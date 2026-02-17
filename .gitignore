@@ -10,9 +10,11 @@ venv/
 dist/
 build/
 
-# Data - exclude all raw data, only keep small processed files
+# Data - exclude all raw data, only keep split training files
 AlphaQCM_data/
-!AlphaQCM_data/.gitkeep
+AlphaQCM/AlphaQCM_data/*
+!AlphaQCM/AlphaQCM_data/README.md
+!AlphaQCM/AlphaQCM_data/*.part_*
 
 # IDE
 .vscode/
