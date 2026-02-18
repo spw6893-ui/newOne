@@ -582,8 +582,7 @@ def main():
             'feature_columns': feature_space.feature_cols,
         }
 
-        import json
-        with open(OUTPUT_DIR / 'validation_results.json', 'w') as f:
+        with open(OUTPUT_DIR / 'validation_results.json', 'w', encoding="utf-8") as f:
             json.dump(val_results, f, indent=2)
 
         print(f"✓ Validation results saved: {OUTPUT_DIR / 'validation_results.json'}")
