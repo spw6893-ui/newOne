@@ -23,7 +23,9 @@ def analyze_feature_importance():
     from alphagen.data.expression import Feature
     from AlphaQCM.alphagen_qlib.crypto_data import CryptoData
     from AlphaQCM.alphagen_qlib.calculator import QLibStockDataCalculator
-    import AlphaQCM.alphagen_qlib.stock_data as sd
+    # 注意：FeatureType 必须来自 `alphagen_qlib.stock_data`（alphagen 核心也从这里 import FeatureType）。
+    # 不要使用 `AlphaQCM.alphagen_qlib.stock_data`，否则会落到固定的 6 维 OHLCV 枚举，导致 "X is not a valid FeatureType"。
+    import alphagen_qlib.stock_data as sd
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
