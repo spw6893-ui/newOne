@@ -1,0 +1,21 @@
+# AlphaGen 训练运行时最小依赖（避免使用 alphagen/requirements.txt 的过老锁版本）
+#
+# 说明：
+# - `alphagen/requirements.txt` 里锁了 numpy/pandas/matplotlib 的老版本，常见会在 Python 3.10+ 触发源码编译失败。
+# - AlphaGen 训练本身只需要 RL 相关依赖 + torch/numpy/pandas。
+#
+# 建议：在虚拟环境里安装
+#   python -m pip install -U pip setuptools wheel
+#   python -m pip install -r requirements_alphagen_train.txt
+
+torch>=2.0.0
+numpy>=1.23.0
+pandas>=1.5.0
+
+gymnasium>=0.29.0
+stable-baselines3>=2.0.0
+sb3-contrib>=2.0.0
+shimmy>=1.3.0
+
+tensorboard>=2.10.0
+packaging>=21.0

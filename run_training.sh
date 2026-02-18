@@ -6,6 +6,10 @@ echo "AlphaGen Crypto Factor Mining - One-Click"
 echo "=========================================="
 echo ""
 
+# 可选：指定 Python 解释器（强烈建议用 venv/conda 的 python）
+PYTHON="${PYTHON:-python3}"
+PIP="$PYTHON -m pip"
+
 # 确保 alphagen 子模块已拉取（否则会出现 `No module named alphagen.rl.env`）
 if [ ! -f "alphagen/requirements.txt" ]; then
     echo "检测到 alphagen 子模块未就绪，正在初始化..."
@@ -43,7 +47,7 @@ fi
 
 if [ "$FORCE_REBUILD" = "1" ] || [ ! -d "AlphaQCM/AlphaQCM_data/alphagen_ready" ] || [ -z "$(ls -A AlphaQCM/AlphaQCM_data/alphagen_ready 2>/dev/null)" ]; then
     echo "准备训练数据..."
-    python AlphaQCM/data_collection/prepare_alphagen_training_data.py \
+    $PYTHON AlphaQCM/data_collection/prepare_alphagen_training_data.py \
         --input-dir "$INPUT_DIR_FOR_PREP" \
         --output-dir AlphaQCM_data/alphagen_ready \
         --horizon-hours 1 \
@@ -64,10 +68,10 @@ echo "=========================================="
 echo "Step 2: 检查依赖"
 echo "=========================================="
 
-if ! python -c "import torch; import sb3_contrib" 2>/dev/null; then
-    echo "安装依赖..."
-    pip install -q -r alphagen/requirements.txt
-    pip install -q -r AlphaQCM/requirements_crypto.txt
+if ! $PYTHON -c "import torch, gymnasium, stable_baselines3, sb3_contrib" 2>/dev/null; then
+    echo "安装依赖（最小集，避免 alphagen/requirements.txt 的过老版本）..."
+    $PIP install -q -U pip setuptools wheel
+    $PIP install -q -r requirements_alphagen_train.txt
     echo "✓ 依赖安装完成"
 else
     echo "✓ 依赖已安装"
@@ -88,7 +92,7 @@ echo "监控训练进度:"
 echo "  tensorboard --logdir=./alphagen_output/tensorboard"
 echo ""
 
-python train_alphagen_crypto.py
+$PYTHON train_alphagen_crypto.py
 
 echo ""
 echo "=========================================="
