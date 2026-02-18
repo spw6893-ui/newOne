@@ -6,6 +6,35 @@ echo "AlphaGen Crypto Factor Mining - One-Click"
 echo "=========================================="
 echo ""
 
+# 训练预设（可选）
+# - baseline: 保持脚本/代码默认值（最接近“原始能跑通”的行为）
+# - explore20: 特征降维(Top20 IC) + 加大训练强度 + 放宽 pool（用于提升探索效率）
+PRESET="${ALPHAGEN_PRESET:-baseline}"
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    echo "用法:"
+    echo "  ./run_training.sh [baseline|explore20]"
+    echo ""
+    echo "示例:"
+    echo "  ./run_training.sh"
+    echo "  ./run_training.sh explore20"
+    echo ""
+    echo "说明:"
+    echo "  也可以用环境变量覆盖任意 ALPHAGEN_* 参数（例如 ALPHAGEN_TOTAL_TIMESTEPS）。"
+    exit 0
+fi
+if [ -n "${1:-}" ]; then
+    PRESET="$1"
+fi
+
+export_default () {
+    # 仅当变量未设置时写入默认值（方便用户外部覆盖）
+    local name="$1"
+    local value="$2"
+    if [ -z "${!name+x}" ]; then
+        export "$name=$value"
+    fi
+}
+
 # 可选：指定 Python 解释器（强烈建议用 venv/conda 的 python）
 PYTHON="${PYTHON:-python3}"
 PIP="$PYTHON -m pip"
@@ -29,6 +58,31 @@ FORCE_REBUILD="${FORCE_REBUILD:-0}"
 # - union：全币种并集（“全因子”）
 # - intersection：全币种交集（NaN 最少，适合先跑通）
 SCHEMA_MODE="${SCHEMA_MODE:-per-file}"
+
+# Step 0: 选择训练预设（只设置“未显式 export”的变量）
+echo "训练预设: $PRESET"
+case "$PRESET" in
+    baseline)
+        # 不强行设置任何 ALPHAGEN_*，完全跟随 train_alphagen_crypto.py 默认/你外部 export 的值
+        ;;
+    explore20)
+        # 方案A：特征降维 + 增强探索（你发的建议）
+        export_default ALPHAGEN_FEATURES_MAX 20
+        export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95
+        export_default ALPHAGEN_TOTAL_TIMESTEPS 800000
+        export_default ALPHAGEN_BATCH_SIZE 256
+        export_default ALPHAGEN_N_STEPS 4096
+        export_default ALPHAGEN_POOL_CAPACITY 20
+        export_default ALPHAGEN_IC_LOWER_BOUND 0.005
+        export_default ALPHAGEN_POOL_L1_ALPHA 0.001
+        # 避免频繁 KL early-stop 把更新截断；如需更稳可改成 0.1/0.2
+        export_default ALPHAGEN_TARGET_KL none
+        ;;
+    *)
+        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20）"
+        exit 1
+        ;;
+esac
 
 # 检查数据目录（Vision 基底 + metrics 覆盖完整 85 币种）
 if [ ! -d "$INPUT_DIR" ] || [ -z "$(ls -A "$INPUT_DIR"/*_final.csv 2>/dev/null)" ]; then
@@ -93,6 +147,16 @@ echo "训练配置:"
 echo "  - 训练集: 2020-01-01 -> $TRAIN_END"
 echo "  - 验证集: $TRAIN_END -> $VAL_END"
 echo "  - 测试集: $VAL_END -> 2025-02-15"
+echo ""
+echo "AlphaGen 关键参数（可通过环境变量覆盖）:"
+echo "  - ALPHAGEN_FEATURES_MAX=${ALPHAGEN_FEATURES_MAX:-0}"
+echo "  - ALPHAGEN_TOTAL_TIMESTEPS=${ALPHAGEN_TOTAL_TIMESTEPS:-100000}"
+echo "  - ALPHAGEN_BATCH_SIZE=${ALPHAGEN_BATCH_SIZE:-128}"
+echo "  - ALPHAGEN_N_STEPS=${ALPHAGEN_N_STEPS:-2048}"
+echo "  - ALPHAGEN_POOL_CAPACITY=${ALPHAGEN_POOL_CAPACITY:-10}"
+echo "  - ALPHAGEN_IC_LOWER_BOUND=${ALPHAGEN_IC_LOWER_BOUND:-0.01}"
+echo "  - ALPHAGEN_POOL_L1_ALPHA=${ALPHAGEN_POOL_L1_ALPHA:-0.005}"
+echo "  - ALPHAGEN_TARGET_KL=${ALPHAGEN_TARGET_KL:-0.03}"
 echo ""
 echo "监控训练进度:"
 echo "  tensorboard --logdir=./alphagen_output/tensorboard"
