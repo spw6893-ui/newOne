@@ -98,6 +98,12 @@ echo "监控训练进度:"
 echo "  tensorboard --logdir=./alphagen_output/tensorboard"
 echo ""
 
+# libgomp 对 OMP_NUM_THREADS 要求是正整数；有些平台会注入非整数值导致告警
+if [ -n "${OMP_NUM_THREADS:-}" ] && ! [[ "${OMP_NUM_THREADS}" =~ ^[0-9]+$ ]]; then
+    echo "⚠ OMP_NUM_THREADS=${OMP_NUM_THREADS} 不是整数，已 unset（避免 libgomp 警告）"
+    unset OMP_NUM_THREADS
+fi
+
 $PYTHON train_alphagen_crypto.py
 
 echo ""

@@ -184,7 +184,10 @@ def main():
     import AlphaQCM.alphagen_qlib.stock_data as sd
 
     import alphagen as alphagen_pkg
-    print(f"alphagen 包路径: {getattr(alphagen_pkg, '__file__', 'UNKNOWN')}")
+    alphagen_file = getattr(alphagen_pkg, "__file__", None)
+    alphagen_path = list(getattr(alphagen_pkg, "__path__", []))
+    # namespace package 场景下 __file__ 可能为 None，用 __path__ 更可靠
+    print(f"alphagen 包路径: {alphagen_file if alphagen_file else alphagen_path}")
 
     class TensorboardCallback(BaseCallback):
         """记录训练指标到TensorBoard"""
