@@ -392,22 +392,38 @@ def main():
         )
     )
 
-    model = MaskablePPO(
-        'MlpPolicy',
-        env,
-        policy_kwargs=policy_kwargs,
-        batch_size=BATCH_SIZE,
-        learning_rate=LEARNING_RATE,
-        n_steps=N_STEPS,
-        gamma=0.99,
-        gae_lambda=GAE_LAMBDA,
-        clip_range=CLIP_RANGE,
-        ent_coef=ENT_COEF,
-        target_kl=TARGET_KL,
-        device=DEVICE,
-        verbose=1,
-        tensorboard_log=str(OUTPUT_DIR / 'tensorboard')
-    )
+    resume_flag = os.environ.get("ALPHAGEN_RESUME", "0").strip() in {"1", "true", "yes", "y"}
+    resume_path = os.environ.get("ALPHAGEN_RESUME_PATH", str(OUTPUT_DIR / "model_final.zip")).strip()
+    if resume_flag and Path(resume_path).exists():
+        print(f"Resuming PPO model from: {resume_path}")
+        model = MaskablePPO.load(
+            resume_path,
+            env=env,
+            device=DEVICE,
+        )
+        # 允许在恢复训练时微调部分超参（不改网络结构）
+        model.ent_coef = ENT_COEF
+        model.target_kl = TARGET_KL
+        # learning_rate 在 SB3 里可能是 schedule，这里不强行覆盖，避免产生误解
+    else:
+        if resume_flag and not Path(resume_path).exists():
+            print(f"⚠ ALPHAGEN_RESUME=1 但未找到模型文件：{resume_path}（将从头训练）")
+        model = MaskablePPO(
+            'MlpPolicy',
+            env,
+            policy_kwargs=policy_kwargs,
+            batch_size=BATCH_SIZE,
+            learning_rate=LEARNING_RATE,
+            n_steps=N_STEPS,
+            gamma=0.99,
+            gae_lambda=GAE_LAMBDA,
+            clip_range=CLIP_RANGE,
+            ent_coef=ENT_COEF,
+            target_kl=TARGET_KL,
+            device=DEVICE,
+            verbose=1,
+            tensorboard_log=str(OUTPUT_DIR / 'tensorboard')
+        )
 
     # ==================== 开始训练 ====================
     print("\n" + "=" * 60)
