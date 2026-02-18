@@ -28,13 +28,15 @@ class CryptoData:
                  feature_columns: Optional[Sequence[str]] = None,
                  device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')) -> None:
 
-        self._symbols = symbols if isinstance(symbols, list) else self._get_symbols(symbols)
         self.max_backtrack_days = max_backtrack_periods
         self.max_future_days = max_future_periods
         self._start_time = start_time
         self._end_time = end_time
         self._timeframe = timeframe
         self._data_dir = data_dir
+        # `_get_symbols('all'/'top100')` 需要依赖 `_data_dir/_timeframe` 扫描文件，
+        # 因此必须在这里先完成赋值，再解析 symbols。
+        self._symbols = symbols if isinstance(symbols, list) else self._get_symbols(symbols)
         self._features = features if features is not None else list(sd.FeatureType)
         # 当 FeatureType 是动态构造时，需要一个“特征列顺序”来做 index->列名映射
         self._feature_columns = list(feature_columns) if feature_columns is not None else list(
