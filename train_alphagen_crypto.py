@@ -210,8 +210,9 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Alpha Pool配置
-    POOL_CAPACITY = 10
-    IC_LOWER_BOUND = 0.01
+    POOL_CAPACITY = int(os.environ.get("ALPHAGEN_POOL_CAPACITY", "10"))
+    IC_LOWER_BOUND = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND", "0.01"))
+    L1_ALPHA = float(os.environ.get("ALPHAGEN_POOL_L1_ALPHA", "0.005"))
 
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
@@ -265,6 +266,7 @@ def main():
         capacity=POOL_CAPACITY,
         calculator=calculator,
         ic_lower_bound=IC_LOWER_BOUND,
+        l1_alpha=L1_ALPHA,
         device=device_obj,
     )
 
