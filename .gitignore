@@ -31,6 +31,13 @@ Thumbs.db
 
 # Logs
 *.log
+events.out.tfevents.*
+
+# Backtest outputs
+factor_ls_output/
+
+# Local scratch
+test_btc_prediction.py
 
 # Jupyter
 .ipynb_checkpoints/
