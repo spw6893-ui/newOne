@@ -302,7 +302,9 @@ def main():
     N_STEPS = int(os.environ.get("ALPHAGEN_N_STEPS", "2048"))
     GAE_LAMBDA = float(os.environ.get("ALPHAGEN_GAE_LAMBDA", "0.95"))
     CLIP_RANGE = float(os.environ.get("ALPHAGEN_CLIP_RANGE", "0.2"))
-    ENT_COEF = float(os.environ.get("ALPHAGEN_ENT_COEF", "0.01"))
+    # ent_coef 太大时会让策略长期接近均匀随机，表现为 ep_len_mean≈MAX_EXPR_LENGTH、ep_rew_mean≈-1
+    ENT_COEF = float(os.environ.get("ALPHAGEN_ENT_COEF", "0.001"))
+    TARGET_KL = float(os.environ.get("ALPHAGEN_TARGET_KL", "0.03"))
 
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
@@ -387,6 +389,7 @@ def main():
         gae_lambda=GAE_LAMBDA,
         clip_range=CLIP_RANGE,
         ent_coef=ENT_COEF,
+        target_kl=TARGET_KL,
         device=DEVICE,
         verbose=1,
         tensorboard_log=str(OUTPUT_DIR / 'tensorboard')
