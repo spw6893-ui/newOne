@@ -207,10 +207,19 @@ def run(args):
     symbols = args.symbols
 
     # 数据源：对齐 AlphaGen 的“宽表因子”（alphagen_ready），同时兼容旧的 crypto_data（OHLCV+VWAP）
+    # data_dir 既支持：
+    # - 相对 AlphaQCM/ 的路径（推荐，例如 AlphaQCM_data/alphagen_ready）
+    # - 相对仓库根目录的路径（例如 AlphaQCM/AlphaQCM_data/alphagen_ready）
+    # - 绝对路径
     data_dir = Path(args.data_dir)
     if not data_dir.is_absolute():
-        data_dir = base_dir / data_dir
-    data_dir = data_dir.resolve()
+        cwd_candidate = (Path.cwd() / data_dir).resolve()
+        if cwd_candidate.exists():
+            data_dir = cwd_candidate
+        else:
+            data_dir = (base_dir / data_dir).resolve()
+    else:
+        data_dir = data_dir.resolve()
 
     feature_cols_all = _detect_feature_columns(data_dir, args.timeframe)
 
