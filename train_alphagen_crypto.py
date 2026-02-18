@@ -95,21 +95,84 @@ def _detect_feature_space(data_dir: Path) -> FeatureSpace:
     if not feature_cols:
         raise RuntimeError(f"未能从表头推断出任何特征列：{data_dir}")
 
-    # 可选：限制特征数量（避免 action_space>255 或内存压力过大）
-    max_n = os.environ.get("ALPHAGEN_FEATURES_MAX", "").strip()
-    if max_n:
-        n = int(max_n)
-        if n > 0 and len(feature_cols) > n:
-            keep_core = [c for c in ("open", "high", "low", "close", "volume", "volume_clean", "vwap") if c in feature_cols]
-            rest = [c for c in feature_cols if c not in set(keep_core)]
-            feature_cols = keep_core + rest[: max(0, n - len(keep_core))]
-
     return FeatureSpace(feature_cols=feature_cols)
+
+def _cap_feature_cols(feature_cols: List[str], n: int) -> List[str]:
+    """
+    仅做“硬截断”的降维（不做 IC 预筛选），用于避免 action_space>255 或内存压力过大。
+    """
+    n = int(n)
+    if n <= 0 or len(feature_cols) <= n:
+        return feature_cols
+    keep_core = [c for c in ("open", "high", "low", "close", "volume", "volume_clean", "vwap") if c in feature_cols]
+    rest = [c for c in feature_cols if c not in set(keep_core)]
+    return keep_core + rest[: max(0, n - len(keep_core))]
+
+
+def _select_top_features(data_dir: Path, feature_cols: List[str], top_k: int) -> Tuple[List[str], List[int]]:
+    """
+    基于单因子IC预筛选高价值特征，减少噪声。
+    返回: (selected_cols, selected_indices)
+    """
+    if top_k <= 0 or top_k >= len(feature_cols):
+        return feature_cols, list(range(len(feature_cols)))
+
+    print(f"\n预筛选特征: 从{len(feature_cols)}个中选择Top {top_k}...")
+
+    # 快速加载少量数据用于IC计算
+    from AlphaQCM.alphagen_qlib.crypto_data import CryptoData
+    from AlphaQCM.alphagen_qlib.calculator import QLibStockDataCalculator
+    from alphagen.data.expression import Feature, Ref
+    import alphagen_qlib.stock_data as sd
+
+    # 临时安装完整特征空间
+    _install_dynamic_feature_type(feature_cols)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    sample_data = CryptoData(
+        symbols="top20",
+        start_time="2023-01-01",
+        end_time="2024-01-01",
+        timeframe='1h',
+        data_dir=str(data_dir),
+        max_backtrack_periods=100,
+        max_future_periods=30,
+        features=None,
+        device=device
+    )
+
+    close_idx = feature_cols.index("close")
+    close_expr = Feature(sd.FeatureType(close_idx))
+    target = Ref(close_expr, -1) / close_expr - 1
+    calculator = QLibStockDataCalculator(sample_data, target)
+
+    # 计算IC
+    ics = []
+    for i, col in enumerate(feature_cols):
+        try:
+            feat = Feature(sd.FeatureType(i))
+            ic = calculator.calc_single_IC_ret(feat)
+            ics.append((i, col, abs(ic)))
+        except:
+            ics.append((i, col, 0.0))
+
+    # 排序并选择Top K
+    ics.sort(key=lambda x: x[2], reverse=True)
+    selected = ics[:top_k]
+
+    print(f"\nTop 10 特征:")
+    for idx, col, ic in selected[:10]:
+        print(f"  {col:30s} |IC|={ic:.4f}")
+
+    selected_indices = [x[0] for x in selected]
+    selected_cols = [x[1] for x in selected]
+
+    return selected_cols, selected_indices
 
 
 def _install_dynamic_feature_type(feature_cols: Sequence[str]) -> None:
     """
-    动态构造 alphagen_qlib.stock_data.FeatureType，使得 AlphaGen 能把“宽表全部因子列”当作可选 Feature。
+    动态构造 alphagen_qlib.stock_data.FeatureType，使得 AlphaGen 能把"宽表全部因子列"当作可选 Feature。
 
     注意：必须在导入 `alphagen.data.tokens` / `alphagen.rl.env.wrapper` 之前调用，
     因为它们会在 import 时读取 `len(FeatureType)` 来构建 action space。
@@ -135,7 +198,7 @@ def _install_dynamic_feature_type(feature_cols: Sequence[str]) -> None:
         members[name] = i
 
     sd.FeatureType = IntEnum("FeatureType", members)  # type: ignore[attr-defined]
-    # 同时暴露“列顺序”，供 CryptoData 做 index->列名映射
+    # 同时暴露"列顺序"，供 CryptoData 做 index->列名映射
     sd.FEATURE_COLUMNS = list(feature_cols)  # type: ignore[attr-defined]
 
 
@@ -158,8 +221,25 @@ def main():
     VAL_END = os.environ.get("ALPHAGEN_VAL_END", "2024-07-01")
     END_TIME = os.environ.get("ALPHAGEN_END_TIME", "2025-02-15")
 
-    # 特征：默认把 alphagen_ready 里的“全部因子列”都扔进 AlphaGen（FeatureType 动态构造）
+    # 特征：默认把 alphagen_ready 里的"全部因子列"都扔进 AlphaGen（FeatureType 动态构造）
     feature_space = _detect_feature_space(Path(DATA_DIR))
+
+    # 可选：特征预筛选（基于单因子 |IC| 选择 Top K，减少噪声，提升信噪比）
+    # 注意：这里使用 ALPHAGEN_FEATURES_MAX；它不再用于“简单截断”（避免与预筛选逻辑冲突）。
+    max_features = os.environ.get("ALPHAGEN_FEATURES_MAX", "").strip()
+    if max_features and int(max_features) > 0:
+        selected_cols, _ = _select_top_features(
+            Path(DATA_DIR),
+            feature_space.feature_cols,
+            int(max_features),
+        )
+        feature_space = FeatureSpace(feature_cols=selected_cols)
+
+    # 可选：硬截断（不看 IC，仅用于快速降维，避免 action_space>255）
+    hard_cap = os.environ.get("ALPHAGEN_FEATURES_CAP", "").strip()
+    if hard_cap and int(hard_cap) > 0:
+        feature_space = FeatureSpace(feature_cols=_cap_feature_cols(feature_space.feature_cols, int(hard_cap)))
+
     _install_dynamic_feature_type(feature_space.feature_cols)
     # alphagen wrapper 的 state dtype 默认是 uint8，因此 action_space 不能超过 255
     # action_space 大小约等于 len(features) + 常量/算子开销（约 42）
@@ -181,7 +261,7 @@ def main():
 
     from AlphaQCM.alphagen_qlib.crypto_data import CryptoData
     from AlphaQCM.alphagen_qlib.calculator import QLibStockDataCalculator
-    import AlphaQCM.alphagen_qlib.stock_data as sd
+    import alphagen_qlib.stock_data as sd
 
     import alphagen as alphagen_pkg
     alphagen_file = getattr(alphagen_pkg, "__file__", None)
@@ -209,10 +289,20 @@ def main():
     OUTPUT_DIR = Path('./alphagen_output')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Alpha Pool配置
-    POOL_CAPACITY = int(os.environ.get("ALPHAGEN_POOL_CAPACITY", "10"))
-    IC_LOWER_BOUND = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND", "0.01"))
-    L1_ALPHA = float(os.environ.get("ALPHAGEN_POOL_L1_ALPHA", "0.005"))
+    # Alpha Pool配置 - 针对高维特征优化
+    POOL_CAPACITY = int(os.environ.get("ALPHAGEN_POOL_CAPACITY", "20"))
+    IC_LOWER_BOUND = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND", "0.005"))
+    L1_ALPHA = float(os.environ.get("ALPHAGEN_POOL_L1_ALPHA", "0.01"))
+
+    # 模型/训练超参（允许通过环境变量配置，便于 alphagen_config.sh 生效）
+    LSTM_LAYERS = int(os.environ.get("ALPHAGEN_LSTM_LAYERS", "3"))
+    LSTM_DIM = int(os.environ.get("ALPHAGEN_LSTM_DIM", "256"))
+    LSTM_DROPOUT = float(os.environ.get("ALPHAGEN_LSTM_DROPOUT", "0.2"))
+    LEARNING_RATE = float(os.environ.get("ALPHAGEN_LEARNING_RATE", "2e-4"))
+    N_STEPS = int(os.environ.get("ALPHAGEN_N_STEPS", "2048"))
+    GAE_LAMBDA = float(os.environ.get("ALPHAGEN_GAE_LAMBDA", "0.95"))
+    CLIP_RANGE = float(os.environ.get("ALPHAGEN_CLIP_RANGE", "0.2"))
+    ENT_COEF = float(os.environ.get("ALPHAGEN_ENT_COEF", "0.01"))
 
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
@@ -279,9 +369,9 @@ def main():
     policy_kwargs = dict(
         features_extractor_class=LSTMSharedNet,
         features_extractor_kwargs=dict(
-            n_layers=2,
-            d_model=128,
-            dropout=0.1,
+            n_layers=LSTM_LAYERS,
+            d_model=LSTM_DIM,
+            dropout=LSTM_DROPOUT,
             device=device_obj,
         )
     )
@@ -291,9 +381,12 @@ def main():
         env,
         policy_kwargs=policy_kwargs,
         batch_size=BATCH_SIZE,
-        learning_rate=3e-4,
-        n_steps=2048,
+        learning_rate=LEARNING_RATE,
+        n_steps=N_STEPS,
         gamma=0.99,
+        gae_lambda=GAE_LAMBDA,
+        clip_range=CLIP_RANGE,
+        ent_coef=ENT_COEF,
         device=DEVICE,
         verbose=1,
         tensorboard_log=str(OUTPUT_DIR / 'tensorboard')
