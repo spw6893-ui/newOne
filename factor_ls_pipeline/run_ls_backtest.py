@@ -54,6 +54,91 @@ def _symbol_from_filename(fp: Path) -> str:
     return name
 
 
+def _read_symbol_list_file(fp: Path) -> List[str]:
+    """
+    读取符号列表文件（支持注释行 # ...）。
+    返回原始条目字符串列表（未做格式化）。
+    """
+    out: List[str] = []
+    if not fp.exists():
+        return out
+    for line in fp.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
+def _symbol_candidates_from_entry(entry: str) -> List[str]:
+    """
+    把类似：
+      - BTC/USDT:USDT
+      - ADA/USDT
+      - BTC_USDT:USDT
+    映射成可能出现在 data_dir 文件名里的 symbol 候选（不含 _train.csv）。
+    """
+    s = str(entry).strip()
+    if not s:
+        return []
+
+    if "/" in s:
+        base, quote = s.split("/", 1)
+        s = f"{base}_{quote}"
+
+    s = s.strip()
+    cands: List[str] = []
+    cands.append(s)
+
+    # 常见：宽表是 *_USDT:USDT_train.csv；而列表里可能只有 *_USDT 或 *_USDT:USDT
+    if s.endswith("_USDT") and not s.endswith("_USDT:USDT"):
+        cands.append(f"{s}:USDT")
+    if s.endswith("_USDT:USDT"):
+        cands.append(s.replace(":USDT", ""))  # -> *_USDT
+
+    # 去重 + 保序
+    seen = set()
+    out: List[str] = []
+    for x in cands:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _select_top_symbols_from_file(
+    available_symbols: Sequence[str],
+    symbol_list_file: Path,
+    max_n: int,
+) -> List[str]:
+    """
+    根据 top100_symbols.txt 的顺序，从 available_symbols 中挑选最多 max_n 个。
+    如果文件不存在/匹配不足，则回退为按 available_symbols 排序截断。
+    """
+    available = list(available_symbols)
+    available_set = set(available)
+
+    entries = _read_symbol_list_file(symbol_list_file)
+    chosen: List[str] = []
+    chosen_set = set()
+
+    for e in entries:
+        for cand in _symbol_candidates_from_entry(e):
+            if cand in available_set and cand not in chosen_set:
+                chosen.append(cand)
+                chosen_set.add(cand)
+                break
+        if len(chosen) >= int(max_n):
+            break
+
+    if len(chosen) >= int(max_n):
+        return chosen[: int(max_n)]
+
+    # 不足则用剩余可用币种补齐，保证可跑
+    rest = [s for s in sorted(available) if s not in chosen_set]
+    return (chosen + rest)[: int(max_n)]
+
+
 def _load_factor_file(fp: Path) -> Tuple[List[str], List[float]]:
     """
     返回 (expr_strings, weights)。
@@ -419,6 +504,11 @@ def _load_wide_csv_data(
     for sym in symbols:
         fp = data_dir / f"{sym}_train.csv"
         if not fp.exists():
+            # 兼容 AlphaQCM alphagen_ready：很多文件名是 *_USDT:USDT_train.csv
+            if ":" not in sym and sym.endswith("_USDT"):
+                fp3 = data_dir / f"{sym}:USDT_train.csv"
+                if fp3.exists():
+                    fp = fp3
             # 兼容 crypto_data 命名
             fp2 = data_dir / f"{sym}_{timeframe}.csv"
             fp = fp2 if fp2.exists() else fp
@@ -621,6 +711,103 @@ def backtest_long_short(
     return df
 
 
+def quantile_backtest(
+    data: StockDataLike,
+    close_col_idx: int,
+    score: torch.Tensor,
+    horizon: int,
+    n_quantiles: int,
+    top_k: int,
+    bottom_k: int,
+) -> pd.DataFrame:
+    """
+    分位数组合回测（按 score 截面排序分组）。
+
+    - Q1 表示最低分组，Qn 表示最高分组
+    - 每组等权
+    - 收益为 forward return（t->t+h）
+    - 额外输出：
+      - ls_qN_q1：Qn - Q1
+      - ls_topK_botK：平均(最高K组) - 平均(最低K组)
+    """
+    T = data.n_days
+    S = data.n_stocks
+    if score.shape != (T, S):
+        raise ValueError(f"score 形状不匹配：{tuple(score.shape)} vs {(T, S)}")
+
+    q = int(n_quantiles)
+    if q < 2:
+        raise ValueError(f"n_quantiles 必须>=2，但得到 {q}")
+    top_k = int(top_k)
+    bottom_k = int(bottom_k)
+    if top_k <= 0 or bottom_k <= 0:
+        raise ValueError("top_k/bottom_k 必须都 > 0")
+    if top_k + bottom_k > q:
+        raise ValueError(f"top_k+bottom_k 不能超过 quantiles：{top_k}+{bottom_k}>{q}")
+
+    bt = data.max_backtrack_days
+    h = int(horizon)
+    close0 = data.data[bt : bt + T, close_col_idx, :].cpu().numpy()
+    close1 = data.data[bt + h : bt + h + T, close_col_idx, :].cpu().numpy()
+    fwd_ret = close1 / close0 - 1.0
+
+    dates = data.dates[bt : bt + T]
+    score_np = score.detach().cpu().numpy().astype(np.float32)
+
+    out: Dict[str, List[object]] = {"datetime": []}
+    for i in range(1, q + 1):
+        out[f"q{i}"] = []
+    out["ls_qN_q1"] = []
+    out[f"ls_top{top_k}_bot{bottom_k}"] = []
+
+    for t in range(T):
+        sc = score_np[t, :]
+        valid = np.isfinite(sc) & np.isfinite(fwd_ret[t, :])
+        idx = np.where(valid)[0]
+        if idx.size < q:
+            out["datetime"].append(dates[t])
+            for i in range(1, q + 1):
+                out[f"q{i}"].append(np.nan)
+            out["ls_qN_q1"].append(np.nan)
+            out[f"ls_top{top_k}_bot{bottom_k}"].append(np.nan)
+            continue
+
+        order = idx[np.argsort(sc[idx])]  # 低->高
+        n = order.size
+        base = n // q
+        rem = n % q
+        groups: List[np.ndarray] = []
+        pos = 0
+        for i in range(q):
+            size = base + (1 if i < rem else 0)
+            groups.append(order[pos : pos + size])
+            pos += size
+
+        qrets: List[float] = []
+        out["datetime"].append(dates[t])
+        for i, g in enumerate(groups, start=1):
+            r = float(np.nanmean(fwd_ret[t, g])) if g.size else float("nan")
+            out[f"q{i}"].append(r)
+            qrets.append(r)
+
+        out["ls_qN_q1"].append(float(qrets[-1] - qrets[0]))
+        top_avg = float(np.nanmean(qrets[-top_k:]))
+        bot_avg = float(np.nanmean(qrets[:bottom_k]))
+        out[f"ls_top{top_k}_bot{bottom_k}"].append(float(top_avg - bot_avg))
+
+    df = pd.DataFrame(out)
+
+    # 补 equity/drawdown（方便直接看回撤）
+    for col in [c for c in df.columns if c != "datetime"]:
+        r = df[col].to_numpy(dtype=float)
+        eq = np.cumprod(1.0 + np.nan_to_num(r, nan=0.0))
+        peak = np.maximum.accumulate(eq)
+        dd = eq / peak - 1.0
+        df[f"{col}_equity"] = eq
+        df[f"{col}_drawdown"] = dd
+    return df
+
+
 def summarize_curve(curve: pd.DataFrame, periods_per_year: float) -> Dict[str, float]:
     r = curve["net_ret"].to_numpy(dtype=float)
     eq = curve["equity"].to_numpy(dtype=float)
@@ -645,6 +832,29 @@ def summarize_curve(curve: pd.DataFrame, periods_per_year: float) -> Dict[str, f
     }
 
 
+def summarize_return_series(r: np.ndarray, periods_per_year: float) -> Dict[str, float]:
+    r = np.asarray(r, dtype=float)
+    if r.size == 0:
+        return {}
+    mean = float(np.nanmean(r))
+    vol = float(np.nanstd(r, ddof=0))
+    ann_ret = (1.0 + mean) ** periods_per_year - 1.0
+    ann_vol = vol * np.sqrt(periods_per_year)
+    sharpe = float(ann_ret / ann_vol) if ann_vol > 0 else float("nan")
+    eq = np.cumprod(1.0 + np.nan_to_num(r, nan=0.0))
+    peak = np.maximum.accumulate(eq)
+    dd = eq / peak - 1.0
+    mdd = float(np.nanmin(dd))
+    return {
+        "n_periods": float(r.size),
+        "ann_return": float(ann_ret),
+        "ann_vol": float(ann_vol),
+        "sharpe": float(sharpe),
+        "max_drawdown": float(mdd),
+        "final_equity": float(eq[-1]),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--factor-file", required=True, help="alpha_pool.json / validation_results.json / *_best_table.csv")
@@ -660,6 +870,9 @@ def main() -> int:
     ap.add_argument("--cost-bps", type=float, default=0.0, help="单边交易成本（bps），按换手扣减（默认 0）")
     ap.add_argument("--min-date-coverage", type=float, default=0.5, help="日期覆盖率阈值（默认 0.5）")
     ap.add_argument("--factor-min-coverage", type=float, default=0.0, help="因子可用性门控阈值（默认 0，关闭）")
+    ap.add_argument("--quantiles", type=int, default=0, help="分位数组合回测组数（例如 10；0 表示不输出）")
+    ap.add_argument("--top-k", type=int, default=5, help="分位数组合：最高 K 组（默认 5）")
+    ap.add_argument("--bottom-k", type=int, default=5, help="分位数组合：最低 K 组（默认 5）")
     ap.add_argument("--output-dir", default="factor_ls_output", help="输出目录")
     args = ap.parse_args()
 
@@ -742,8 +955,12 @@ def main() -> int:
             "SUI_USDT",
         ]
     elif sym_arg == "top100":
-        sym_files = sorted(data_dir.glob("*_train.csv"))
-        symbols = [_symbol_from_filename(fp) for fp in sym_files][:100]
+        sym_files = _list_symbol_files(data_dir)
+        available = [_symbol_from_filename(fp) for fp in sym_files]
+
+        # 优先用 AlphaQCM 的 top100 列表（按市值排序），保证与你的数据/训练更一致
+        top100_fp = (repo_root / "AlphaQCM" / "data_collection" / "top100_symbols.txt").resolve()
+        symbols = _select_top_symbols_from_file(available, symbol_list_file=top100_fp, max_n=100)
     else:
         # 允许逗号分隔
         symbols = [x.strip() for x in sym_arg.split(",") if x.strip()]
@@ -811,6 +1028,36 @@ def main() -> int:
     curve.to_csv(out_dir / "curve.csv", index=False)
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    if int(args.quantiles) and int(args.quantiles) >= 2:
+        qdf = quantile_backtest(
+            data=data,
+            close_col_idx=int(close_idx),
+            score=score,
+            horizon=int(args.horizon),
+            n_quantiles=int(args.quantiles),
+            top_k=int(args.top_k),
+            bottom_k=int(args.bottom_k),
+        )
+        qdf.to_csv(out_dir / "quantiles.csv", index=False)
+
+        q = int(args.quantiles)
+        top_k = int(args.top_k)
+        bottom_k = int(args.bottom_k)
+        qsum = {
+            "quantiles": q,
+            "top_k": top_k,
+            "bottom_k": bottom_k,
+            "ls_qN_q1": summarize_return_series(qdf["ls_qN_q1"].to_numpy(dtype=float), periods_per_year),
+            f"ls_top{top_k}_bot{bottom_k}": summarize_return_series(
+                qdf[f"ls_top{top_k}_bot{bottom_k}"].to_numpy(dtype=float), periods_per_year
+            ),
+        }
+        (out_dir / "quantiles_summary.json").write_text(
+            json.dumps(qsum, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"分位回测: {out_dir / 'quantiles.csv'}")
+        print(f"分位汇总: {out_dir / 'quantiles_summary.json'}")
+
     print("========================================")
     print("多空回测完成")
     print("========================================")
@@ -822,4 +1069,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
