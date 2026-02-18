@@ -1,4 +1,4 @@
-from typing import List, Union, Optional, Tuple
+from typing import List, Union, Optional, Tuple, Sequence
 import numpy as np
 import pandas as pd
 import torch
@@ -7,7 +7,7 @@ import glob
 import re
 
 # Import FeatureType from stock_data to maintain compatibility
-from alphagen_qlib.stock_data import FeatureType
+import alphagen_qlib.stock_data as sd
 
 
 class CryptoData:
@@ -24,7 +24,8 @@ class CryptoData:
                  data_dir: str = 'AlphaQCM_data/crypto_data',
                  max_backtrack_periods: int = 100,
                  max_future_periods: int = 30,
-                 features: Optional[List[FeatureType]] = None,
+                 features: Optional[List["sd.FeatureType"]] = None,
+                 feature_columns: Optional[Sequence[str]] = None,
                  device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')) -> None:
 
         self._symbols = symbols if isinstance(symbols, list) else self._get_symbols(symbols)
@@ -34,7 +35,11 @@ class CryptoData:
         self._end_time = end_time
         self._timeframe = timeframe
         self._data_dir = data_dir
-        self._features = features if features is not None else list(FeatureType)
+        self._features = features if features is not None else list(sd.FeatureType)
+        # 当 FeatureType 是动态构造时，需要一个“特征列顺序”来做 index->列名映射
+        self._feature_columns = list(feature_columns) if feature_columns is not None else list(
+            getattr(sd, "FEATURE_COLUMNS", [])
+        )
         self.device = device
         self.data, self._dates, self._symbol_ids = self._get_data()
 
@@ -162,15 +167,25 @@ class CryptoData:
         print(f"Total periods: {len(valid_dates)}")
 
         # Build 3D tensor: (time, features, symbols)
-        # FeatureType -> 实际列名映射（兼容最终宽表/训练表常见字段）
-        feat_col_map = {
-            FeatureType.OPEN: ["open"],
-            FeatureType.HIGH: ["high"],
-            FeatureType.LOW: ["low"],
-            FeatureType.CLOSE: ["close"],
-            FeatureType.VWAP: ["vwap"],
-            FeatureType.VOLUME: ["volume", "volume_clean"],
-        }
+        # FeatureType -> 实际列名映射
+        # 1) 动态 FeatureType：优先用 `_feature_columns`（与 FeatureType index 一一对应）
+        # 2) 否则回退到基础 OHLCV/VWAP 映射
+        feat_col_map: dict[sd.FeatureType, List[str]] = {}
+        if self._feature_columns:
+            for ft in self._features:
+                j = int(ft)
+                if 0 <= j < len(self._feature_columns):
+                    feat_col_map[ft] = [self._feature_columns[j]]
+        else:
+            # fallback for legacy fixed FeatureType
+            feat_col_map = {
+                sd.FeatureType.OPEN: ["open"],
+                sd.FeatureType.HIGH: ["high"],
+                sd.FeatureType.LOW: ["low"],
+                sd.FeatureType.CLOSE: ["close"],
+                sd.FeatureType.VWAP: ["vwap"],
+                sd.FeatureType.VOLUME: ["volume", "volume_clean"],
+            }
         n_dates = len(valid_dates)
         n_features = len(self._features)
         n_symbols = len(all_dfs)
@@ -184,7 +199,7 @@ class CryptoData:
             df = df.ffill()
 
             for j, ft in enumerate(self._features):
-                col_candidates = feat_col_map.get(ft, [ft.name.lower()])
+                col_candidates = feat_col_map.get(ft, [str(getattr(ft, "name", "")).lower()])
                 col = next((c for c in col_candidates if c in df.columns), "")
                 if col:
                     data_array[:, j, i] = pd.to_numeric(df[col], errors="coerce").astype("float32").values
