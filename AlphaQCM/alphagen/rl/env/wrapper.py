@@ -54,6 +54,14 @@ class AlphaEnvWrapper(gym.Wrapper):
         self.action_space = gym.spaces.Discrete(SIZE_ACTION)
         self.observation_space = gym.spaces.Box(low=0, high=SIZE_ALL - 1, shape=(MAX_EXPR_LENGTH, ), dtype=np.uint8)
 
+    @property
+    def pool(self):
+        """
+        兼容 AlphaQCM 的 agent 实现：它会直接访问 `env.pool`。
+        这里把 Wrapper 内部的 AlphaEnvCore.pool 透传出来。
+        """
+        return self.env.pool
+
     def reset(self, **kwargs) -> Tuple[np.ndarray, dict]:
         self.counter = 0
         self.state = np.zeros(MAX_EXPR_LENGTH, dtype=np.uint8)
