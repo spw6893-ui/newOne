@@ -34,6 +34,10 @@ class QLibStockDataCalculator(AlphaCalculator):
         value = self._calc_alpha(expr)
         return self._calc_IC(value, self.target_value)
 
+    def calc_single_rIC_ret(self, expr: Expression) -> float:
+        value = self._calc_alpha(expr)
+        return self._calc_rIC(value, self.target_value)
+
     def calc_mutual_IC(self, expr1: Expression, expr2: Expression) -> float:
         value1, value2 = self._calc_alpha(expr1), self._calc_alpha(expr2)
         return self._calc_IC(value1, value2)
@@ -49,6 +53,9 @@ class QLibStockDataCalculator(AlphaCalculator):
             ensemble_value = self.make_ensemble_alpha(exprs, weights)
             rank_ic = batch_spearmanr(ensemble_value, self.target_value).mean().item()
             return rank_ic
+
+    def calc_pool_all_ret(self, exprs: List[Expression], weights: List[float]):
+        return self.calc_pool_IC_ret(exprs, weights), self.calc_pool_rIC_ret(exprs, weights)
 
 class TestStockDataCalculator(AlphaCalculator):
     def __init__(self, data: StockData, target: Optional[Expression]):
@@ -77,6 +84,10 @@ class TestStockDataCalculator(AlphaCalculator):
         value = self._calc_alpha(expr)
         return self._calc_IC(value, self.target_value)
 
+    def calc_single_rIC_ret(self, expr: Expression) -> float:
+        value = self._calc_alpha(expr)
+        return self._calc_rIC(value, self.target_value)
+
     def calc_mutual_IC(self, expr1: Expression, expr2: Expression) -> float:
         value1, value2 = self._calc_alpha(expr1), self._calc_alpha(expr2)
         return self._calc_IC(value1, value2)
@@ -92,3 +103,6 @@ class TestStockDataCalculator(AlphaCalculator):
             ensemble_value = self.make_ensemble_alpha(exprs, weights)
             rank_ic = batch_spearmanr(ensemble_value, self.target_value).mean().item()
             return rank_ic
+
+    def calc_pool_all_ret(self, exprs: List[Expression], weights: List[float]):
+        return self.calc_pool_IC_ret(exprs, weights), self.calc_pool_rIC_ret(exprs, weights)
