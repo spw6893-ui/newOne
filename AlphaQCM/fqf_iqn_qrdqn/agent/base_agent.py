@@ -245,6 +245,23 @@ class BaseAgent(ABC):
 
         # We log evaluation results along with training steps.
         if self.episodes % self.log_interval == 0:
+            try:
+                pool_size = len(self.env.pool.state.get('exprs', []))
+                best_ic = self.env.pool.state.get('best_ic_ret', None)
+            except Exception:
+                pool_size = -1
+                best_ic = None
+            eps = None
+            try:
+                eps = self.epsilon_train.get()
+            except Exception:
+                pass
+            print(
+                f"[train] episodes={self.episodes} steps={self.steps} "
+                f"return_mean={self.train_return.get():.4f} "
+                f"epsilon={eps if eps is not None else 'NA'} "
+                f"pool={pool_size} best_ic_ret={best_ic if best_ic is not None else 'NA'}"
+            )
             self.writer.add_scalar(
                 'ic/train', self.env.env.pool.state['best_ic_ret'], self.steps)
 
@@ -266,6 +283,15 @@ class BaseAgent(ABC):
 
         valid_ic = self.env.pool.test_ensemble(self.valid_calculator)
         test_ic = self.env.pool.test_ensemble(self.test_calculator)
+        try:
+            pool_size = len(self.env.pool.state.get('exprs', []))
+        except Exception:
+            pool_size = -1
+
+        print(
+            f"[eval] steps={self.steps} valid_ic={valid_ic:.4f} test_ic={test_ic:.4f} "
+            f"best_valid={self.best_eval_score:.4f} best_test={self.best_test_score:.4f} pool={pool_size}"
+        )
 
         if valid_ic > self.best_eval_score:
             self.best_eval_score = valid_ic

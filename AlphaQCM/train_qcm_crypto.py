@@ -382,6 +382,9 @@ def run(args):
             f"{name}-seed{args.seed}-{time}-N{config['N']}-lr{config['quantile_lr']}-per{config['use_per']}-gamma{config['gamma']}-step{config['multi_step']}"
         )
 
+    print(f"日志目录: {log_dir}")
+    print(f"TensorBoard: tensorboard --logdir=\"{os.path.join(log_dir, 'summary')}\"")
+
     # Create the agent and run
     if name == 'qrdqn':
         agent = QRQCMAgent(
