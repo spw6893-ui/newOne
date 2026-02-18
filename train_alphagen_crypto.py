@@ -252,6 +252,15 @@ def main():
     # 现在再 import alphagen（确保 action space 读到的是动态 FeatureType）
     # 注意：当前 alphagen 版本没有 Close()/Open() 这类快捷构造器，使用 Feature(FeatureType.X) 即可。
     from alphagen.data.expression import Feature, Ref
+    # 兼容：alphagen 上游 rolling Std/Var 在窗口=1 时会触发 dof<=0 警告并产生 NaN（unbiased=True 的默认行为）。
+    # 这里做一次运行时 monkey patch，避免需要修改 submodule 指针（否则会导致他人无法拉取特定 commit）。
+    import alphagen.data.expression as _expr_mod
+    def _std_apply_unbiased_false(self, operand):  # type: ignore[no-redef]
+        return operand.std(dim=-1, unbiased=False)
+    def _var_apply_unbiased_false(self, operand):  # type: ignore[no-redef]
+        return operand.var(dim=-1, unbiased=False)
+    _expr_mod.Std._apply = _std_apply_unbiased_false  # type: ignore[assignment]
+    _expr_mod.Var._apply = _var_apply_unbiased_false  # type: ignore[assignment]
     from alphagen.models.linear_alpha_pool import MseAlphaPool
     from alphagen.rl.env.wrapper import AlphaEnv
     import alphagen.rl.env.wrapper as env_wrapper
