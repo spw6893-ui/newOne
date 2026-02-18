@@ -97,6 +97,136 @@ def _detect_feature_space(data_dir: Path) -> FeatureSpace:
 
     return FeatureSpace(feature_cols=feature_cols)
 
+
+def _cs_mean_pearson_ic(x: torch.Tensor, y: torch.Tensor) -> float:
+    """
+    计算“按时点的截面皮尔逊相关(IC)”，并对所有时点取均值。
+
+    x/y: shape=(time, symbols)，允许 NaN/inf，自动忽略无效值。
+    """
+    if x.shape != y.shape:
+        raise ValueError(f"x/y 形状不一致: {tuple(x.shape)} vs {tuple(y.shape)}")
+    # mask=True 表示无效值（不参与统计）
+    mask = (~torch.isfinite(x)) | (~torch.isfinite(y))
+    n = (~mask).sum(dim=1)  # (time,)
+
+    # 至少需要 2 个样本才能算相关
+    valid = n >= 2
+    if not bool(valid.any()):
+        return float("nan")
+
+    n_safe = torch.clamp(n, min=1)
+    x0 = x.clone()
+    y0 = y.clone()
+    x0[mask] = 0.0
+    y0[mask] = 0.0
+
+    mean_x = x0.sum(dim=1) / n_safe
+    mean_y = y0.sum(dim=1) / n_safe
+    xc = (x0 - mean_x[:, None]) * (~mask)
+    yc = (y0 - mean_y[:, None]) * (~mask)
+    var_x = (xc * xc).sum(dim=1) / n_safe
+    var_y = (yc * yc).sum(dim=1) / n_safe
+    std_x = torch.sqrt(var_x)
+    std_y = torch.sqrt(var_y)
+
+    # std=0 的时点视为无效（价格常数/全相等等会出现）
+    valid = valid & (std_x > 0) & (std_y > 0)
+    if not bool(valid.any()):
+        return float("nan")
+
+    corr = (xc * yc).sum(dim=1) / (n_safe * std_x * std_y)
+    ic = corr[valid].mean().item()
+    return float(ic)
+
+
+def _select_top_features_by_ic(
+    data: torch.Tensor,
+    feature_cols: Sequence[str],
+    k: int,
+    corr_threshold: float,
+    ensure_cols: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """
+    用训练集做单变量 IC 打分并选 Top-K，同时用 mutual-IC 做去冗余（近似“高度相关特征剔除”）。
+
+    - IC 口径：每个时点做截面相关（跨币种），再对时点取均值。
+    - mutual-IC：同样口径对 (feature_i, feature_j) 做相关，用于剔除 |corr|>=阈值 的冗余特征。
+    """
+    if k <= 0:
+        return list(feature_cols)
+    if data.ndim != 3:
+        raise ValueError(f"data 期望 shape=(time, features, symbols)，但得到: {tuple(data.shape)}")
+    if len(feature_cols) != int(data.shape[1]):
+        raise ValueError(f"feature_cols 数量与 data features 维不一致: {len(feature_cols)} vs {int(data.shape[1])}")
+
+    ensure = [c for c in (ensure_cols or []) if c]
+    ensure_set = set(ensure)
+
+    if "close" not in feature_cols:
+        raise RuntimeError("特征列里缺少 close，无法计算 forward return 作为 target")
+    close_idx = list(feature_cols).index("close")
+    close = data[:, close_idx, :]  # (time, symbols)
+    # forward 1h return: close[t+1]/close[t]-1
+    y = close[1:, :] / close[:-1, :] - 1.0
+
+    scores: List[tuple[str, float]] = []
+    time_aligned = slice(0, -1)
+    for j, col in enumerate(feature_cols):
+        x = data[time_aligned, j, :]
+        ic = _cs_mean_pearson_ic(x, y)
+        if not np.isfinite(ic):
+            ic = 0.0
+        scores.append((str(col), float(ic)))
+
+    # 按 |IC| 排序（绝对值越大越好）
+    scores.sort(key=lambda t: abs(t[1]), reverse=True)
+
+    # 贪心去冗余：从高分到低分依次尝试加入
+    corr_threshold = float(corr_threshold)
+    corr_threshold = max(0.0, min(1.0, corr_threshold))
+
+    kept: List[str] = []
+
+    # 先把 ensure_cols 放进去（顺序保持），避免 target 依赖列丢失
+    for c in ensure:
+        if c in feature_cols and c not in kept:
+            kept.append(c)
+
+    for col, _ic in scores:
+        if col in ensure_set:
+            continue
+        if col in kept:
+            continue
+        if len(kept) >= k:
+            break
+
+        # 与已保留特征计算 mutual-IC，过高则跳过
+        j = list(feature_cols).index(col)
+        x = data[time_aligned, j, :]
+        redundant = False
+        for exist in kept:
+            jj = list(feature_cols).index(exist)
+            xx = data[time_aligned, jj, :]
+            mic = _cs_mean_pearson_ic(x, xx)
+            if np.isfinite(mic) and abs(float(mic)) >= corr_threshold:
+                redundant = True
+                break
+        if not redundant:
+            kept.append(col)
+
+    # 如果 ensure 占满了 k，也允许超过 k（因为 close 必须有）；否则补足到至少包含 ensure
+    if "close" in feature_cols and "close" not in kept:
+        kept = ["close"] + kept
+
+    # 最终保持原始列名（snake_case），并保证都在 feature_cols 内
+    out = [c for c in kept if c in feature_cols]
+    # 兜底：至少返回 close
+    if not out:
+        out = ["close"]
+    return out
+
+
 def _install_dynamic_feature_type(feature_cols: Sequence[str]) -> None:
     """
     动态构造 alphagen_qlib.stock_data.FeatureType，使得 AlphaGen 能把"宽表全部因子列"当作可选 Feature。
@@ -149,7 +279,38 @@ def main():
     END_TIME = os.environ.get("ALPHAGEN_END_TIME", "2025-02-15")
 
     # 特征：默认把 alphagen_ready 里的"全部因子列"都扔进 AlphaGen（FeatureType 动态构造）
+    # 可选：用训练集的单变量 IC 做预筛选，从而缩小 action space（更容易探索/更快收敛）
     feature_space = _detect_feature_space(Path(DATA_DIR))
+
+    features_max = int(os.environ.get("ALPHAGEN_FEATURES_MAX", "0").strip() or 0)
+    prune_corr = float(os.environ.get("ALPHAGEN_FEATURES_PRUNE_CORR", "0.95").strip() or 0.95)
+    if features_max > 0:
+        # 先用“全特征”构造 FeatureType，加载一次数据做打分，然后再用筛选后的特征重建 FeatureType。
+        _install_dynamic_feature_type(feature_space.feature_cols)
+        from AlphaQCM.alphagen_qlib.crypto_data import CryptoData
+
+        print(f"计算特征 IC 以做预筛选: topK={features_max}, prune_corr={prune_corr}")
+        score_data = CryptoData(
+            symbols=SYMBOLS,
+            start_time=START_TIME,
+            end_time=TRAIN_END,
+            timeframe="1h",
+            data_dir=DATA_DIR,
+            max_backtrack_periods=100,
+            max_future_periods=30,
+            features=None,
+            device=torch.device("cpu"),
+        )
+        selected_cols = _select_top_features_by_ic(
+            data=score_data.data.detach().cpu(),
+            feature_cols=feature_space.feature_cols,
+            k=features_max,
+            corr_threshold=prune_corr,
+            ensure_cols=["close"],
+        )
+        feature_space = FeatureSpace(feature_cols=selected_cols)
+        print(f"预筛选后特征数: {len(feature_space.feature_cols)}")
+        print(f"预筛选特征列表: {feature_space.feature_cols}")
 
     _install_dynamic_feature_type(feature_space.feature_cols)
     # alphagen wrapper 的 state dtype 默认是 uint8，因此 action_space 不能超过 255
