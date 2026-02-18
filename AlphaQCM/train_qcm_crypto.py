@@ -3,6 +3,7 @@ import yaml
 import argparse
 import torch
 from datetime import datetime
+from pathlib import Path
 
 from fqf_iqn_qrdqn.agent import QRQCMAgent, IQCMAgent, FQCMAgent
 from alphagen.data.expression import Feature, Ref
@@ -14,9 +15,10 @@ from alphagen.rl.env.wrapper import AlphaEnv
 
 
 def run(args):
-    config_path = os.path.join('qcm_config', f'{args.model}.yaml')
+    base_dir = Path(__file__).resolve().parent
+    config_path = base_dir / 'qcm_config' / f'{args.model}.yaml'
 
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
 
     # Create environments
@@ -31,26 +33,27 @@ def run(args):
     symbols = args.symbols
 
     # Load crypto data
+    data_dir = str((base_dir / 'AlphaQCM_data' / 'crypto_data').resolve())
     data_train = CryptoData(
         symbols=symbols,
-        start_time='2020-01-01',
-        end_time='2023-12-31',
+        start_time=args.train_start,
+        end_time=args.train_end,
         timeframe=args.timeframe,
-        data_dir='AlphaQCM_data/crypto_data'
+        data_dir=data_dir
     )
     data_valid = CryptoData(
         symbols=symbols,
-        start_time='2024-01-01',
-        end_time='2024-06-30',
+        start_time=args.valid_start,
+        end_time=args.valid_end,
         timeframe=args.timeframe,
-        data_dir='AlphaQCM_data/crypto_data'
+        data_dir=data_dir
     )
     data_test = CryptoData(
         symbols=symbols,
-        start_time='2024-07-01',
-        end_time='2024-12-31',
+        start_time=args.test_start,
+        end_time=args.test_end,
         timeframe=args.timeframe,
-        data_dir='AlphaQCM_data/crypto_data'
+        data_dir=data_dir
     )
 
     train_calculator = QLibStockDataCalculator(data_train, target)
@@ -71,14 +74,14 @@ def run(args):
 
     if name in ['qrdqn', 'iqn']:
         log_dir = os.path.join(
-            'AlphaQCM_data/crypto_logs',
+            str((base_dir / 'AlphaQCM_data' / 'crypto_logs').resolve()),
             f'{symbols}_{args.timeframe}',
             f'pool_{args.pool}_QCM_{args.std_lam}',
             f"{name}-seed{args.seed}-{time}-N{config['N']}-lr{config['lr']}-per{config['use_per']}-gamma{config['gamma']}-step{config['multi_step']}"
         )
     elif name == 'fqf':
         log_dir = os.path.join(
-            'AlphaQCM_data/crypto_logs',
+            str((base_dir / 'AlphaQCM_data' / 'crypto_logs').resolve()),
             f'{symbols}_{args.timeframe}',
             f'pool_{args.pool}_QCM_{args.std_lam}',
             f"{name}-seed{args.seed}-{time}-N{config['N']}-lr{config['quantile_lr']}-per{config['use_per']}-gamma{config['gamma']}-step{config['multi_step']}"
@@ -141,5 +144,17 @@ if __name__ == '__main__':
                         help='Candle timeframe')
     parser.add_argument('--target-periods', type=int, default=20,
                         help='Number of periods ahead to predict')
+    parser.add_argument('--train-start', type=str, default='2020-01-01',
+                        help='Train start (inclusive)')
+    parser.add_argument('--train-end', type=str, default='2023-12-31',
+                        help='Train end (inclusive)')
+    parser.add_argument('--valid-start', type=str, default='2024-01-01',
+                        help='Validation start (inclusive)')
+    parser.add_argument('--valid-end', type=str, default='2024-06-30',
+                        help='Validation end (inclusive)')
+    parser.add_argument('--test-start', type=str, default='2024-07-01',
+                        help='Test start (inclusive)')
+    parser.add_argument('--test-end', type=str, default='2024-12-31',
+                        help='Test end (inclusive)')
     args = parser.parse_args()
     run(args)
