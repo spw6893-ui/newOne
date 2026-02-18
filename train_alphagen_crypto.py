@@ -397,7 +397,8 @@ def main():
     CLIP_RANGE = float(os.environ.get("ALPHAGEN_CLIP_RANGE", "0.2"))
     # 默认不额外加熵正则（保持与 PPO 默认一致，避免在大 action space 下冷启动卡死）
     ENT_COEF = float(os.environ.get("ALPHAGEN_ENT_COEF", "0.0"))
-    target_kl_raw = os.environ.get("ALPHAGEN_TARGET_KL", "0.03").strip().lower()
+    # 默认关闭 KL early-stop（更贴近最初的训练脚本行为；需要时可显式设置数值开启）
+    target_kl_raw = os.environ.get("ALPHAGEN_TARGET_KL", "none").strip().lower()
     TARGET_KL: Optional[float]
     if target_kl_raw in {"none", "null", ""}:
         TARGET_KL = None
