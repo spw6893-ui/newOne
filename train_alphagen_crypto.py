@@ -116,7 +116,8 @@ def main():
     _install_dynamic_feature_type(feature_space.feature_cols)
 
     # 现在再 import alphagen（确保 action space 读到的是动态 FeatureType）
-    from alphagen.data.expression import Close, Ref
+    # 注意：当前 alphagen 版本没有 Close()/Open() 这类快捷构造器，使用 Feature(FeatureType.X) 即可。
+    from alphagen.data.expression import Feature, Ref
     from alphagen.models.linear_alpha_pool import MseAlphaPool
     from alphagen.rl.env.wrapper import AlphaEnv
     from alphagen.rl.policy import LSTMSharedNet
@@ -126,6 +127,7 @@ def main():
 
     from alphagen_qlib.crypto_data import CryptoData
     from alphagen_qlib.calculator import QLibStockDataCalculator
+    import alphagen_qlib.stock_data as sd
 
     class TensorboardCallback(BaseCallback):
         """记录训练指标到TensorBoard"""
@@ -181,7 +183,13 @@ def main():
 
     # ==================== 定义目标 ====================
     # 预测1小时后的收益率
-    target = Ref(Close(), -1) / Close() - 1
+    if "close" not in feature_space.feature_cols:
+        raise RuntimeError(
+            f"特征列中未找到 close，无法构造目标。请检查 {DATA_DIR} 下 *_train.csv 表头。"
+        )
+    close_idx = feature_space.feature_cols.index("close")
+    close_expr = Feature(sd.FeatureType(close_idx))
+    target = Ref(close_expr, -1) / close_expr - 1
 
     print(f"Target: 1-hour forward return")
 
