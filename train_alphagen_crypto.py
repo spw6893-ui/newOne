@@ -254,6 +254,7 @@ def main():
     from alphagen.data.expression import Feature, Ref
     from alphagen.models.linear_alpha_pool import MseAlphaPool
     from alphagen.rl.env.wrapper import AlphaEnv
+    import alphagen.rl.env.wrapper as env_wrapper
     from alphagen.rl.policy import LSTMSharedNet
     from alphagen.utils import reseed_everything
     from sb3_contrib.ppo_mask import MaskablePPO
@@ -304,7 +305,17 @@ def main():
     CLIP_RANGE = float(os.environ.get("ALPHAGEN_CLIP_RANGE", "0.2"))
     # ent_coef 太大时会让策略长期接近均匀随机，表现为 ep_len_mean≈MAX_EXPR_LENGTH、ep_rew_mean≈-1
     ENT_COEF = float(os.environ.get("ALPHAGEN_ENT_COEF", "0.001"))
-    TARGET_KL = float(os.environ.get("ALPHAGEN_TARGET_KL", "0.03"))
+    target_kl_raw = os.environ.get("ALPHAGEN_TARGET_KL", "0.03").strip().lower()
+    TARGET_KL: Optional[float]
+    if target_kl_raw in {"none", "null", ""}:
+        TARGET_KL = None
+    else:
+        v = float(target_kl_raw)
+        TARGET_KL = None if v <= 0 else v
+
+    # 每步惩罚（鼓励更短表达式/更早 SEP），默认 0
+    reward_per_step = float(os.environ.get("ALPHAGEN_REWARD_PER_STEP", "0").strip() or 0.0)
+    env_wrapper.REWARD_PER_STEP = reward_per_step
 
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
@@ -315,6 +326,9 @@ def main():
     print(f"Val: {TRAIN_END} -> {VAL_END}")
     print(f"Test: {VAL_END} -> {END_TIME}")
     print(f"Features (dynamic): {len(feature_space.feature_cols)}")
+    print(f"Policy: LSTM layers={LSTM_LAYERS}, dim={LSTM_DIM}, dropout={LSTM_DROPOUT}")
+    print(f"PPO: lr={LEARNING_RATE}, n_steps={N_STEPS}, gae_lambda={GAE_LAMBDA}, clip={CLIP_RANGE}, ent_coef={ENT_COEF}, target_kl={TARGET_KL}")
+    print(f"Env shaping: reward_per_step={reward_per_step}")
     print()
 
     # ==================== 设置随机种子 ====================
