@@ -6,6 +6,14 @@ echo "AlphaGen Crypto Factor Mining - One-Click"
 echo "=========================================="
 echo ""
 
+# 确保 alphagen 子模块已拉取（否则会出现 `No module named alphagen.rl.env`）
+if [ ! -f "alphagen/requirements.txt" ]; then
+    echo "检测到 alphagen 子模块未就绪，正在初始化..."
+    git submodule update --init --recursive
+    echo "✓ alphagen 子模块就绪"
+    echo ""
+fi
+
 # 配置参数
 TRAIN_END="2024-01-01 00:00:00+00:00"
 VAL_END="2024-07-01 00:00:00+00:00"
