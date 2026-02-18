@@ -311,6 +311,17 @@ def main():
         feature_space = FeatureSpace(feature_cols=selected_cols)
         print(f"预筛选后特征数: {len(feature_space.feature_cols)}")
         print(f"预筛选特征列表: {feature_space.feature_cols}")
+        # 记录到输出目录，方便复现实验
+        try:
+            out_dir = Path("./alphagen_output")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "selected_features.json").write_text(
+                json.dumps({"features": feature_space.feature_cols}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"✓ 预筛选结果已保存: {out_dir / 'selected_features.json'}")
+        except Exception as e:
+            print(f"⚠ 保存预筛选结果失败: {e}")
 
     _install_dynamic_feature_type(feature_space.feature_cols)
     # alphagen wrapper 的 state dtype 默认是 uint8，因此 action_space 不能超过 255
