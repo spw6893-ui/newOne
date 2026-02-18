@@ -26,14 +26,64 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
 
 EPS = 1e-12
+
+
+def _read_header_cols(fp: Path) -> list[str]:
+    """
+    仅读取 CSV 表头，避免全量载入。
+
+    约定：输入文件是 `*_final.csv`（index=第一列），因此返回的 cols 不包含 index 列名。
+    """
+    with fp.open("r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+    if not header:
+        return []
+    # 第一列是 index（datetime），不纳入 columns
+    return [c.strip() for c in header[1:] if c is not None and str(c).strip()]
+
+
+def _canonical_order(cols: Iterable[str]) -> list[str]:
+    """
+    给输出列一个稳定顺序，便于 diff/调试，也便于训练端做一致的 FeatureType 映射。
+    """
+    cols = list(dict.fromkeys([str(c).strip() for c in cols if str(c).strip()]))
+    colset = set(cols)
+
+    core = [c for c in ("symbol", "feature_time", "split", "open", "high", "low", "close", "volume", "volume_clean", "vwap") if c in colset]
+    labels = sorted([c for c in cols if c.startswith("y_")])
+    rest = [c for c in cols if (c not in set(core)) and (c not in set(labels))]
+    rest_sorted = sorted(rest)
+    return core + rest_sorted + labels
+
+
+def _compute_global_schema(files: Sequence[Path], mode: str) -> list[str]:
+    mode = str(mode).lower().strip()
+    if mode not in {"union", "intersection"}:
+        raise ValueError(f"schema mode 仅支持 union/intersection：{mode}")
+
+    col_sets: list[set[str]] = []
+    for fp in files:
+        cols = set(_read_header_cols(fp))
+        col_sets.append(cols)
+
+    if not col_sets:
+        return []
+    if mode == "union":
+        merged: set[str] = set().union(*col_sets)
+        return _canonical_order(merged)
+    merged = set.intersection(*col_sets)
+    return _canonical_order(merged)
 
 
 def _to_utc_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -101,6 +151,7 @@ def prepare_one(
     filter_quality: bool,
     impute_policy: str,
     ffill_limit: Optional[int],
+    schema_cols: Optional[Sequence[str]] = None,
     train_end: Optional[pd.Timestamp] = None,
     val_end: Optional[pd.Timestamp] = None,
 ) -> pd.DataFrame:
@@ -113,6 +164,10 @@ def prepare_one(
 
     if filter_quality:
         df = _apply_quality_filter(df)
+
+    if schema_cols is not None:
+        # 统一输出 schema：缺失列补 NaN（后续由 impute 策略决定是否填充）
+        df = df.reindex(columns=list(schema_cols))
 
     df = _impute(df, policy=impute_policy, ffill_limit=ffill_limit)
     # 避免 DataFrame 高度碎片化导致的性能警告（后续可能还会添加少量列）
@@ -146,6 +201,16 @@ def main() -> int:
     ap.add_argument("--ffill-limit", type=int, default=24, help="ffill 的最大连续填充步数（小时），默认 24")
     ap.add_argument("--train-end", default="", help="训练集结束时间（UTC，例：2022-12-31 23:00:00+00:00）")
     ap.add_argument("--val-end", default="", help="验证集结束时间（UTC，例：2023-06-30 23:00:00+00:00）")
+    ap.add_argument(
+        "--schema",
+        default="per-file",
+        help="输出列 schema：per-file（默认，按币种原样）/ union（全币种并集）/ intersection（全币种交集）",
+    )
+    ap.add_argument(
+        "--schema-out",
+        default="",
+        help="当 --schema=union|intersection 时，保存 schema 的 JSON 路径（默认写到输出目录：schema.json）",
+    )
     ap.add_argument("--limit", type=int, default=0, help="仅处理前 N 个文件（0=不限制）")
     args = ap.parse_args()
 
@@ -161,6 +226,20 @@ def main() -> int:
         print(f"未找到输入文件：{input_dir}")
         return 2
 
+    schema_mode = str(args.schema).lower().strip()
+    schema_cols: Optional[list[str]] = None
+    if schema_mode in {"union", "intersection"}:
+        schema_cols = _compute_global_schema(files, schema_mode)
+        if not schema_cols:
+            raise RuntimeError(f"无法计算全局 schema：{schema_mode}")
+        schema_out = str(args.schema_out).strip()
+        if not schema_out:
+            schema_out = str((output_dir / "schema.json").resolve())
+        Path(schema_out).parent.mkdir(parents=True, exist_ok=True)
+        with open(schema_out, "w", encoding="utf-8") as f:
+            json.dump({"mode": schema_mode, "columns": schema_cols}, f, ensure_ascii=False, indent=2)
+        print(f"全局 schema({schema_mode}) 列数：{len(schema_cols)} -> {schema_out}")
+
     train_end = pd.to_datetime(args.train_end, utc=True, errors="coerce") if str(args.train_end).strip() else None
     val_end = pd.to_datetime(args.val_end, utc=True, errors="coerce") if str(args.val_end).strip() else None
 
@@ -175,6 +254,7 @@ def main() -> int:
                 filter_quality=bool(args.filter_quality),
                 impute_policy=str(args.impute),
                 ffill_limit=int(args.ffill_limit) if args.ffill_limit is not None else None,
+                schema_cols=schema_cols,
                 train_end=train_end,
                 val_end=val_end,
             )

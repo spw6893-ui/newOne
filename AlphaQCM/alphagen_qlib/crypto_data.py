@@ -40,8 +40,27 @@ class CryptoData:
         self._feature_columns = list(feature_columns) if feature_columns is not None else list(
             getattr(sd, "FEATURE_COLUMNS", [])
         )
+        # 训练阶段会把宽表“所有因子列”都塞进同一个 CSV，这会让 read_csv 默认读全列非常吃内存。
+        # 这里提前计算本次加载真正需要的列名集合：仅包含 FeatureType 对应的列（不含 y_*、质量标记等）。
+        self._required_columns = self._compute_required_columns()
         self.device = device
         self.data, self._dates, self._symbol_ids = self._get_data()
+
+    def _compute_required_columns(self) -> List[str]:
+        """
+        仅保留 AlphaGen 环境会用到的特征列，避免把 label/flag 等无关列读入内存导致 OOM。
+        """
+        required: set[str] = set()
+        if self._feature_columns:
+            for ft in self._features:
+                j = int(ft)
+                if 0 <= j < len(self._feature_columns):
+                    required.add(str(self._feature_columns[j]))
+        else:
+            for c in ("open", "high", "low", "close", "vwap", "volume", "volume_clean"):
+                required.add(c)
+        # 兜底：如果文件里有 symbol 列，读不读都无所谓；但为了兼容一些下游处理，这里不强依赖。
+        return sorted([c for c in required if c])
 
     @staticmethod
     def _symbol_variants(symbol: str) -> List[str]:
@@ -109,7 +128,20 @@ class CryptoData:
             return None
 
         try:
-            df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+            # 优先按需读列（大幅降低内存峰值）；若列不存在则自动回退全量读取。
+            usecols = None
+            if self._required_columns:
+                # 输入 CSV 约定包含 datetime 列（index 列名），prepare 脚本会写出该字段
+                usecols = ["datetime"] + self._required_columns
+            try:
+                if usecols is None:
+                    raise ValueError("skip usecols")
+                df = pd.read_csv(file_path, usecols=usecols, parse_dates=["datetime"])
+                if "datetime" not in df.columns:
+                    raise ValueError("missing datetime column")
+                df = df.set_index("datetime")
+            except Exception:
+                df = pd.read_csv(file_path, index_col=0, parse_dates=True)
             # 兼容：如果 index 不是 datetime，尝试从 datetime 列提取
             idx = pd.to_datetime(df.index, utc=True, errors="coerce")
             if idx.isna().all() and "datetime" in df.columns:
@@ -204,12 +236,27 @@ class CryptoData:
                 if col:
                     data_array[:, j, i] = pd.to_numeric(df[col], errors="coerce").astype("float32").values
 
-        # Check for remaining NaN values
-        nan_count = np.isnan(data_array).sum()
-        if nan_count > 0:
-            print(f"Warning: {nan_count} NaN values remain, filling with 0")
-            # 原地填充，避免产生额外大拷贝导致 OOM
-            np.nan_to_num(data_array, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        # 可选：按“因子可用性覆盖率”做时段门控（Dynamic Factor Universe 的工程近似）
+        # - 目的：某些因子在很长一段历史里根本不存在（或覆盖极低），不应被当作有效 0 值参与训练。
+        # - 做法：当某因子在某个时点的跨币种覆盖率 < 阈值时，把该时点的该因子全部置为 NaN，
+        #         让 IC/相关系数计算自动忽略这些样本。
+        #
+        # 注意：这不会动态改变 action space（AlphaGen 的 feature token 集合仍是固定的），
+        #       但能避免“因子上线前被硬塞 0”的不合理训练信号。
+        min_cov = float(os.environ.get("ALPHAGEN_FACTOR_MIN_COVERAGE", "0").strip() or 0.0)
+        if min_cov > 0:
+            min_cov = max(0.0, min(1.0, min_cov))
+            for j in range(n_features):
+                cov = np.mean(~np.isnan(data_array[:, j, :]), axis=1)  # (time,)
+                low = cov < min_cov
+                if np.any(low):
+                    data_array[low, j, :] = np.nan
+            print(f"Applied factor availability gating: min_coverage={min_cov}")
+
+        # 统一处理 inf -> NaN（避免 log/除法时污染）
+        inf_mask = ~np.isfinite(data_array)
+        if np.any(inf_mask):
+            data_array[inf_mask] = np.nan
 
         # Load to CPU first to avoid CUDA OOM
         # 使用 from_numpy 共享内存，避免 torch.tensor 产生第二份拷贝

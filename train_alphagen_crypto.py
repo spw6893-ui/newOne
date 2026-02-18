@@ -22,8 +22,9 @@ import torch
 
 
 repo_root = Path(__file__).resolve().parent
-# 导入优先级：alphagen 子模块必须在最前；AlphaQCM 仅用于提供 alphagen_qlib 适配层
-sys.path.insert(0, str(repo_root / "AlphaQCM"))
+# 导入优先级：
+# 1) alphagen 子模块（repo_root/alphagen）用于 AlphaGen 核心实现
+# 2) AlphaQCM 作为“包”使用（repo_root 默认已在 sys.path），只通过 `AlphaQCM.alphagen_qlib` 引用适配层
 sys.path.insert(0, str(repo_root / "alphagen"))
 
 
@@ -52,11 +53,57 @@ def _detect_feature_space(data_dir: Path) -> FeatureSpace:
     if not files:
         raise FileNotFoundError(f"未找到训练数据：{data_dir}（期望 *_train.csv）")
 
-    header = _read_csv_header(files[0])
     exclude = {"datetime", "symbol", "split"}
-    feature_cols = [c for c in header if c and (c not in exclude) and (not c.startswith("y_"))]
+    exclude_env = os.environ.get("ALPHAGEN_EXCLUDE_COLS", "").strip()
+    exclude_cols = {c.strip() for c in exclude_env.split(",") if c.strip()} if exclude_env else set()
+
+    # 优先使用 prepare_alphagen_training_data.py 写出的 schema.json（若存在）
+    schema_fp = data_dir / "schema.json"
+    if schema_fp.exists():
+        try:
+            obj = json.loads(schema_fp.read_text(encoding="utf-8"))
+            cols = obj.get("columns", [])
+            header = [str(c).strip() for c in cols if str(c).strip()]
+        except Exception:
+            header = []
+    else:
+        header = []
+
+    # 如果没有 schema.json，则用扫描表头的方式构造特征列集合
+    # mode=union（默认）：把所有币种出现过的列都纳入（“全因子”）
+    # mode=intersection：只保留所有币种都具备的列（显著减少 NaN，适合先跑通训练）
+    mode = os.environ.get("ALPHAGEN_FEATURE_SCHEMA_MODE", "union").strip().lower()
+    if not header:
+        ordered: List[str] = []
+        seen = set()
+        per_file_sets: List[set[str]] = []
+        for fp in files:
+            h = _read_csv_header(fp)
+            cols = [c for c in h if c and (c not in exclude) and (not c.startswith("y_")) and (c not in exclude_cols)]
+            per_file_sets.append(set(cols))
+            for c in cols:
+                if c not in seen:
+                    seen.add(c)
+                    ordered.append(c)
+        if mode == "intersection":
+            inter = set.intersection(*per_file_sets) if per_file_sets else set()
+            header = [c for c in ordered if c in inter]
+        else:
+            header = ordered
+
+    feature_cols = [c for c in header if c and (c not in exclude) and (not c.startswith("y_")) and (c not in exclude_cols)]
     if not feature_cols:
-        raise RuntimeError(f"未能从表头推断出任何特征列：{files[0]}")
+        raise RuntimeError(f"未能从表头推断出任何特征列：{data_dir}")
+
+    # 可选：限制特征数量（避免 action_space>255 或内存压力过大）
+    max_n = os.environ.get("ALPHAGEN_FEATURES_MAX", "").strip()
+    if max_n:
+        n = int(max_n)
+        if n > 0 and len(feature_cols) > n:
+            keep_core = [c for c in ("open", "high", "low", "close", "volume", "volume_clean", "vwap") if c in feature_cols]
+            rest = [c for c in feature_cols if c not in set(keep_core)]
+            feature_cols = keep_core + rest[: max(0, n - len(keep_core))]
+
     return FeatureSpace(feature_cols=feature_cols)
 
 
@@ -132,9 +179,12 @@ def main():
     from sb3_contrib.ppo_mask import MaskablePPO
     from stable_baselines3.common.callbacks import BaseCallback
 
-    from alphagen_qlib.crypto_data import CryptoData
-    from alphagen_qlib.calculator import QLibStockDataCalculator
-    import alphagen_qlib.stock_data as sd
+    from AlphaQCM.alphagen_qlib.crypto_data import CryptoData
+    from AlphaQCM.alphagen_qlib.calculator import QLibStockDataCalculator
+    import AlphaQCM.alphagen_qlib.stock_data as sd
+
+    import alphagen as alphagen_pkg
+    print(f"alphagen 包路径: {getattr(alphagen_pkg, '__file__', 'UNKNOWN')}")
 
     class TensorboardCallback(BaseCallback):
         """记录训练指标到TensorBoard"""
@@ -150,6 +200,7 @@ def main():
     BATCH_SIZE = int(os.environ.get("ALPHAGEN_BATCH_SIZE", "128"))
     TOTAL_TIMESTEPS = int(os.environ.get("ALPHAGEN_TOTAL_TIMESTEPS", "100000"))
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device_obj = torch.device(DEVICE)
 
     # 输出配置
     OUTPUT_DIR = Path('./alphagen_output')
@@ -184,7 +235,7 @@ def main():
         max_backtrack_periods=100,
         max_future_periods=30,
         features=None,  # 使用动态 FeatureType 的全集
-        device=torch.device(DEVICE)
+        device=device_obj
     )
 
     print(f"Train data: {train_data.n_days} days, {train_data.n_stocks} symbols, {train_data.n_features} features")
@@ -211,12 +262,12 @@ def main():
         capacity=POOL_CAPACITY,
         calculator=calculator,
         ic_lower_bound=IC_LOWER_BOUND,
-        device=torch.device(DEVICE),
+        device=device_obj,
     )
 
     # ==================== 创建RL环境 ====================
     print("Setting up RL environment...")
-    env = AlphaEnv(pool=pool, device=torch.device(DEVICE))
+    env = AlphaEnv(pool=pool, device=device_obj)
 
     # ==================== 创建PPO模型 ====================
     print("Creating PPO model...")
@@ -224,7 +275,9 @@ def main():
         features_extractor_class=LSTMSharedNet,
         features_extractor_kwargs=dict(
             n_layers=2,
-            d_model=128
+            d_model=128,
+            dropout=0.1,
+            device=device_obj,
         )
     )
 
@@ -285,7 +338,7 @@ def main():
         max_backtrack_periods=100,
         max_future_periods=30,
         features=None,
-        device=torch.device(DEVICE)
+        device=device_obj,
     )
 
     val_calculator = QLibStockDataCalculator(val_data, target)

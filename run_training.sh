@@ -24,6 +24,11 @@ VAL_END="2024-07-01 00:00:00+00:00"
 # 允许外部覆盖（例如你只复原到了 final_dataset/ 目录）
 INPUT_DIR="${INPUT_DIR:-AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
+# 训练 CSV 的 schema 策略：
+# - per-file：保持每个币自己的列（默认，兼容旧输出）
+# - union：全币种并集（“全因子”）
+# - intersection：全币种交集（NaN 最少，适合先跑通）
+SCHEMA_MODE="${SCHEMA_MODE:-per-file}"
 
 # 检查数据目录（Vision 基底 + metrics 覆盖完整 85 币种）
 if [ ! -d "$INPUT_DIR" ] || [ -z "$(ls -A "$INPUT_DIR"/*_final.csv 2>/dev/null)" ]; then
@@ -54,6 +59,7 @@ if [ "$FORCE_REBUILD" = "1" ] || [ ! -d "AlphaQCM/AlphaQCM_data/alphagen_ready" 
         --filter-quality \
         --impute ffill \
         --ffill-limit 24 \
+        --schema "$SCHEMA_MODE" \
         --train-end "$TRAIN_END" \
         --val-end "$VAL_END"
     echo "✓ 数据准备完成"
