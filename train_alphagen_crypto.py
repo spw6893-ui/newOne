@@ -40,7 +40,8 @@ def main():
     # ==================== 配置参数 ====================
 
     # 数据配置
-    DATA_DIR = 'AlphaQCM_data/alphagen_ready'
+    # 训练数据默认落在 AlphaQCM/AlphaQCM_data/alphagen_ready（由 run_training.sh / prepare_alphagen_training_data.py 生成）
+    DATA_DIR = 'AlphaQCM/AlphaQCM_data/alphagen_ready'
     SYMBOLS = 'top20'  # 或指定列表: ['BTCUSDT', 'ETHUSDT', ...]
 
     # 时间分割

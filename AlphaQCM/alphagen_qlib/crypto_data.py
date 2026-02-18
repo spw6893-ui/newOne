@@ -4,6 +4,7 @@ import pandas as pd
 import torch
 import os
 import glob
+import re
 
 # Import FeatureType from stock_data to maintain compatibility
 from alphagen_qlib.stock_data import FeatureType
@@ -37,6 +38,31 @@ class CryptoData:
         self.device = device
         self.data, self._dates, self._symbol_ids = self._get_data()
 
+    @staticmethod
+    def _symbol_variants(symbol: str) -> List[str]:
+        """
+        生成 symbol 的常见变体，提升对不同命名风格（是否含 :USDT 等）的兼容性。
+        """
+        s = str(symbol).strip()
+        out: List[str] = []
+        if s:
+            out.append(s)
+
+        # 处理类似 BTC_USDT:USDT / BTC_USDT
+        if ":USDT" in s:
+            out.append(s.replace(":USDT", ""))
+        else:
+            out.append(s + ":USDT")
+
+        # 去重保持顺序
+        seen = set()
+        uniq: List[str] = []
+        for x in out:
+            if x and x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        return uniq
+
     def _get_symbols(self, symbol_group: str) -> List[str]:
         """Get symbol list based on group name"""
         if symbol_group == 'top10':
@@ -49,23 +75,43 @@ class CryptoData:
                     'APT_USDT', 'ARB_USDT', 'OP_USDT', 'INJ_USDT', 'SUI_USDT']
         elif symbol_group == 'top100':
             # Load from data directory, sorted by availability
+            # 兼容两种布局：
+            # 1) {symbol}_{timeframe}.csv（原始 crypto_data 口径）
+            # 2) {symbol}_train.csv（alphagen_ready 口径）
             csv_files = glob.glob(os.path.join(self._data_dir, f'*_{self._timeframe}.csv'))
+            if not csv_files:
+                csv_files = glob.glob(os.path.join(self._data_dir, '*_train.csv'))
+                return sorted([os.path.basename(f).replace('_train.csv', '') for f in csv_files])
             return sorted([os.path.basename(f).replace(f'_{self._timeframe}.csv', '') for f in csv_files])
         elif symbol_group == 'all':
             csv_files = glob.glob(os.path.join(self._data_dir, f'*_{self._timeframe}.csv'))
+            if not csv_files:
+                csv_files = glob.glob(os.path.join(self._data_dir, '*_train.csv'))
+                return sorted([os.path.basename(f).replace('_train.csv', '') for f in csv_files])
             return sorted([os.path.basename(f).replace(f'_{self._timeframe}.csv', '') for f in csv_files])
         else:
             raise ValueError(f"Unknown symbol group: {symbol_group}. Use 'top10', 'top20', 'top100', or 'all'")
 
     def _load_symbol_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Load data for a single symbol"""
-        file_path = os.path.join(self._data_dir, f'{symbol}_{self._timeframe}.csv')
-        if not os.path.exists(file_path):
+        candidates: List[str] = []
+        for s in self._symbol_variants(symbol):
+            candidates.append(os.path.join(self._data_dir, f'{s}_{self._timeframe}.csv'))
+            candidates.append(os.path.join(self._data_dir, f'{s}_train.csv'))
+
+        file_path = next((p for p in candidates if os.path.exists(p)), "")
+        if not file_path:
             return None
 
         try:
             df = pd.read_csv(file_path, index_col=0, parse_dates=True)
-            df.index = pd.to_datetime(df.index, utc=True)
+            # 兼容：如果 index 不是 datetime，尝试从 datetime 列提取
+            idx = pd.to_datetime(df.index, utc=True, errors="coerce")
+            if idx.isna().all() and "datetime" in df.columns:
+                idx = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+                df = df.drop(columns=["datetime"])
+            df.index = idx
+            df = df.loc[df.index.notna()].copy()
 
             # Filter by date range
             df = df[(df.index >= self._start_time) & (df.index <= self._end_time)]
@@ -116,7 +162,15 @@ class CryptoData:
         print(f"Total periods: {len(valid_dates)}")
 
         # Build 3D tensor: (time, features, symbols)
-        feature_names = [f.name.lower() for f in self._features]
+        # FeatureType -> 实际列名映射（兼容最终宽表/训练表常见字段）
+        feat_col_map = {
+            FeatureType.OPEN: ["open"],
+            FeatureType.HIGH: ["high"],
+            FeatureType.LOW: ["low"],
+            FeatureType.CLOSE: ["close"],
+            FeatureType.VWAP: ["vwap"],
+            FeatureType.VOLUME: ["volume", "volume_clean"],
+        }
         n_dates = len(valid_dates)
         n_features = len(self._features)
         n_symbols = len(all_dfs)
@@ -126,12 +180,14 @@ class CryptoData:
 
         for i, symbol in enumerate(all_dfs.keys()):
             df = all_dfs[symbol].reindex(valid_dates)
-            # Forward fill missing values (for newly listed coins)
-            df = df.fillna(method='ffill').fillna(method='bfill')
+            # 仅允许 forward-fill（bfill 会引入前视偏差）
+            df = df.ffill()
 
-            for j, feat in enumerate(feature_names):
-                if feat in df.columns:
-                    data_array[:, j, i] = df[feat].values
+            for j, ft in enumerate(self._features):
+                col_candidates = feat_col_map.get(ft, [ft.name.lower()])
+                col = next((c for c in col_candidates if c in df.columns), "")
+                if col:
+                    data_array[:, j, i] = pd.to_numeric(df[col], errors="coerce").astype("float32").values
 
         # Check for remaining NaN values
         nan_count = np.isnan(data_array).sum()

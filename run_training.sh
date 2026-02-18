@@ -29,8 +29,8 @@ echo "=========================================="
 if [ ! -d "AlphaQCM/AlphaQCM_data/alphagen_ready" ] || [ -z "$(ls -A AlphaQCM/AlphaQCM_data/alphagen_ready 2>/dev/null)" ]; then
     echo "准备训练数据..."
     python AlphaQCM/data_collection/prepare_alphagen_training_data.py \
-        --input-dir "$INPUT_DIR" \
-        --output-dir AlphaQCM/AlphaQCM_data/alphagen_ready \
+        --input-dir AlphaQCM_data/final_dataset_vision_metrics85 \
+        --output-dir AlphaQCM_data/alphagen_ready \
         --horizon-hours 1 \
         --filter-quality \
         --impute ffill \
