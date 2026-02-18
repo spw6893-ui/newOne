@@ -103,17 +103,24 @@ def main():
     # 数据配置
     # 训练数据默认落在 AlphaQCM/AlphaQCM_data/alphagen_ready（由 run_training.sh / prepare_alphagen_training_data.py 生成）
     DATA_DIR = os.environ.get("ALPHAGEN_DATA_DIR", "AlphaQCM/AlphaQCM_data/alphagen_ready")
-    SYMBOLS = 'top20'  # 或指定列表: ['BTCUSDT', 'ETHUSDT', ...]
+    SYMBOLS = os.environ.get("ALPHAGEN_SYMBOLS", "top20")  # 或指定列表: ['BTCUSDT', 'ETHUSDT', ...]
 
     # 时间分割
-    START_TIME = '2020-01-01'
-    TRAIN_END = '2024-01-01'
-    VAL_END = '2024-07-01'
-    END_TIME = '2025-02-15'
+    START_TIME = os.environ.get("ALPHAGEN_START_TIME", "2020-01-01")
+    TRAIN_END = os.environ.get("ALPHAGEN_TRAIN_END", "2024-01-01")
+    VAL_END = os.environ.get("ALPHAGEN_VAL_END", "2024-07-01")
+    END_TIME = os.environ.get("ALPHAGEN_END_TIME", "2025-02-15")
 
     # 特征：默认把 alphagen_ready 里的“全部因子列”都扔进 AlphaGen（FeatureType 动态构造）
     feature_space = _detect_feature_space(Path(DATA_DIR))
     _install_dynamic_feature_type(feature_space.feature_cols)
+    # alphagen wrapper 的 state dtype 默认是 uint8，因此 action_space 不能超过 255
+    # action_space 大小约等于 len(features) + 常量/算子开销（约 42）
+    if len(feature_space.feature_cols) + 42 > 255:
+        raise RuntimeError(
+            f"特征列过多（{len(feature_space.feature_cols)}），会导致 AlphaGen action_space>255（uint8 溢出）。"
+            f"请减少特征列或改造 alphagen 的 wrapper dtype。"
+        )
 
     # 现在再 import alphagen（确保 action space 读到的是动态 FeatureType）
     # 注意：当前 alphagen 版本没有 Close()/Open() 这类快捷构造器，使用 Feature(FeatureType.X) 即可。
@@ -139,9 +146,9 @@ def main():
             return True
 
     # 训练配置
-    SEED = 42
-    BATCH_SIZE = 128
-    TOTAL_TIMESTEPS = 100000
+    SEED = int(os.environ.get("ALPHAGEN_SEED", "42"))
+    BATCH_SIZE = int(os.environ.get("ALPHAGEN_BATCH_SIZE", "128"))
+    TOTAL_TIMESTEPS = int(os.environ.get("ALPHAGEN_TOTAL_TIMESTEPS", "100000"))
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # 输出配置
@@ -160,6 +167,7 @@ def main():
     print(f"Train: {START_TIME} -> {TRAIN_END}")
     print(f"Val: {TRAIN_END} -> {VAL_END}")
     print(f"Test: {VAL_END} -> {END_TIME}")
+    print(f"Features (dynamic): {len(feature_space.feature_cols)}")
     print()
 
     # ==================== 设置随机种子 ====================

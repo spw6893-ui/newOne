@@ -208,10 +208,12 @@ class CryptoData:
         nan_count = np.isnan(data_array).sum()
         if nan_count > 0:
             print(f"Warning: {nan_count} NaN values remain, filling with 0")
-            data_array = np.nan_to_num(data_array, nan=0.0)
+            # 原地填充，避免产生额外大拷贝导致 OOM
+            np.nan_to_num(data_array, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Load to CPU first to avoid CUDA OOM
-        data_tensor = torch.tensor(data_array, dtype=torch.float, device='cpu')
+        # 使用 from_numpy 共享内存，避免 torch.tensor 产生第二份拷贝
+        data_tensor = torch.from_numpy(data_array)
 
         # Move to target device only if explicitly requested
         if self.device.type == 'cuda':
