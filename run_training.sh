@@ -9,7 +9,9 @@ echo ""
 # 配置参数
 TRAIN_END="2024-01-01 00:00:00+00:00"
 VAL_END="2024-07-01 00:00:00+00:00"
-INPUT_DIR="AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85"
+# 允许外部覆盖（例如你只复原到了 final_dataset/ 目录）
+INPUT_DIR="${INPUT_DIR:-AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85}"
+FORCE_REBUILD="${FORCE_REBUILD:-0}"
 
 # 检查数据目录（Vision 基底 + metrics 覆盖完整 85 币种）
 if [ ! -d "$INPUT_DIR" ] || [ -z "$(ls -A "$INPUT_DIR"/*_final.csv 2>/dev/null)" ]; then
@@ -26,10 +28,15 @@ echo "=========================================="
 echo "Step 1: 准备AlphaGen训练数据"
 echo "=========================================="
 
-if [ ! -d "AlphaQCM/AlphaQCM_data/alphagen_ready" ] || [ -z "$(ls -A AlphaQCM/AlphaQCM_data/alphagen_ready 2>/dev/null)" ]; then
+INPUT_DIR_FOR_PREP="$INPUT_DIR"
+if [[ "$INPUT_DIR_FOR_PREP" == AlphaQCM/* ]]; then
+    INPUT_DIR_FOR_PREP="${INPUT_DIR_FOR_PREP#AlphaQCM/}"
+fi
+
+if [ "$FORCE_REBUILD" = "1" ] || [ ! -d "AlphaQCM/AlphaQCM_data/alphagen_ready" ] || [ -z "$(ls -A AlphaQCM/AlphaQCM_data/alphagen_ready 2>/dev/null)" ]; then
     echo "准备训练数据..."
     python AlphaQCM/data_collection/prepare_alphagen_training_data.py \
-        --input-dir AlphaQCM_data/final_dataset_vision_metrics85 \
+        --input-dir "$INPUT_DIR_FOR_PREP" \
         --output-dir AlphaQCM_data/alphagen_ready \
         --horizon-hours 1 \
         --filter-quality \
