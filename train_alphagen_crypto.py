@@ -7,8 +7,12 @@ import sys
 from pathlib import Path
 
 # 添加路径
-sys.path.insert(0, str(Path(__file__).parent / 'alphagen'))
-sys.path.insert(0, str(Path(__file__).parent / 'AlphaQCM'))
+repo_root = Path(__file__).resolve().parent
+# 重要：必须让仓库根目录下的 `alphagen/`（子模块）优先级高于 `AlphaQCM/`，
+# 否则会因为存在 `AlphaQCM/alphagen/` 目录导致 namespace package 合并时选错实现，
+# 进而出现类似 “cannot import TensorAlphaCalculator” 的错误。
+sys.path.insert(0, str(repo_root / "AlphaQCM"))
+sys.path.insert(0, str(repo_root / "alphagen"))
 
 import torch
 import numpy as np
