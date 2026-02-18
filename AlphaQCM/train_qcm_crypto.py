@@ -3,6 +3,7 @@ import csv
 import json
 import yaml
 import argparse
+import sys
 import torch
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,11 @@ from enum import IntEnum
 from typing import List, Optional, Sequence
 
 import numpy as np
+
+# 重要：强制让 `alphagen` / `alphagen_qlib` 优先从 AlphaQCM 目录导入，
+# 避免与仓库根目录的 git submodule `alphagen/`（同名目录）发生命名空间包冲突。
+_base_dir_for_path = Path(__file__).resolve().parent
+sys.path.insert(0, str(_base_dir_for_path))
 
 from fqf_iqn_qrdqn.agent import QRQCMAgent, IQCMAgent, FQCMAgent
 
