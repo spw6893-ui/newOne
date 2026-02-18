@@ -11,10 +11,12 @@ dist/
 build/
 
 # Data - exclude all raw data, only keep split training files
-AlphaQCM_data/
-AlphaQCM/AlphaQCM_data/*
-!AlphaQCM/AlphaQCM_data/README.md
-!AlphaQCM/AlphaQCM_data/*.part_*
+/AlphaQCM_data/
+/AlphaQCM/AlphaQCM_data/*
+!/AlphaQCM/AlphaQCM_data/README.md
+!/AlphaQCM/AlphaQCM_data/*.part_*
+/AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85_filtered.parquet.part_*
+/AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85_filtered_scaled.parquet.part_*
 
 # IDE
 .vscode/

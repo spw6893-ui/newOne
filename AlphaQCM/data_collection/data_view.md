@@ -4,17 +4,18 @@
 
 ## 1. 最终宽表（推荐直接用）
 
-- 路径：`AlphaQCM/AlphaQCM_data/final_dataset/{SYMBOL}_final.csv`
+- 路径（推荐 Vision 基底）：`AlphaQCM/AlphaQCM_data/final_dataset_vision/{SYMBOL}_final.csv`
 - 粒度：1 小时（1H）
 - 行含义：`datetime` 对应该小时的 bar（例如 `10:00:00+00:00` 表示 `[10:00, 10:59]` 这一小时）
 - 主要来源：
-  - 基础行情 + 资金费：`AlphaQCM/AlphaQCM_data/crypto_hourly_cleaned/{SYMBOL}_cleaned.csv`
-  - 动量因子：`AlphaQCM/AlphaQCM_data/crypto_hourly_momentum/{SYMBOL}_momentum.csv`
-  - 波动率/微观结构/形态/流动性/筹码分布：`AlphaQCM/AlphaQCM_data/crypto_hourly_volatility/{SYMBOL}_volatility.csv`
+  - 基础行情（Vision 1m→1h + 清洗标记）：`AlphaQCM/AlphaQCM_data/crypto_hourly_cleaned_vision/{SYMBOL}_cleaned.csv`
+  - 动量因子：`AlphaQCM/AlphaQCM_data/crypto_hourly_momentum_vision/{SYMBOL}_momentum.csv`
+  - 波动率/微观结构/形态/流动性/筹码分布：`AlphaQCM/AlphaQCM_data/crypto_hourly_volatility_vision/{SYMBOL}_volatility.csv`
   - 额外衍生列（跨品种/滚动统计）：由 `AlphaQCM/data_collection/build_final_dataset.py` 在生成最终宽表时追加
+  - 衍生品补齐（Binance Vision）：`binance_fundingRate`、`binance_metrics`、`binance_*PriceKlines_1h`、`binance_aggTrades`
 
 如果你需要“所有币种合并后的一张大表”（便于一次性喂给训练/分析）：
-- 路径：`AlphaQCM/AlphaQCM_data/final_dataset_all.parquet`
+- 路径（Vision 基底）：`AlphaQCM/AlphaQCM_data/final_dataset_vision_all.parquet`
 - 粒度：1 小时（1H）
 - schema：与单币种 `{SYMBOL}_final.csv` 完全一致，**仅额外增加一列 `symbol`**（文件名里的 symbol，例如 `BTC_USDT:USDT`）
 - 生成脚本：`python3 AlphaQCM/data_collection/build_global_final_table.py`
@@ -23,7 +24,7 @@
 
 ## 1.1 全局大表（把所有币合并到一张表）
 
-- 路径：`AlphaQCM/AlphaQCM_data/final_dataset_all.parquet`
+- 路径（Vision 基底）：`AlphaQCM/AlphaQCM_data/final_dataset_vision_all.parquet`
 - 粒度：1 小时（1H）
 - 行含义：每行 = 某个 `symbol` 在某个 `datetime` 的一根小时 bar
 - 字段：与单币最终宽表完全一致，只额外增加：
@@ -31,9 +32,19 @@
 
 ## 1.2 全局大表（metrics 覆盖完整的 85 币种版本，推荐训练用）
 
-- 单币 CSV 目录：`AlphaQCM/AlphaQCM_data/final_dataset_metrics85/`
-- 全局 Parquet：`AlphaQCM/AlphaQCM_data/final_dataset_metrics85_all.parquet`
+- 单币 CSV 目录（Vision 基底）：`AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85/`
+- 全局 Parquet（Vision 基底）：`AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85_all.parquet`
 - 口径：以 `top100_perp_symbols.txt`（过滤后 90）为 universe，进一步剔除 `metrics` 尾部持续缺失的币种（剩余 85）。
+
+如果你希望直接拿到“可训练”的清理版本（已做共线性裁剪 + 逐币种 winsorize+zscore）：
+- 共线性裁剪后：`AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85_filtered.parquet`
+- B 类清理后：`AlphaQCM/AlphaQCM_data/final_dataset_vision_metrics85_filtered_scaled.parquet`
+
+> 训练口径提示（重要）：为降低“源站起始较晚导致的大段缺失”对训练/建模的干扰，
+> 当前两份训练就绪 Parquet **会在生成后做字段裁剪**（只影响训练表，不影响 `final_dataset_vision/*_final.csv` 原始宽表）。
+> - 已剔除：`ls_toptrader_long_short_ratio`、`ls_taker_long_short_vol_ratio`（缺失率高）
+> - 已剔除：`oi_*` 共 6 列（OI 起始普遍较晚，整体缺失率约 28.6%）
+> - OI 覆盖明细（按 symbol）：`AlphaQCM/data_collection/oi_coverage_by_symbol.csv`
 
 ---
 
@@ -81,6 +92,13 @@
 | `oi_delta_usd_over_quote_volume` | OI USD 变化率/成交额 | `oi_delta_usd / (close*volume)`（近似 quote 成交额） |
 | `ls_toptrader_long_short_ratio` | Top Trader 多空比 | `sum_toptrader_long_short_ratio`（偏“主力”） |
 | `ls_taker_long_short_vol_ratio` | 主动成交多空比（量口径） | `sum_taker_long_short_vol_ratio`（偏“订单流”） |
+
+> 训练口径提示：由于 `ls_toptrader_long_short_ratio` 与 `ls_taker_long_short_vol_ratio` 在部分币种/时段缺失率较高，
+> 当前训练就绪版（`final_dataset_vision_metrics85_filtered.parquet` / `final_dataset_vision_metrics85_filtered_scaled.parquet`）已默认剔除这两列；
+> 原始最终宽表（`final_dataset_vision/*_final.csv`）中仍保留，便于后续单独研究。
+
+> 训练口径补充：OI（`oi_*`）的源数据来自 `binance_metrics`，但多数合约在 2020-2021 年缺失（源站起始较晚），
+> 当前训练就绪版 Parquet 已**剔除全部 `oi_*` 相关列**；如需研究 OI，请改用原始最终宽表或 `final_dataset_vision_metrics85_all.parquet`。
 
 ### C) 断流/维护检测（替代“公告/维护时间表”）
 

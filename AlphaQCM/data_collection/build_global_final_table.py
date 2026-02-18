@@ -48,6 +48,24 @@ def _read_csv(p: Path, parse_dates: Iterable[str]) -> pd.DataFrame:
     return df
 
 
+def _coerce_numeric_to_float(df: pd.DataFrame, *, exclude: set[str]) -> pd.DataFrame:
+    """
+    统一数值列 dtype，避免某个样本文件把 `volume` 推断成 int64，
+    但其它币种出现小数导致写 Parquet 时触发“截断”错误。
+
+    策略：除 symbol/时间列外，其余列尽量转为 float64（NaN 允许）。
+    """
+    for c in df.columns:
+        if c in exclude:
+            continue
+        if c in ("symbol",):
+            continue
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            continue
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+    return df
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="合并 final_dataset 为单一 Parquet 大表")
     parser.add_argument("--input-dir", default="AlphaQCM_data/final_dataset")
@@ -67,6 +85,7 @@ def main() -> int:
     # 用首个文件推断“统一列集合与顺序”（本项目目前所有 final.csv 列一致）
     sample = _read_csv(files[0], parse_dates=parse_dates)
     sample.insert(0, "symbol", symbol_from_filename(files[0]))
+    sample = _coerce_numeric_to_float(sample, exclude=set(parse_dates))
 
     schema = build_arrow_schema(sample)
 
@@ -88,6 +107,7 @@ def main() -> int:
             sym = symbol_from_filename(p)
             df = _read_csv(p, parse_dates=parse_dates)
             df.insert(0, "symbol", sym)
+            df = _coerce_numeric_to_float(df, exclude=set(parse_dates))
 
             table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
             writer.write_table(table, row_group_size=args.row_group_size)
@@ -105,4 +125,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

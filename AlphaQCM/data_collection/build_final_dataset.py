@@ -15,6 +15,7 @@ def build_final_dataset(
     volatility_dir='AlphaQCM_data/crypto_hourly_volatility',
     aggtrades_hourly_dir='AlphaQCM_data/binance_aggTrades',
     binance_metrics_dir='AlphaQCM_data/binance_metrics',
+    binance_funding_dir='AlphaQCM_data/binance_fundingRate',
     binance_mark_dir='AlphaQCM_data/binance_markPriceKlines_1h',
     binance_index_dir='AlphaQCM_data/binance_indexPriceKlines_1h',
     binance_premium_dir='AlphaQCM_data/binance_premiumIndexKlines_1h',
@@ -36,6 +37,7 @@ def build_final_dataset(
     volatility_dir = str((alphaqcm_root / volatility_dir).resolve()) if not os.path.isabs(volatility_dir) else volatility_dir
     aggtrades_hourly_dir = str((alphaqcm_root / aggtrades_hourly_dir).resolve()) if not os.path.isabs(aggtrades_hourly_dir) else aggtrades_hourly_dir
     binance_metrics_dir = str((alphaqcm_root / binance_metrics_dir).resolve()) if not os.path.isabs(binance_metrics_dir) else binance_metrics_dir
+    binance_funding_dir = str((alphaqcm_root / binance_funding_dir).resolve()) if not os.path.isabs(binance_funding_dir) else binance_funding_dir
     binance_mark_dir = str((alphaqcm_root / binance_mark_dir).resolve()) if not os.path.isabs(binance_mark_dir) else binance_mark_dir
     binance_index_dir = str((alphaqcm_root / binance_index_dir).resolve()) if not os.path.isabs(binance_index_dir) else binance_index_dir
     binance_premium_dir = str((alphaqcm_root / binance_premium_dir).resolve()) if not os.path.isabs(binance_premium_dir) else binance_premium_dir
@@ -55,154 +57,65 @@ def build_final_dataset(
         csv_files = glob.glob(os.path.join(hourly_micro_dir, '*_hourly_micro.csv'))
         base_suffix = '_hourly_micro.csv'
 
-    all_data = {}
-    for csv_file in csv_files:
-        symbol = os.path.basename(csv_file).replace(base_suffix, '')
-        df = pd.read_csv(csv_file, index_col=0, parse_dates=True)
-        df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
-        df.index.name = 'datetime'
+    if not csv_files:
+        raise FileNotFoundError(f"未找到 base 小时数据：{hourly_micro_dir}")
 
-        # Merge momentum factors if available
-        mom_file = os.path.join(momentum_dir, f"{symbol}_momentum.csv")
-        if os.path.exists(mom_file):
-            df_mom = pd.read_csv(mom_file, index_col=0, parse_dates=True)
-            df_mom.index = pd.to_datetime(df_mom.index, utc=True, errors='coerce')
-            df = df.join(df_mom, how='left')
+    # ===== Pass 1: 仅用最小列扫描横截面统计（避免一次性加载 89 个币的全量特征导致 OOM） =====
+    print(f"Scanning {len(csv_files)} symbols for cross-sectional stats...")
 
-        # Merge volatility factors if available
-        vol_file = os.path.join(volatility_dir, f"{symbol}_volatility.csv")
-        if os.path.exists(vol_file):
-            df_vol = pd.read_csv(vol_file, index_col=0, parse_dates=True)
-            df_vol.index = pd.to_datetime(df_vol.index, utc=True, errors='coerce')
-            df = df.join(df_vol, how='left')
+    volume_sum = pd.Series(dtype="float64")
+    volume_count = pd.Series(dtype="float64")
+    funding_series_map: dict[str, pd.Series] = {}
 
-        # Merge aggTrades-derived orderflow/CVD factors if available (Binance Vision)
-        # 输出文件名使用 Binance Vision 合约符号（如 BTCUSDT），这里做一次简单映射。
+    for csv_file in sorted(csv_files):
+        symbol = os.path.basename(csv_file).replace(base_suffix, "")
+        # 只读 datetime + volume
+        try:
+            df_min = pd.read_csv(csv_file, usecols=["datetime", "volume"], parse_dates=["datetime"])
+        except ValueError:
+            # 兼容：如果 datetime 不是显式列名（极少数情况），退化为读第一列做 index
+            df_min = pd.read_csv(csv_file, index_col=0, usecols=[0, 5], parse_dates=True)
+            df_min = df_min.rename_axis("datetime").reset_index()
+
+        dt = pd.to_datetime(df_min["datetime"], utc=True, errors="coerce")
+        v = pd.to_numeric(df_min.get("volume"), errors="coerce")
+        s_vol = pd.Series(v.to_numpy(), index=dt, dtype="float64")
+        s_vol = s_vol[~s_vol.index.isna()]
+        volume_sum = volume_sum.add(s_vol, fill_value=0.0)
+        volume_count = volume_count.add(s_vol.notna().astype("float64"), fill_value=0.0)
+
+        # fundingRate（用于 funding_pressure 的横截面中位数）
         at_symbol = _ccxt_to_binance_um_symbol(symbol)
-        at_file = os.path.join(aggtrades_hourly_dir, f"{at_symbol}_aggTrades.csv")
-        if os.path.exists(at_file):
-            df_at = pd.read_csv(at_file, index_col=0, parse_dates=True)
-            df_at.index = pd.to_datetime(df_at.index, utc=True, errors='coerce')
-            df_at = df_at.add_prefix('at_')
-            df = df.join(df_at, how='left')
+        fr_file = os.path.join(binance_funding_dir, f"{at_symbol}_fundingRate.csv")
+        if os.path.exists(fr_file):
+            df_fr = pd.read_csv(fr_file, index_col=0, parse_dates=True)
+            df_fr.index = pd.to_datetime(df_fr.index, utc=True, errors="coerce")
+            df_fr = df_fr.sort_index()
+            if "last_funding_rate" in df_fr.columns:
+                s_fr = pd.to_numeric(df_fr["last_funding_rate"], errors="coerce")
+                s_fr = s_fr[~s_fr.index.isna()]
+                if not s_fr.empty:
+                    funding_series_map[symbol] = s_fr.astype("float32")
 
-        # Merge Binance Vision metrics (OI + Long/Short ratios)
-        bm_file = os.path.join(binance_metrics_dir, f"{at_symbol}_metrics.csv")
-        if os.path.exists(bm_file):
-            df_bm = pd.read_csv(bm_file, parse_dates=['create_time'])
-            if 'create_time' in df_bm.columns:
-                df_bm['create_time'] = pd.to_datetime(df_bm['create_time'], utc=True, errors='coerce')
-                df_bm = df_bm.dropna(subset=['create_time']).sort_values('create_time')
-                df_bm = df_bm.drop_duplicates(subset=['create_time'], keep='last').set_index('create_time')
+    volume_mean = volume_sum / volume_count.replace(0.0, np.nan)
+    cs_universe_size = volume_count.astype("int64")
+    cs_coverage_frac = (cs_universe_size / max(1, int(len(csv_files)))).astype("float64")
 
-                rename_map = {
-                    'sum_open_interest': 'oi_open_interest',
-                    'sum_open_interest_value': 'oi_open_interest_usd',
-                    'sum_toptrader_long_short_ratio': 'ls_toptrader_long_short_ratio',
-                    'sum_taker_long_short_vol_ratio': 'ls_taker_long_short_vol_ratio',
-                }
-                df_bm = df_bm.rename(columns=rename_map)
-                keep_cols = [c for c in rename_map.values() if c in df_bm.columns]
-                if keep_cols:
-                    df = df.join(df_bm[keep_cols], how='left')
+    funding_median = None
+    if funding_series_map:
+        funding_median = pd.DataFrame(funding_series_map).median(axis=1)
 
-        # Merge Binance Vision price triad components (mark/index/premium) and compute basis
-        mark_file = os.path.join(binance_mark_dir, f"{at_symbol}_markPriceKlines.csv")
-        if os.path.exists(mark_file):
-            df_mark = pd.read_csv(mark_file, parse_dates=['open_time'])
-            df_mark['open_time'] = pd.to_datetime(df_mark['open_time'], utc=True, errors='coerce')
-            df_mark = df_mark.dropna(subset=['open_time']).drop_duplicates(subset=['open_time'], keep='last').set_index('open_time')
-            if 'mark_close' in df_mark.columns:
-                df = df.join(df_mark[['mark_close']].rename(columns={'mark_close': 'triad_mark_close'}), how='left')
-
-        index_file = os.path.join(binance_index_dir, f"{at_symbol}_indexPriceKlines.csv")
-        if os.path.exists(index_file):
-            df_index = pd.read_csv(index_file, parse_dates=['open_time'])
-            df_index['open_time'] = pd.to_datetime(df_index['open_time'], utc=True, errors='coerce')
-            df_index = df_index.dropna(subset=['open_time']).drop_duplicates(subset=['open_time'], keep='last').set_index('open_time')
-            if 'index_close' in df_index.columns:
-                df = df.join(df_index[['index_close']].rename(columns={'index_close': 'triad_index_close'}), how='left')
-
-        prem_file = os.path.join(binance_premium_dir, f"{at_symbol}_premiumIndexKlines.csv")
-        if os.path.exists(prem_file):
-            df_prem = pd.read_csv(prem_file, parse_dates=['open_time'])
-            df_prem['open_time'] = pd.to_datetime(df_prem['open_time'], utc=True, errors='coerce')
-            df_prem = df_prem.dropna(subset=['open_time']).drop_duplicates(subset=['open_time'], keep='last').set_index('open_time')
-            if 'premium_close' in df_prem.columns:
-                df = df.join(df_prem[['premium_close']].rename(columns={'premium_close': 'triad_premium_close'}), how='left')
-
-        # Basis: (Last - Index) / Index；Last 使用最终宽表的 close（来源为 CCXT 1m->1h 聚合）
-        if 'triad_index_close' in df.columns and 'close' in df.columns:
-            df['triad_basis'] = (df['close'] - df['triad_index_close']) / df['triad_index_close']
-
-        # OI 衍生：变化率、归一化
-        if 'oi_open_interest' in df.columns:
-            df['oi_delta'] = df['oi_open_interest'].diff()
-            if 'volume' in df.columns:
-                df['oi_delta_over_volume'] = df['oi_delta'] / (df['volume'] + 1e-12)
-        if 'oi_open_interest_usd' in df.columns:
-            df['oi_delta_usd'] = df['oi_open_interest_usd'].diff()
-            if 'close' in df.columns and 'volume' in df.columns:
-                df['oi_delta_usd_over_quote_volume'] = df['oi_delta_usd'] / (df['close'] * df['volume'] + 1e-12)
-
-        # Merge taker buy ratio if available
-        taker_file = os.path.join(trades_dir, f"{symbol}_taker_ratio.csv")
-        if os.path.exists(taker_file):
-            df_taker = pd.read_csv(taker_file, index_col=0, parse_dates=True)
-            df = df.join(df_taker[['taker_buy_ratio']], how='left')
-            # 缺失值策略交给下游训练准备脚本统一处理，避免在最终宽表中引入不一致的硬编码填充值
-
-        # 兼容：若存在 rv_std_sqrt60（本仓库波动率聚合），则提供 realized_vol 别名
-        if 'realized_vol' not in df.columns and 'rv_std_sqrt60' in df.columns:
-            df['realized_vol'] = df['rv_std_sqrt60']
-
-        all_data[symbol] = df
-
-    print(f"Loaded {len(all_data)} symbols")
-
+    valid_timestamps = None
     if align_cross_section:
-        # Get union of all timestamps
-        all_timestamps = pd.DatetimeIndex([])
-        for df in all_data.values():
-            all_timestamps = all_timestamps.union(df.index)
-        all_timestamps = all_timestamps.sort_values()
+        min_symbols = max(1, int(len(csv_files) * float(min_coverage)))
+        valid_timestamps = cs_universe_size[cs_universe_size >= min_symbols].index.sort_values()
+        volume_mean = volume_mean.reindex(valid_timestamps)
+        cs_universe_size = cs_universe_size.reindex(valid_timestamps).fillna(0).astype("int64")
+        cs_coverage_frac = cs_coverage_frac.reindex(valid_timestamps).fillna(0.0).astype("float64")
+        if funding_median is not None:
+            funding_median = funding_median.reindex(valid_timestamps)
 
-        print(f"Total timestamps: {len(all_timestamps)}")
-
-        # Calculate coverage for each timestamp
-        coverage = pd.Series(0, index=all_timestamps)
-        for df in all_data.values():
-            coverage[df.index] += 1
-
-        # Filter timestamps with sufficient coverage
-        min_symbols = max(1, int(len(all_data) * min_coverage))
-        valid_timestamps = coverage[coverage >= min_symbols].index
-
-        print(f"Valid timestamps (>={min_coverage*100}% coverage): {len(valid_timestamps)}")
-
-        # Align all symbols to valid timestamps
-        aligned_data = {}
-        for symbol, df in all_data.items():
-            # Reindex to valid timestamps with forward fill（避免 bfill 引入未来信息）
-            df_aligned = df.reindex(valid_timestamps).ffill().infer_objects(copy=False)
-            aligned_data[symbol] = df_aligned
-    else:
-        # 不做强制对齐：每个币种保留自身时间轴（避免新币/下架币被覆盖率过滤成 0 行）
-        aligned_data = {s: d.copy() for s, d in all_data.items()}
-
-    # Calculate high-value cross-sectional factors
-    print("Calculating cross-sectional factors...")
-
-    # 1. Funding rate pressure (deviation from cross-sectional median)
-    if any('funding_rate' in d.columns for d in aligned_data.values()):
-        all_funding = pd.DataFrame({s: d['funding_rate'] for s, d in aligned_data.items() if 'funding_rate' in d.columns})
-        funding_median = all_funding.median(axis=1)
-
-    # 2. Relative volume (vs cross-sectional mean)
-    all_volume = pd.DataFrame({s: d['volume'] for s, d in aligned_data.items() if 'volume' in d.columns})
-    volume_mean = all_volume.mean(axis=1)
-    cs_universe_size = all_volume.notna().sum(axis=1).astype("int64")
-    cs_coverage_frac = (cs_universe_size / max(1, int(len(aligned_data)))).astype("float64")
+        print(f"Valid timestamps (>={min_coverage*100:.1f}% coverage): {len(valid_timestamps)}")
 
     # 统一输出列顺序（缺失列自动补 NaN，便于下游做统一 schema）
     base_cols = [
@@ -265,7 +178,125 @@ def build_final_dataset(
     desired_cols = base_cols + momentum_cols + volatility_cols + aggtrades_cols + derived_cols
 
     summary = []
-    for symbol, df in aligned_data.items():
+    # ===== Pass 2: 逐币种构建最终宽表并落盘（避免全量驻留内存） =====
+    for i, csv_file in enumerate(sorted(csv_files), 1):
+        symbol = os.path.basename(csv_file).replace(base_suffix, "")
+        df = pd.read_csv(csv_file, index_col=0, parse_dates=True)
+        df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
+        df.index.name = 'datetime'
+
+        # Merge momentum factors if available
+        mom_file = os.path.join(momentum_dir, f"{symbol}_momentum.csv")
+        if os.path.exists(mom_file):
+            df_mom = pd.read_csv(mom_file, index_col=0, parse_dates=True)
+            df_mom.index = pd.to_datetime(df_mom.index, utc=True, errors='coerce')
+            df = df.join(df_mom, how='left')
+
+        # Merge volatility factors if available
+        vol_file = os.path.join(volatility_dir, f"{symbol}_volatility.csv")
+        if os.path.exists(vol_file):
+            df_vol = pd.read_csv(vol_file, index_col=0, parse_dates=True)
+            df_vol.index = pd.to_datetime(df_vol.index, utc=True, errors='coerce')
+            df = df.join(df_vol, how='left')
+
+        # Merge aggTrades-derived orderflow/CVD factors if available (Binance Vision)
+        # 输出文件名使用 Binance Vision 合约符号（如 BTCUSDT），这里做一次简单映射。
+        at_symbol = _ccxt_to_binance_um_symbol(symbol)
+        at_file = os.path.join(aggtrades_hourly_dir, f"{at_symbol}_aggTrades.csv")
+        if os.path.exists(at_file):
+            df_at = pd.read_csv(at_file, index_col=0, parse_dates=True)
+            df_at.index = pd.to_datetime(df_at.index, utc=True, errors='coerce')
+            df_at = df_at.add_prefix('at_')
+            df = df.join(df_at, how='left')
+
+        # Merge Binance Vision fundingRate (8h) -> 对齐到小时（ffill）
+        # fundingRate 文件通常已经是小时粒度（逐小时 ffill 后的 last_funding_rate）
+        if 'funding_rate' not in df.columns:
+            fr_file = os.path.join(binance_funding_dir, f"{at_symbol}_fundingRate.csv")
+            if os.path.exists(fr_file):
+                df_fr = pd.read_csv(fr_file, index_col=0, parse_dates=True)
+                df_fr.index = pd.to_datetime(df_fr.index, utc=True, errors='coerce')
+                df_fr = df_fr.sort_index()
+                if 'last_funding_rate' in df_fr.columns:
+                    s = pd.to_numeric(df_fr['last_funding_rate'], errors='coerce')
+                    s = s.reindex(df.index).ffill()
+                    df['funding_rate'] = s
+                    df['funding_annualized'] = df['funding_rate'] * 365 * 3
+                    df['funding_delta'] = df['funding_rate'].diff()
+                    df['arb_pressure'] = (df['funding_annualized'].abs() > 0.30).astype('int8')
+
+        # Merge Binance Vision metrics (OI + Long/Short ratios)
+        bm_file = os.path.join(binance_metrics_dir, f"{at_symbol}_metrics.csv")
+        if os.path.exists(bm_file):
+            df_bm = pd.read_csv(bm_file, parse_dates=['create_time'])
+            if 'create_time' in df_bm.columns:
+                df_bm['create_time'] = pd.to_datetime(df_bm['create_time'], utc=True, errors='coerce')
+                df_bm = df_bm.dropna(subset=['create_time']).sort_values('create_time')
+                df_bm = df_bm.drop_duplicates(subset=['create_time'], keep='last').set_index('create_time')
+
+                rename_map = {
+                    'sum_open_interest': 'oi_open_interest',
+                    'sum_open_interest_value': 'oi_open_interest_usd',
+                    'sum_toptrader_long_short_ratio': 'ls_toptrader_long_short_ratio',
+                    'sum_taker_long_short_vol_ratio': 'ls_taker_long_short_vol_ratio',
+                }
+                df_bm = df_bm.rename(columns=rename_map)
+                keep_cols = [c for c in rename_map.values() if c in df_bm.columns]
+                if keep_cols:
+                    df = df.join(df_bm[keep_cols], how='left')
+
+        # Merge Binance Vision price triad components (mark/index/premium) and compute basis
+        mark_file = os.path.join(binance_mark_dir, f"{at_symbol}_markPriceKlines.csv")
+        if os.path.exists(mark_file):
+            df_mark = pd.read_csv(mark_file, parse_dates=['open_time'])
+            df_mark['open_time'] = pd.to_datetime(df_mark['open_time'], utc=True, errors='coerce')
+            df_mark = df_mark.dropna(subset=['open_time']).drop_duplicates(subset=['open_time'], keep='last').set_index('open_time')
+            if 'mark_close' in df_mark.columns:
+                df = df.join(df_mark[['mark_close']].rename(columns={'mark_close': 'triad_mark_close'}), how='left')
+
+        index_file = os.path.join(binance_index_dir, f"{at_symbol}_indexPriceKlines.csv")
+        if os.path.exists(index_file):
+            df_index = pd.read_csv(index_file, parse_dates=['open_time'])
+            df_index['open_time'] = pd.to_datetime(df_index['open_time'], utc=True, errors='coerce')
+            df_index = df_index.dropna(subset=['open_time']).drop_duplicates(subset=['open_time'], keep='last').set_index('open_time')
+            if 'index_close' in df_index.columns:
+                df = df.join(df_index[['index_close']].rename(columns={'index_close': 'triad_index_close'}), how='left')
+
+        prem_file = os.path.join(binance_premium_dir, f"{at_symbol}_premiumIndexKlines.csv")
+        if os.path.exists(prem_file):
+            df_prem = pd.read_csv(prem_file, parse_dates=['open_time'])
+            df_prem['open_time'] = pd.to_datetime(df_prem['open_time'], utc=True, errors='coerce')
+            df_prem = df_prem.dropna(subset=['open_time']).drop_duplicates(subset=['open_time'], keep='last').set_index('open_time')
+            if 'premium_close' in df_prem.columns:
+                df = df.join(df_prem[['premium_close']].rename(columns={'premium_close': 'triad_premium_close'}), how='left')
+
+        # Basis: (Last - Index) / Index；Last 使用最终宽表的 close
+        if 'triad_index_close' in df.columns and 'close' in df.columns:
+            df['triad_basis'] = (df['close'] - df['triad_index_close']) / df['triad_index_close']
+
+        # OI 衍生：变化率、归一化
+        if 'oi_open_interest' in df.columns:
+            df['oi_delta'] = df['oi_open_interest'].diff()
+            if 'volume' in df.columns:
+                df['oi_delta_over_volume'] = df['oi_delta'] / (df['volume'] + 1e-12)
+        if 'oi_open_interest_usd' in df.columns:
+            df['oi_delta_usd'] = df['oi_open_interest_usd'].diff()
+            if 'close' in df.columns and 'volume' in df.columns:
+                df['oi_delta_usd_over_quote_volume'] = df['oi_delta_usd'] / (df['close'] * df['volume'] + 1e-12)
+
+        # Merge taker buy ratio if available
+        taker_file = os.path.join(trades_dir, f"{symbol}_taker_ratio.csv")
+        if os.path.exists(taker_file):
+            df_taker = pd.read_csv(taker_file, index_col=0, parse_dates=True)
+            df = df.join(df_taker[['taker_buy_ratio']], how='left')
+
+        # 兼容：若存在 rv_std_sqrt60（本仓库波动率聚合），则提供 realized_vol 别名
+        if 'realized_vol' not in df.columns and 'rv_std_sqrt60' in df.columns:
+            df['realized_vol'] = df['rv_std_sqrt60']
+
+        if align_cross_section and valid_timestamps is not None:
+            df = df.reindex(valid_timestamps).ffill().infer_objects(copy=False)
+
         # 明确时间语义（避免把“小时 bar 的开始时间”误当作“可用特征时间”）
         df['bar_end_time'] = (df.index + pd.Timedelta(hours=1))
         df['feature_time'] = df['bar_end_time'] + pd.Timedelta(milliseconds=1)
@@ -274,11 +305,11 @@ def build_final_dataset(
         df['cs_universe_size'] = cs_universe_size.reindex(df.index)
         df['cs_coverage_frac'] = cs_coverage_frac.reindex(df.index)
 
-        if 'funding_rate' in df.columns and 'funding_rate' in all_funding.columns:
-            df['funding_pressure'] = df['funding_rate'] - funding_median
+        if funding_median is not None and 'funding_rate' in df.columns:
+            df['funding_pressure'] = df['funding_rate'] - funding_median.reindex(df.index)
 
         if 'volume' in df.columns:
-            df['relative_volume'] = df['volume'] / volume_mean
+            df['relative_volume'] = df['volume'] / volume_mean.reindex(df.index)
 
         # 3. Abnormal turnover (volume / rolling mean)
         if 'volume' in df.columns:
@@ -346,7 +377,7 @@ def build_final_dataset(
         # Save individual symbol
         output_file = os.path.join(output_dir, f'{symbol}_final.csv')
         df.to_csv(output_file)
-        print(f"  Saved {symbol}: {len(df)} rows")
+        print(f"[{i}/{len(csv_files)}] Saved {symbol}: {len(df)} rows")
 
         summary.append({
             'symbol': symbol,
@@ -372,6 +403,7 @@ if __name__ == '__main__':
         volatility_dir='AlphaQCM_data/crypto_hourly_volatility',
         aggtrades_hourly_dir='AlphaQCM_data/binance_aggTrades',
         binance_metrics_dir='AlphaQCM_data/binance_metrics',
+        binance_funding_dir='AlphaQCM_data/binance_fundingRate',
         binance_mark_dir='AlphaQCM_data/binance_markPriceKlines_1h',
         binance_index_dir='AlphaQCM_data/binance_indexPriceKlines_1h',
         binance_premium_dir='AlphaQCM_data/binance_premiumIndexKlines_1h',

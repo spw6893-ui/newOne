@@ -29,6 +29,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import warnings
 
 
 EPS = 1e-12
@@ -41,7 +42,26 @@ class HourFeatures:
 
 
 def _to_utc_datetime(s: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(s, utc=True, errors="coerce")
+    """
+    将 datetime 列转为 UTC 时间戳。
+
+    说明：
+    - Vision 1m CSV 通常是 `YYYY-mm-dd HH:MM:SS+00:00`，用 format 指定可显著加速并避免 pandas 的推断警告。
+    - 少量历史/异构文件可能没有时区（`YYYY-mm-dd HH:MM:SS`），因此做两段式兜底解析。
+    """
+    s = s.astype("string")
+    dt = pd.to_datetime(s, format="%Y-%m-%d %H:%M:%S%z", utc=True, errors="coerce")
+    mask = dt.isna()
+    if bool(mask.any()):
+        dt2 = pd.to_datetime(s[mask], format="%Y-%m-%d %H:%M:%S", utc=True, errors="coerce")
+        dt.loc[mask] = dt2
+        mask = dt.isna()
+    if bool(mask.any()):
+        # 最后兜底（极少数脏格式），避免刷屏 warning
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Could not infer format*", category=UserWarning)
+            dt3 = pd.to_datetime(s[mask], utc=True, errors="coerce")
+        dt.loc[mask] = dt3
     return dt
 
 
@@ -95,14 +115,16 @@ def _compute_hour_features(
     df_hour: 单小时内的 1m 行（已按 datetime 升序）
     必需列：datetime, open, high, low, close, volume
     """
-    # 确保数值类型
-    open_ = pd.to_numeric(df_hour["open"], errors="coerce").to_numpy(dtype="float64")
-    high_ = pd.to_numeric(df_hour["high"], errors="coerce").to_numpy(dtype="float64")
-    low_ = pd.to_numeric(df_hour["low"], errors="coerce").to_numpy(dtype="float64")
-    close_ = pd.to_numeric(df_hour["close"], errors="coerce").to_numpy(dtype="float64")
-    vol_ = pd.to_numeric(df_hour["volume"], errors="coerce").to_numpy(dtype="float64")
+    # 数值列在读取阶段已尽量转为 float，这里直接转 numpy，避免每小时重复 to_numeric 的开销
+    open_ = df_hour["open"].to_numpy(dtype="float64", copy=False)
+    high_ = df_hour["high"].to_numpy(dtype="float64", copy=False)
+    low_ = df_hour["low"].to_numpy(dtype="float64", copy=False)
+    close_ = df_hour["close"].to_numpy(dtype="float64", copy=False)
+    vol_ = df_hour["volume"].to_numpy(dtype="float64", copy=False)
 
-    dt = pd.to_datetime(df_hour["datetime"], utc=True, errors="coerce")
+    dt = df_hour["datetime"]
+    if not pd.api.types.is_datetime64_any_dtype(dt):
+        dt = pd.to_datetime(dt, utc=True, errors="coerce")
     minute = dt.dt.minute.to_numpy(dtype="int64")
 
     out: Dict[str, float] = {}
@@ -192,7 +214,9 @@ def _update_us_open_cache(
     if df.empty:
         return
 
-    dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+    dt = df["datetime"]
+    if not pd.api.types.is_datetime64_any_dtype(dt):
+        dt = pd.to_datetime(dt, utc=True, errors="coerce")
     if dt.isna().all():
         return
 
@@ -244,15 +268,20 @@ def _iter_full_hours(
     csv_path: Path,
     *,
     chunksize: int,
+    assume_sorted: bool,
 ) -> Iterator[Tuple[pd.Timestamp, pd.DataFrame]]:
     """
     流式读取 1m CSV，按小时 yield 完整小时的 DataFrame（最后一小时用 buffer 延迟到下一 chunk）。
     """
     buffer: Optional[pd.DataFrame] = None
-    for chunk in pd.read_csv(csv_path, chunksize=chunksize):
+    usecols = ["datetime", "open", "high", "low", "close", "volume"]
+    for chunk in pd.read_csv(csv_path, chunksize=chunksize, usecols=lambda c: c in usecols):
         if "datetime" not in chunk.columns:
             continue
         chunk["datetime"] = _to_utc_datetime(chunk["datetime"])
+        for c in ("open", "high", "low", "close", "volume"):
+            if c in chunk.columns:
+                chunk[c] = pd.to_numeric(chunk[c], errors="coerce")
         chunk = chunk.dropna(subset=["datetime"])
         if chunk.empty:
             continue
@@ -260,7 +289,8 @@ def _iter_full_hours(
         if buffer is not None and not buffer.empty:
             chunk = pd.concat([buffer, chunk], ignore_index=True)
 
-        chunk = chunk.sort_values("datetime")
+        if not assume_sorted:
+            chunk = chunk.sort_values("datetime")
         hour = chunk["datetime"].dt.floor("h")
         last_hour = hour.iloc[-1]
 
@@ -287,13 +317,15 @@ def aggregate_symbol(
     output_path: Path,
     *,
     chunksize: int = 200_000,
+    assume_sorted: bool = True,
 ) -> int:
     """
     返回写入的小时行数。
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists():
-        output_path.unlink()
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
 
     # 美股开盘窗口缓存（跨 chunk）
     us_open_open_by_date: Dict[pd.Timestamp, float] = {}
@@ -312,14 +344,14 @@ def aggregate_symbol(
         df_out = pd.DataFrame(rows, index=pd.DatetimeIndex(ts_list, name="datetime")).sort_index()
         mode = "w" if written == 0 else "a"
         header = written == 0
-        df_out.to_csv(output_path, mode=mode, header=header)
+        df_out.to_csv(tmp_path, mode=mode, header=header)
         written += int(df_out.shape[0])
         rows = []
         ts_list = []
 
     # 注意：为了生成 seg_us_open_60m_logret，我们需要在同一小时聚合前先更新 us_open_logret_by_hour。
     # 简化做法：在读取“完整小时 group”时，同时对该 group 内的分钟数据更新缓存（足够覆盖 09:30/10:29 关键分钟）。
-    for hour_ts, df_hour in _iter_full_hours(csv_path, chunksize=chunksize):
+    for hour_ts, df_hour in _iter_full_hours(csv_path, chunksize=chunksize, assume_sorted=assume_sorted):
         _update_us_open_cache(
             df_hour,
             open_by_date=us_open_open_by_date,
@@ -335,6 +367,7 @@ def aggregate_symbol(
             flush()
 
     flush()
+    tmp_path.replace(output_path)
     return written
 
 
@@ -343,6 +376,13 @@ def main() -> int:
     ap.add_argument("--input-dir", default="AlphaQCM_data/crypto_1min", help="输入目录（1m CSV）")
     ap.add_argument("--output-dir", default="AlphaQCM_data/crypto_hourly_momentum", help="输出目录（1h 动量因子）")
     ap.add_argument("--chunksize", type=int, default=200_000, help="流式读取 chunksize，默认 200k")
+    ap.add_argument("--assume-sorted", action="store_true", help="假设输入已按时间升序（可跳过排序，加速）")
+    ap.add_argument("--skip-existing", action="store_true", help="若输出已存在则跳过（支持断点续跑）")
+    ap.add_argument("--force", action="store_true", help="强制重算（覆盖已存在输出）")
+    ap.add_argument("--symbols", default="", help="仅处理指定币种（逗号分隔），留空表示处理目录内所有文件")
+    ap.add_argument("--symbols-file", default="", help="仅处理文件中的币种（每行一个 symbol），与 --symbols 互斥")
+    ap.add_argument("--shard-index", type=int, default=0, help="分片索引（从 0 开始）")
+    ap.add_argument("--shard-count", type=int, default=1, help="分片总数（默认 1=不分片）")
     ap.add_argument("--limit", type=int, default=0, help="仅处理前 N 个文件（0=不限制），用于快速验证")
     args = ap.parse_args()
 
@@ -352,7 +392,25 @@ def main() -> int:
     output_dir = (alphaqcm_root / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(input_dir.glob("*_1m.csv"))
+    if args.symbols and args.symbols_file:
+        print("参数错误：--symbols 与 --symbols-file 只能二选一")
+        return 2
+
+    if args.symbols_file:
+        p = Path(args.symbols_file)
+        if not p.exists():
+            print(f"未找到 symbols 文件：{p}")
+            return 2
+        wanted = [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        files = [input_dir / f"{s}_1m.csv" for s in wanted]
+        files = [f for f in files if f.exists()]
+    elif args.symbols.strip():
+        wanted = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        files = [input_dir / f"{s}_1m.csv" for s in wanted]
+        files = [f for f in files if f.exists()]
+    else:
+        files = sorted(input_dir.glob("*_1m.csv"))
+
     if args.limit and args.limit > 0:
         files = files[: int(args.limit)]
 
@@ -360,13 +418,32 @@ def main() -> int:
         print(f"未找到输入文件: {input_dir}")
         return 2
 
+    shard_count = int(args.shard_count)
+    shard_index = int(args.shard_index)
+    if shard_count <= 0:
+        print("参数错误：--shard-count 必须 >= 1")
+        return 2
+    if not (0 <= shard_index < shard_count):
+        print("参数错误：--shard-index 必须满足 0 <= shard-index < shard-count")
+        return 2
+    if shard_count > 1:
+        files = [fp for j, fp in enumerate(files) if (j % shard_count) == shard_index]
+
     total_written = 0
     for i, fp in enumerate(files, 1):
         symbol = fp.name.replace("_1m.csv", "")
         out_path = output_dir / f"{symbol}_momentum.csv"
         print(f"[{i}/{len(files)}] {symbol}...", end=" ")
         try:
-            n = aggregate_symbol(fp, out_path, chunksize=int(args.chunksize))
+            if out_path.exists() and args.skip_existing and not args.force:
+                print("↷ Skip (exists)")
+                continue
+            n = aggregate_symbol(
+                fp,
+                out_path,
+                chunksize=int(args.chunksize),
+                assume_sorted=bool(args.assume_sorted),
+            )
             total_written += n
             print(f"✓ {n} hours -> {out_path}")
         except Exception as e:

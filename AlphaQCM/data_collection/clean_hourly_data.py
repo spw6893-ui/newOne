@@ -7,12 +7,22 @@ import numpy as np
 import os
 import glob
 from pathlib import Path
+import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
 from gap_detector import detect_maintenance_flags
 
-def clean_symbol(symbol, input_dir, output_dir, min_history_bars=24):
+def clean_symbol(
+    symbol,
+    input_dir,
+    output_dir,
+    *,
+    input_suffix="_hourly_full.csv",
+    output_suffix="_cleaned.csv",
+    min_history_bars=24,
+    skip_existing=False,
+):
     """
     Clean single symbol data
 
@@ -24,7 +34,11 @@ def clean_symbol(symbol, input_dir, output_dir, min_history_bars=24):
     5. Point-in-time alignment check
     """
 
-    input_file = os.path.join(input_dir, f"{symbol}_hourly_full.csv")
+    output_file = os.path.join(output_dir, f"{symbol}{output_suffix}")
+    if skip_existing and os.path.exists(output_file):
+        return None
+
+    input_file = os.path.join(input_dir, f"{symbol}{input_suffix}")
     if not os.path.exists(input_file):
         return None
 
@@ -82,7 +96,6 @@ def clean_symbol(symbol, input_dir, output_dir, min_history_bars=24):
     df = df.drop(columns=['log_return', 'volume_zscore', 'bars_since_start'])
 
     # Save cleaned data
-    output_file = os.path.join(output_dir, f'{symbol}_cleaned.csv')
     df.to_csv(output_file)
 
     return {
@@ -96,29 +109,46 @@ def clean_symbol(symbol, input_dir, output_dir, min_history_bars=24):
     }
 
 def main():
+    parser = argparse.ArgumentParser(description="按小时数据清洗（维护断流标记 / 异常值 / 新币成熟期）")
+    parser.add_argument("--input-dir", default="AlphaQCM_data/crypto_hourly_full")
+    parser.add_argument("--output-dir", default="AlphaQCM_data/crypto_hourly_cleaned")
+    parser.add_argument("--input-suffix", default="_hourly_full.csv")
+    parser.add_argument("--output-suffix", default="_cleaned.csv")
+    parser.add_argument("--min-history-bars", type=int, default=24)
+    parser.add_argument("--skip-existing", action="store_true")
+    args = parser.parse_args()
+
     alphaqcm_root = Path(__file__).resolve().parents[1]
-    input_dir = str((alphaqcm_root / 'AlphaQCM_data/crypto_hourly_full').resolve())
-    output_dir = str((alphaqcm_root / 'AlphaQCM_data/crypto_hourly_cleaned').resolve())
+    input_dir = str((alphaqcm_root / args.input_dir).resolve()) if not os.path.isabs(args.input_dir) else args.input_dir
+    output_dir = str((alphaqcm_root / args.output_dir).resolve()) if not os.path.isabs(args.output_dir) else args.output_dir
 
     os.makedirs(output_dir, exist_ok=True)
 
-    csv_files = glob.glob(os.path.join(input_dir, '*_hourly_full.csv'))
+    csv_files = glob.glob(os.path.join(input_dir, f"*{args.input_suffix}"))
     if not csv_files:
         print(f"未找到输入文件：{input_dir}")
         return
 
     results = []
     for i, csv_file in enumerate(csv_files, 1):
-        symbol = os.path.basename(csv_file).replace('_hourly_full.csv', '')
+        symbol = os.path.basename(csv_file).replace(args.input_suffix, '')
         print(f"[{i}/{len(csv_files)}] {symbol}...", end=' ')
 
         try:
-            result = clean_symbol(symbol, input_dir, output_dir)
+            result = clean_symbol(
+                symbol,
+                input_dir,
+                output_dir,
+                input_suffix=args.input_suffix,
+                output_suffix=args.output_suffix,
+                min_history_bars=args.min_history_bars,
+                skip_existing=args.skip_existing,
+            )
             if result:
                 results.append(result)
                 print(f"✓ {result['rows']} rows, {result['stable_rows']} stable, {result['spikes']} spikes")
             else:
-                print("✗ No data")
+                print("↷ skipped/no data")
         except Exception as e:
             print(f"✗ {e}")
 
@@ -127,7 +157,7 @@ def main():
     summary_file = os.path.join(output_dir, 'cleaning_summary.csv')
     df_summary.to_csv(summary_file, index=False)
 
-    print(f"\nCleaned {len(results)}/{len(csv_files)} symbols")
+    print(f"\nCleaned {len(results)}/{len(csv_files)} symbols (written)")
     if not df_summary.empty:
         print(f"Total spikes detected: {df_summary['spikes'].sum()}")
         print(f"Total volume spikes: {df_summary['volume_spikes'].sum()}")

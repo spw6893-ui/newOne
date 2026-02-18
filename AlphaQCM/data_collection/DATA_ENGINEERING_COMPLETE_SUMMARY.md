@@ -20,9 +20,16 @@
 本仓库目前存在两套互补数据资产：
 - `crypto_*`：通过 CCXT/API 获取的基础 OHLCV/资金费率等（覆盖面广、字段相对基础）。
 - `binance_*`：通过 Binance Vision 历史归档补齐的合约特征（更贴近你 checklist 的 OI/TopTrader/CVD 等）。
- - `final_dataset_all.parquet`：把全部 `final_dataset/*_final.csv` 合并后的单表版本（便于训练/分析）。
- - `final_dataset_metrics85/`：按 “metrics 覆盖完整”裁剪后的 85 个币种最终宽表（单币 CSV）。
- - `final_dataset_metrics85_all.parquet`：上述 85 币种的全局单表版本（Parquet）。
+
+为了避免 CCXT 版本“中途断流只到 2020”的历史问题（例如 ETH），当前推荐使用 **Binance Vision 1m → 1h** 作为最终宽表的基底：
+- `final_dataset_vision/`：Vision 基底的单币最终宽表（89 个 `*_final.csv` + `dataset_summary.csv`）
+- `final_dataset_vision_all.parquet`：合并后的全局单表（Parquet，便于训练/分析）
+- `final_dataset_vision_metrics85/`：在 `final_dataset_vision/` 上裁剪到 “metrics 覆盖完整” 的 85 币种（单币 CSV）
+- `final_dataset_vision_metrics85_all.parquet`：上述 85 币种全局单表（Parquet）
+- `final_dataset_vision_metrics85_filtered.parquet`：对 metrics85 全局表做共线性裁剪（|corr|>0.95）后的训练表
+  - 训练字段裁剪：已剔除缺失率过高的 `ls_toptrader_long_short_ratio`、`ls_taker_long_short_vol_ratio`；以及 OI 相关 `oi_*` 6 列（整体缺失率约 28.6%，源站起始较晚导致）。
+  - OI 覆盖明细：`AlphaQCM/data_collection/oi_coverage_by_symbol.csv`
+- `final_dataset_vision_metrics85_filtered_scaled.parquet`：在 filtered 表上做 B 类清理（winsorize + zscore，逐币种）的训练表（同样已做上述字段裁剪）
 
 ### A. CCXT/API 基础数据（策略骨架）
 
@@ -31,6 +38,14 @@
 - 文件：`{SYMBOL}_1m.csv`（例如 `BTC_USDT:USDT_1m.csv`）
 - 字段：`datetime, open, high, low, close, volume`
 - 规模：约 2.3GB，92 个币种
+ - 备注：该目录来自 CCXT 拉取，历史上曾出现“部分币种中途停止导致只覆盖到 2020”的问题（例如 ETH）。
+
+1b) **1 分钟 OHLCV（Binance Vision 归档重拉，推荐）**
+- 目录：`AlphaQCM/AlphaQCM_data/crypto_1min_vision/`
+- 文件：`{SYMBOL}_1m.csv`（例如 `ETH_USDT:USDT_1m.csv`）
+- 字段：`datetime, open, high, low, close, volume`（与 CCXT 版本保持一致，便于复用聚合脚本）
+- 来源：Binance Vision `futures/um/monthly/klines/{BINANCE_SYMBOL}/1m/`
+- 状态：90 个币种中 89 个可覆盖到 `2025-02-15 23:59 UTC`；`MATIC/USDT:USDT` 从 2024-10 起源站持续 404，已移到 `crypto_1min_vision_excluded/` 并从 symbol 列表中剔除。
 
 2) **小时 OHLCV（原始/基础）**
 - 目录：`AlphaQCM/AlphaQCM_data/crypto_data/`
@@ -94,14 +109,10 @@
 - 目录：`AlphaQCM/AlphaQCM_data/binance_metrics/`
 - 文件：`{SYMBOL}_metrics.csv`
 - 字段（示例）：`sum_open_interest, sum_open_interest_value, sum_toptrader_long_short_ratio, sum_taker_long_short_vol_ratio`
-- 备注：该目录包含额外 3 个（`KEYUSDT/MDTUSDT/STPTUSDT`），默认 universe 已剔除。
-  - 覆盖检查（以 `2025-02-15` 为结束日期，按“覆盖到结束日期”口径）：90 个 symbol 中 **85 个**可覆盖到结束日期。
-  - 以下 5 个合约在 Binance Vision 的 `metrics` 归档中存在**硬缺口（之后日期持续 404）**，因此无法补齐到 `2025-02-15`（截至当前落盘的最后时间戳如下）：
-    - `CVCUSDT`：最后 `2024-07-15 12:00:00+00:00`
-    - `DGBUSDT`：最后 `2024-07-15 12:00:00+00:00`
-    - `SCUSDT`：最后 `2024-07-15 12:00:00+00:00`
-    - `WAVESUSDT`：最后 `2024-07-15 12:00:00+00:00`
-    - `MATICUSDT`：最后 `2025-01-22 02:00:00+00:00`（之后日期 404）
+- 备注：该目录包含额外 3 个（`KEYUSDT/MDTUSDT/STPTUSDT`），默认 universe 已剔除（见 `top100_perp_symbols.txt` 末尾说明）。
+- 覆盖裁剪口径：`materialize_final_dataset_metrics85.py` 读取 `*_metrics.csv.meta.json`，判断 `max_ts >= 2025-02-15` 则视为“覆盖完整”。
+  - 当前 universe（Vision 基底）为 89 个；其中 **85 个** metrics 覆盖到 `2025-02-15`。
+  - metrics85 被排除的 4 个：`CVCUSDT`, `DGBUSDT`, `SCUSDT`, `WAVESUSDT`（尾部持续缺失/源站 404）。
 
 2) **Funding Rate（归档，按小时对齐）**
 - 目录：`AlphaQCM/AlphaQCM_data/binance_fundingRate/`
