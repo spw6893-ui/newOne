@@ -10,15 +10,17 @@ echo ""
 # - baseline: 保持脚本/代码默认值（最接近“原始能跑通”的行为）
 # - explore20: 特征降维(Top20 IC) + 加大训练强度 + 放宽 pool（用于提升探索效率）
 # - explore20_icir: 在 explore20 基础上，使用 ICIR 目标(MeanStdAlphaPool) + 动态阈值 + 长度惩罚
+# - explore20_faststable: 在 explore20 基础上，偏“更快 + 更稳 + 更好泛化”的组合（推荐日常跑）
 PRESET="${ALPHAGEN_PRESET:-baseline}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "用法:"
-    echo "  ./run_training.sh [baseline|explore20|explore20_icir]"
+    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable]"
     echo ""
     echo "示例:"
     echo "  ./run_training.sh"
     echo "  ./run_training.sh explore20"
     echo "  ./run_training.sh explore20_icir"
+    echo "  ./run_training.sh explore20_faststable"
     echo ""
     echo "说明:"
     echo "  也可以用环境变量覆盖任意 ALPHAGEN_* 参数（例如 ALPHAGEN_TOTAL_TIMESTEPS）。"
@@ -100,8 +102,41 @@ case "$PRESET" in
         export_default ALPHAGEN_REWARD_PER_STEP -0.001
         export_default ALPHAGEN_TARGET_KL none
         ;;
+    explore20_faststable)
+        # 目标：在不牺牲泛化的前提下，显著缓解“后期越跑越慢”，并降低 PPO 抖动（clip_fraction/approx_kl 偏高）
+        export_default ALPHAGEN_FEATURES_MAX 20
+        export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95
+        export_default ALPHAGEN_TOTAL_TIMESTEPS 800000
+
+        # PPO：大 batch + 大 rollout + 较少 epoch（更快也更稳）
+        export_default ALPHAGEN_BATCH_SIZE 512
+        export_default ALPHAGEN_N_STEPS 8192
+        export_default ALPHAGEN_N_EPOCHS 10
+        export_default ALPHAGEN_LEARNING_RATE 0.0001
+        export_default ALPHAGEN_CLIP_RANGE 0.2
+        export_default ALPHAGEN_TARGET_KL none
+
+        # Pool：不把阈值抬到过高（避免后期入池停滞），并限制优化步数避免“200k 后慢到爆”
+        export_default ALPHAGEN_POOL_TYPE mse
+        export_default ALPHAGEN_POOL_CAPACITY 20
+        export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
+        export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
+        export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 10000
+        export_default ALPHAGEN_POOL_L1_ALPHA 0.005
+        export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
+        export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
+
+        # 防止策略学会超早 SEP（导致评估次数爆炸）；先保底长度，再决定要不要加 per-step 惩罚
+        export_default ALPHAGEN_MIN_EXPR_LEN 8
+        export_default ALPHAGEN_REWARD_PER_STEP 0
+
+        # 缓存与周期评估（评估太频繁会拖慢整体）
+        export_default ALPHAGEN_ALPHA_CACHE_SIZE 128
+        export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
+        export_default ALPHAGEN_EVAL_TEST 1
+        ;;
     *)
-        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir）"
+        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable）"
         exit 1
         ;;
 esac
