@@ -236,6 +236,21 @@ class TensorQLibStockDataCalculator(TensorAlphaCalculator):
             self._alpha_cache.popitem(last=False)
         return val
 
+    def make_ensemble_alpha(self, exprs: List[Expression], weights: List[float]) -> Tensor:
+        """
+        NaN 友好线性组合（与 QLibStockDataCalculator 保持一致）：
+        - 单个因子缺失视为 0；
+        - 只有当该时点所有因子都缺失时，组合结果才为 NaN。
+        """
+        n = len(exprs)
+        if n == 0:
+            raise ValueError("exprs 不能为空")
+        stacked = torch.stack([self.evaluate_alpha(exprs[i]) * float(weights[i]) for i in range(n)], dim=0)
+        all_nan = torch.isnan(stacked).all(dim=0)
+        out = torch.nan_to_num(stacked, nan=0.0, posinf=0.0, neginf=0.0).sum(dim=0)
+        out[all_nan] = torch.nan
+        return out
+
     def alpha_cache_stats(self) -> dict:
         return {
             "cache_size": int(self._alpha_cache_size),

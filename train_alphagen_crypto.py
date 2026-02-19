@@ -427,15 +427,67 @@ def main():
             self._every = max(1, int(eval_every_steps))
             self._eval_test = bool(eval_test)
 
+        @staticmethod
+        def _get_target_tensor(calc_obj):
+            # QLibStockDataCalculator: target_value
+            tv = getattr(calc_obj, "target_value", None)
+            if tv is not None:
+                return tv
+            # TensorQLibStockDataCalculator: target property from TensorAlphaCalculator
+            try:
+                return getattr(calc_obj, "target")
+            except Exception:
+                return None
+
+        @staticmethod
+        def _calc_icir_and_turnover(calc_obj, exprs, weights):
+            """
+            额外指标（不参与训练目标，仅用于观测）：
+            - ICIR：按天 IC 序列的 mean/std
+            - turnover：mean(|alpha_t - alpha_{t-1}|)（对组合 alpha）
+            """
+            try:
+                from alphagen.utils.correlation import batch_pearsonr  # 延迟导入
+            except Exception:
+                return {}
+
+            if not hasattr(calc_obj, "make_ensemble_alpha"):
+                return {}
+            target = PeriodicValTestEvalCallback._get_target_tensor(calc_obj)
+            if target is None:
+                return {}
+
+            with torch.no_grad():
+                alpha = calc_obj.make_ensemble_alpha(exprs, weights)
+                ics = batch_pearsonr(alpha, target)  # (days,)
+                ic_mean = ics.mean()
+                ic_std = ics.std()
+                icir = (ic_mean / ic_std).item() if ic_std.item() > 0 else float("nan")
+
+                a0 = alpha[:-1]
+                a1 = alpha[1:]
+                mask = torch.isfinite(a0) & torch.isfinite(a1)
+                diff = torch.abs(a1 - a0)
+                diff[~mask] = torch.nan
+                turnover = torch.nanmean(diff).item()
+
+            return {
+                "ic_std": float(ic_std.item()),
+                "icir": float(icir),
+                "turnover": float(turnover),
+            }
+
         def _eval_pool(self, calc_obj):
             if getattr(self._pool, "size", 0) <= 0:
-                return 0.0, 0.0
+                return {"ic": 0.0, "ric": 0.0}
             exprs = [e for e in self._pool.exprs[: self._pool.size] if e is not None]
             weights = list(self._pool.weights)
             if len(exprs) == 0:
-                return 0.0, 0.0
+                return {"ic": 0.0, "ric": 0.0}
             ic, ric = calc_obj.calc_pool_all_ret(exprs, weights)
-            return float(ic), float(ric)
+            out = {"ic": float(ic), "ric": float(ric)}
+            out.update(self._calc_icir_and_turnover(calc_obj, exprs, weights))
+            return out
 
         def _on_step(self) -> bool:
             if (self.num_timesteps % self._every) != 0:
@@ -446,18 +498,30 @@ def main():
             self.logger.record("pool/best_ic_ret", float(getattr(self._pool, "best_ic_ret", 0.0)))
 
             try:
-                vic, vric = self._eval_pool(self._val_calc)
-                self.logger.record("eval/val_ic", vic)
-                self.logger.record("eval/val_rank_ic", vric)
+                v = self._eval_pool(self._val_calc)
+                self.logger.record("eval/val_ic", float(v.get("ic", 0.0)))
+                self.logger.record("eval/val_rank_ic", float(v.get("ric", 0.0)))
+                if "icir" in v:
+                    self.logger.record("eval/val_icir", float(v["icir"]))
+                if "ic_std" in v:
+                    self.logger.record("eval/val_ic_std", float(v["ic_std"]))
+                if "turnover" in v:
+                    self.logger.record("eval/val_turnover", float(v["turnover"]))
             except Exception as e:
                 if self.verbose:
                     print(f"⚠ Val 评估失败：{e}")
 
             if self._eval_test and (self._test_calc is not None):
                 try:
-                    tic, tric = self._eval_pool(self._test_calc)
-                    self.logger.record("eval/test_ic", tic)
-                    self.logger.record("eval/test_rank_ic", tric)
+                    t = self._eval_pool(self._test_calc)
+                    self.logger.record("eval/test_ic", float(t.get("ic", 0.0)))
+                    self.logger.record("eval/test_rank_ic", float(t.get("ric", 0.0)))
+                    if "icir" in t:
+                        self.logger.record("eval/test_icir", float(t["icir"]))
+                    if "ic_std" in t:
+                        self.logger.record("eval/test_ic_std", float(t["ic_std"]))
+                    if "turnover" in t:
+                        self.logger.record("eval/test_turnover", float(t["turnover"]))
                 except Exception as e:
                     if self.verbose:
                         print(f"⚠ Test 评估失败：{e}")
