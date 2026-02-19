@@ -402,6 +402,68 @@ def main():
             self.logger.record("cache/alpha_cache_hit_rate", hit_rate)
             return True
 
+    class PeriodicValTestEvalCallback(BaseCallback):
+        """
+        周期性在验证/测试集评估当前因子池（IC/RankIC），并写入 TensorBoard 标量。
+
+        说明：
+        - 评估会额外消耗算力与内存（需要加载 Val/Test 数据到内存），默认关闭；
+        - 通过环境变量 `ALPHAGEN_EVAL_EVERY_STEPS` 启用（>0）。
+        """
+
+        def __init__(
+            self,
+            pool,
+            val_calculator_obj,
+            test_calculator_obj,
+            eval_every_steps: int,
+            eval_test: bool,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self._pool = pool
+            self._val_calc = val_calculator_obj
+            self._test_calc = test_calculator_obj
+            self._every = max(1, int(eval_every_steps))
+            self._eval_test = bool(eval_test)
+
+        def _eval_pool(self, calc_obj):
+            if getattr(self._pool, "size", 0) <= 0:
+                return 0.0, 0.0
+            exprs = [e for e in self._pool.exprs[: self._pool.size] if e is not None]
+            weights = list(self._pool.weights)
+            if len(exprs) == 0:
+                return 0.0, 0.0
+            ic, ric = calc_obj.calc_pool_all_ret(exprs, weights)
+            return float(ic), float(ric)
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self._every) != 0:
+                return True
+
+            # pool 基本信息（便于在 TB 里看 pool 是否在增长）
+            self.logger.record("pool/size", float(getattr(self._pool, "size", 0)))
+            self.logger.record("pool/best_ic_ret", float(getattr(self._pool, "best_ic_ret", 0.0)))
+
+            try:
+                vic, vric = self._eval_pool(self._val_calc)
+                self.logger.record("eval/val_ic", vic)
+                self.logger.record("eval/val_rank_ic", vric)
+            except Exception as e:
+                if self.verbose:
+                    print(f"⚠ Val 评估失败：{e}")
+
+            if self._eval_test and (self._test_calc is not None):
+                try:
+                    tic, tric = self._eval_pool(self._test_calc)
+                    self.logger.record("eval/test_ic", tic)
+                    self.logger.record("eval/test_rank_ic", tric)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"⚠ Test 评估失败：{e}")
+
+            return True
+
     class IcLowerBoundScheduleCallback(BaseCallback):
         """
         动态 IC lower bound：
@@ -513,6 +575,10 @@ def main():
     reward_per_step = float(os.environ.get("ALPHAGEN_REWARD_PER_STEP", "0").strip() or 0.0)
     env_wrapper.REWARD_PER_STEP = reward_per_step
 
+    # 周期性评估（默认关闭，>0 开启）
+    eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
+    eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
+
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
     print("=" * 60)
@@ -561,6 +627,44 @@ def main():
         calculator = TensorQLibStockDataCalculator(train_data, target)
     else:
         calculator = QLibStockDataCalculator(train_data, target)
+
+    # 可选：提前加载 Val/Test 数据与 calculator，用于周期性评估
+    val_calculator_periodic = None
+    test_calculator_periodic = None
+    if eval_every_steps > 0:
+        print("\n" + "=" * 60)
+        print(f"周期性评估已开启：每 {eval_every_steps} steps 评估一次（将额外加载 Val/Test 数据）")
+        print("=" * 60)
+
+        val_data_periodic = CryptoData(
+            symbols=SYMBOLS,
+            start_time=TRAIN_END,
+            end_time=VAL_END,
+            timeframe='1h',
+            data_dir=DATA_DIR,
+            max_backtrack_periods=100,
+            max_future_periods=30,
+            features=None,
+            device=device_obj,
+        )
+        test_data_periodic = CryptoData(
+            symbols=SYMBOLS,
+            start_time=VAL_END,
+            end_time=END_TIME,
+            timeframe='1h',
+            data_dir=DATA_DIR,
+            max_backtrack_periods=100,
+            max_future_periods=30,
+            features=None,
+            device=device_obj,
+        )
+
+        if POOL_TYPE == "meanstd":
+            val_calculator_periodic = TensorQLibStockDataCalculator(val_data_periodic, target)
+            test_calculator_periodic = TensorQLibStockDataCalculator(test_data_periodic, target)
+        else:
+            val_calculator_periodic = QLibStockDataCalculator(val_data_periodic, target)
+            test_calculator_periodic = QLibStockDataCalculator(test_data_periodic, target)
 
     # ==================== 创建Alpha Pool ====================
     # 如果启用动态阈值，初始化用 start（避免刚开始就被“后期阈值”卡死）
@@ -646,6 +750,17 @@ def main():
 
     callbacks = [TensorboardCallback()]
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
+    if eval_every_steps > 0 and val_calculator_periodic is not None:
+        callbacks.append(
+            PeriodicValTestEvalCallback(
+                pool=pool,
+                val_calculator_obj=val_calculator_periodic,
+                test_calculator_obj=test_calculator_periodic,
+                eval_every_steps=eval_every_steps,
+                eval_test=eval_test_flag,
+                verbose=0,
+            )
+        )
     if ic_lb_start != ic_lb_end:
         callbacks.append(
             IcLowerBoundScheduleCallback(
