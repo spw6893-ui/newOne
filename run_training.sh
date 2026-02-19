@@ -11,16 +11,18 @@ echo ""
 # - explore20: 特征降维(Top20 IC) + 加大训练强度 + 放宽 pool（用于提升探索效率）
 # - explore20_icir: 在 explore20 基础上，使用 ICIR 目标(MeanStdAlphaPool) + 动态阈值 + 长度惩罚
 # - explore20_faststable: 在 explore20 基础上，偏“更快 + 更稳 + 更好泛化”的组合（推荐日常跑）
+# - explore20_lcb: 走“思路2”：Pool 目标改为 LCB(mean - beta*std)，更偏泛化稳定性（冲更高 OOS IC）
 PRESET="${ALPHAGEN_PRESET:-baseline}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "用法:"
-    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable]"
+    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb]"
     echo ""
     echo "示例:"
     echo "  ./run_training.sh"
     echo "  ./run_training.sh explore20"
     echo "  ./run_training.sh explore20_icir"
     echo "  ./run_training.sh explore20_faststable"
+    echo "  ./run_training.sh explore20_lcb"
     echo ""
     echo "说明:"
     echo "  也可以用环境变量覆盖任意 ALPHAGEN_* 参数（例如 ALPHAGEN_TOTAL_TIMESTEPS）。"
@@ -144,8 +146,56 @@ case "$PRESET" in
         export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
         export_default ALPHAGEN_EVAL_TEST 1
         ;;
+    explore20_lcb)
+        # 思路2：Pool objective 从“均值 IC”切到“更稳的下置信界”(LCB = mean - beta * std)
+        # 目的：更偏向 OOS（val/test）稳定性，通常能把平台期的泛化能力往上抬。
+        #
+        # 注意：这是“训练信号/优化目标”的变化，不是纯调参；reward 会变成 LCB/ICIR，而不是单纯 IC。
+        export_default ALPHAGEN_FEATURES_MAX 20
+        export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95
+        export_default ALPHAGEN_TOTAL_TIMESTEPS 800000
+
+        # PPO：尽量稳（避免抖动导致 val/test flat）
+        export_default ALPHAGEN_BATCH_SIZE 512
+        export_default ALPHAGEN_N_STEPS 8192
+        export_default ALPHAGEN_N_EPOCHS 10
+        export_default ALPHAGEN_LEARNING_RATE 0.0001
+        export_default ALPHAGEN_CLIP_RANGE 0.2
+        export_default ALPHAGEN_TARGET_KL none
+        export_default ALPHAGEN_ENT_COEF 0
+
+        # Pool：meanstd + LCB
+        export_default ALPHAGEN_POOL_TYPE meanstd
+        export_default ALPHAGEN_POOL_CAPACITY 30
+        export_default ALPHAGEN_POOL_L1_ALPHA 0.001
+        # LCB beta：越大越保守（更压 std），一般 0.3~1.0 之间试；可外部覆盖
+        export_default ALPHAGEN_POOL_LCB_BETA 0.5
+
+        # 动态阈值：先松后紧（避免早期卡死）
+        export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
+        export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
+        export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 10000
+
+        # 速度/可训练性：冷启动短，后期加长减少评估频率
+        export_default ALPHAGEN_STACK_GUARD 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_START 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_END 10
+        export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
+        export_default ALPHAGEN_REWARD_PER_STEP 0
+
+        # 子表达式库：配合“结构优先”构建策略，突破平台期
+        export_default ALPHAGEN_SUBEXPRS_MAX 80
+        export_default ALPHAGEN_SUBEXPRS_RAW_MAX 10
+        export_default ALPHAGEN_SUBEXPRS_WINDOWS "5,10,20,40"
+        export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
+
+        # cache & eval
+        export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
+        export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
+        export_default ALPHAGEN_EVAL_TEST 1
+        ;;
     *)
-        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable）"
+        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb）"
         exit 1
         ;;
 esac
