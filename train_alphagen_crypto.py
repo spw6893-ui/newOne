@@ -906,8 +906,7 @@ def main():
     elif MIN_EXPR_LEN > 1:
         print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
     print(f"Stack guard: {'ON' if STACK_GUARD else 'OFF'}（避免栈过深导致最终表达式无效 => reward=-1）")
-    if POOL_TYPE == "mse":
-        print(f"Pool optimize: lr={POOL_OPT_LR}, max_steps={POOL_OPT_MAX_STEPS}, tol={POOL_OPT_TOLERANCE}")
+    print(f"Pool optimize: lr={POOL_OPT_LR}, max_steps={POOL_OPT_MAX_STEPS}, tol={POOL_OPT_TOLERANCE}")
     print(f"PPO: n_steps={N_STEPS}, batch_size={BATCH_SIZE}, n_epochs={N_EPOCHS}")
     print(f"Features (dynamic): {len(feature_space.feature_cols)}")
     print()
@@ -996,7 +995,13 @@ def main():
         + (f" [schedule {ic_lb_start}->{ic_lb_end}]" if ic_lb_start != ic_lb_end else "")
     )
     if POOL_TYPE == "meanstd":
-        pool = NaNFriendlyMeanStdAlphaPool(
+        class TunableNaNFriendlyMeanStdAlphaPool(NaNFriendlyMeanStdAlphaPool):
+            def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:  # type: ignore[override]
+                # MeanStdAlphaPool 默认 optimize(max_steps=10000) 在 days*stocks 很大时非常慢。
+                # 这里复用 ALPHAGEN_POOL_OPT_* 作为统一的“优化预算阀门”，方便在脚本里提速/稳住。
+                return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+
+        pool = TunableNaNFriendlyMeanStdAlphaPool(
             capacity=POOL_CAPACITY,
             calculator=calculator,  # type: ignore[arg-type]
             ic_lower_bound=init_ic_lb,

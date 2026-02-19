@@ -173,6 +173,10 @@ case "$PRESET" in
         # LCB beta：越大越保守（更压 std），一般 0.3~1.0 之间试；可外部覆盖
         export_default ALPHAGEN_POOL_LCB_BETA 0.5
 
+        # MeanStdAlphaPool 的权重优化很耗时：显式限制优化预算，避免后期 fps 掉太多
+        export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
+        export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
+
         # 动态阈值：先松后紧（避免早期卡死）
         export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
         export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
@@ -220,6 +224,10 @@ case "$PRESET" in
         export_default ALPHAGEN_POOL_LCB_BETA_START -0.5
         export_default ALPHAGEN_POOL_LCB_BETA_END 0.5
         export_default ALPHAGEN_POOL_LCB_BETA_UPDATE_EVERY 10000
+
+        # MeanStdAlphaPool 的权重优化很耗时：显式限制优化预算，避免后期 fps 掉太多
+        export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
+        export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
 
         export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
         export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
