@@ -2,6 +2,7 @@ from typing import List, Optional
 from torch import Tensor
 import torch
 from alphagen.data.calculator import AlphaCalculator
+from alphagen.data.calculator import TensorAlphaCalculator
 from alphagen.data.expression import Expression
 from alphagen.utils.correlation import batch_pearsonr, batch_spearmanr
 from alphagen.utils.pytorch_utils import masked_mean_std, normalize_by_day
@@ -130,3 +131,43 @@ class TestStockDataCalculator(AlphaCalculator):
 
     def calc_pool_all_ret(self, exprs: List[Expression], weights: List[float]):
         return self.calc_pool_IC_ret(exprs, weights), self.calc_pool_rIC_ret(exprs, weights)
+
+
+class TensorQLibStockDataCalculator(TensorAlphaCalculator):
+    """
+    Tensor 版 Calculator（用于 MeanStdAlphaPool / ICIR 优化）。
+
+    关键点：
+    - `evaluate_alpha()` 与 `target` 都使用“按日 zscore”但**保留 NaN 语义**
+    - 交给 MeanStdAlphaPool 内部做 NaN 友好组合（已在 LinearAlphaPool 中做过处理）
+    """
+
+    def __init__(self, data: StockData, target: Optional[Expression]):
+        self.data = data
+        if target is None:
+            target_value = None
+        else:
+            target_value = self._normalize_keep_nan(target.evaluate(self.data))
+        super().__init__(target_value)
+
+    @staticmethod
+    def _normalize_keep_nan(value: Tensor) -> Tensor:
+        nan_mask = torch.isnan(value) | (~torch.isfinite(value))
+        n = (~nan_mask).sum(dim=1).clamp(min=1)
+        x = value.clone()
+        x[nan_mask] = 0.0
+        mean = x.sum(dim=1) / n
+        xc = (x - mean[:, None]) * (~nan_mask)
+        var = (xc * xc).sum(dim=1) / n
+        std = torch.sqrt(var)
+        std_safe = torch.where(std > 0, std, torch.ones_like(std))
+        out = (value - mean[:, None]) / std_safe[:, None]
+        out[nan_mask] = torch.nan
+        return out
+
+    def evaluate_alpha(self, expr: Expression) -> Tensor:
+        return self._normalize_keep_nan(expr.evaluate(self.data))
+
+    @property
+    def n_days(self) -> int:
+        return self.data.n_days

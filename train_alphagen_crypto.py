@@ -344,16 +344,17 @@ def main():
         return operand.var(dim=-1, unbiased=False)
     _expr_mod.Std._apply = _std_apply_unbiased_false  # type: ignore[assignment]
     _expr_mod.Var._apply = _var_apply_unbiased_false  # type: ignore[assignment]
-    from alphagen.models.linear_alpha_pool import MseAlphaPool
+    from alphagen.models.linear_alpha_pool import MeanStdAlphaPool, MseAlphaPool
     from alphagen.rl.env.wrapper import AlphaEnv
     import alphagen.rl.env.wrapper as env_wrapper
     from alphagen.rl.policy import LSTMSharedNet
     from alphagen.utils import reseed_everything
     from sb3_contrib.ppo_mask import MaskablePPO
     from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.callbacks import CallbackList
 
     from AlphaQCM.alphagen_qlib.crypto_data import CryptoData
-    from AlphaQCM.alphagen_qlib.calculator import QLibStockDataCalculator
+    from AlphaQCM.alphagen_qlib.calculator import QLibStockDataCalculator, TensorQLibStockDataCalculator
     import alphagen_qlib.stock_data as sd
 
     import alphagen as alphagen_pkg
@@ -371,6 +372,66 @@ def main():
         def _on_step(self) -> bool:
             return True
 
+    class IcLowerBoundScheduleCallback(BaseCallback):
+        """
+        动态 IC lower bound：
+        - 训练初期放宽（更容易把“尚可”的表达式塞进 pool）
+        - 训练后期收紧（逼迫更强的 alpha 进入 pool）
+        """
+
+        def __init__(
+            self,
+            pool,
+            total_timesteps: int,
+            start_lb: float,
+            end_lb: float,
+            update_every: int,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self.pool = pool
+            self.total_timesteps = max(1, int(total_timesteps))
+            self.start_lb = float(start_lb)
+            self.end_lb = float(end_lb)
+            self.update_every = max(1, int(update_every))
+            self._last_lb: Optional[float] = None
+
+        def _compute_lb(self) -> float:
+            frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
+            return self.start_lb + frac * (self.end_lb - self.start_lb)
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self.update_every) != 0:
+                return True
+            lb = float(self._compute_lb())
+            # LinearAlphaPool 内部用的是 `_ic_lower_bound`（float），这里直接更新即可。
+            setattr(self.pool, "_ic_lower_bound", lb)
+            self.logger.record("pool/ic_lower_bound", lb)
+            self._last_lb = lb
+            return True
+
+    class NaNFriendlyMeanStdAlphaPool(MeanStdAlphaPool):
+        """
+        MeanStdAlphaPool 的 NaN 友好版本：
+        - 单个因子缺失视为 0
+        - 只有“全因子都缺失”的位置才保留 NaN
+
+        目的：避免加权求和时 NaN 传播，导致组合 alpha 大面积 NaN，从而把 IC/ICIR 压成 0。
+        """
+
+        def _calc_obj_impl(self, alpha_values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            from alphagen.utils.correlation import batch_pearsonr  # 延迟导入避免循环
+
+            target_value = self.calculator.target
+            all_nan = torch.isnan(alpha_values).all(dim=0)
+            weighted = (weights[:, None, None] * torch.nan_to_num(alpha_values, nan=0.0)).sum(dim=0)
+            weighted[all_nan] = torch.nan
+            ics = batch_pearsonr(weighted, target_value)
+            mean, std = ics.mean(), ics.std()
+            if getattr(self, "_lcb_beta", None) is not None:
+                return mean - float(getattr(self, "_lcb_beta")) * std
+            return mean / std
+
     # 训练配置
     SEED = int(os.environ.get("ALPHAGEN_SEED", "42"))
     BATCH_SIZE = int(os.environ.get("ALPHAGEN_BATCH_SIZE", "128"))
@@ -386,6 +447,18 @@ def main():
     POOL_CAPACITY = int(os.environ.get("ALPHAGEN_POOL_CAPACITY", "10"))
     IC_LOWER_BOUND = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND", "0.01"))
     L1_ALPHA = float(os.environ.get("ALPHAGEN_POOL_L1_ALPHA", "0.005"))
+    POOL_TYPE = os.environ.get("ALPHAGEN_POOL_TYPE", "mse").strip().lower()  # mse / meanstd
+    pool_lcb_beta_raw = os.environ.get("ALPHAGEN_POOL_LCB_BETA", "none").strip().lower()
+    POOL_LCB_BETA: Optional[float]
+    if pool_lcb_beta_raw in {"none", "null", ""}:
+        POOL_LCB_BETA = None
+    else:
+        POOL_LCB_BETA = float(pool_lcb_beta_raw)
+
+    # 动态 threshold：start/end 任意一个被设置就启用（默认与 IC_LOWER_BOUND 相同 => 等价于关闭）
+    ic_lb_start = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_START", str(IC_LOWER_BOUND)))
+    ic_lb_end = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_END", str(IC_LOWER_BOUND)))
+    ic_lb_update_every = int(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY", "2048"))
 
     # 模型/训练超参（允许通过环境变量配置，便于 alphagen_config.sh 生效）
     LSTM_LAYERS = int(os.environ.get("ALPHAGEN_LSTM_LAYERS", "2"))
@@ -454,17 +527,35 @@ def main():
 
     # ==================== 创建Calculator ====================
     print("\nInitializing calculator...")
-    calculator = QLibStockDataCalculator(train_data, target)
+    if POOL_TYPE == "meanstd":
+        calculator = TensorQLibStockDataCalculator(train_data, target)
+    else:
+        calculator = QLibStockDataCalculator(train_data, target)
 
     # ==================== 创建Alpha Pool ====================
-    print(f"Creating alpha pool (capacity={POOL_CAPACITY}, IC threshold={IC_LOWER_BOUND})...")
-    pool = MseAlphaPool(
-        capacity=POOL_CAPACITY,
-        calculator=calculator,
-        ic_lower_bound=IC_LOWER_BOUND,
-        l1_alpha=L1_ALPHA,
-        device=device_obj,
+    # 如果启用动态阈值，初始化用 start（避免刚开始就被“后期阈值”卡死）
+    init_ic_lb = ic_lb_start if (ic_lb_start != ic_lb_end) else IC_LOWER_BOUND
+    print(
+        f"Creating alpha pool (type={POOL_TYPE}, capacity={POOL_CAPACITY}, IC threshold={init_ic_lb})..."
+        + (f" [schedule {ic_lb_start}->{ic_lb_end}]" if ic_lb_start != ic_lb_end else "")
     )
+    if POOL_TYPE == "meanstd":
+        pool = NaNFriendlyMeanStdAlphaPool(
+            capacity=POOL_CAPACITY,
+            calculator=calculator,  # type: ignore[arg-type]
+            ic_lower_bound=init_ic_lb,
+            l1_alpha=L1_ALPHA,
+            lcb_beta=POOL_LCB_BETA,
+            device=device_obj,
+        )
+    else:
+        pool = MseAlphaPool(
+            capacity=POOL_CAPACITY,
+            calculator=calculator,
+            ic_lower_bound=init_ic_lb,
+            l1_alpha=L1_ALPHA,
+            device=device_obj,
+        )
 
     # ==================== 创建RL环境 ====================
     print("Setting up RL environment...")
@@ -523,7 +614,18 @@ def main():
     print(f"Monitor training: tensorboard --logdir={OUTPUT_DIR / 'tensorboard'}")
     print()
 
-    callback = TensorboardCallback()
+    callbacks = [TensorboardCallback()]
+    if ic_lb_start != ic_lb_end:
+        callbacks.append(
+            IcLowerBoundScheduleCallback(
+                pool=pool,
+                total_timesteps=TOTAL_TIMESTEPS,
+                start_lb=ic_lb_start,
+                end_lb=ic_lb_end,
+                update_every=ic_lb_update_every,
+            )
+        )
+    callback = CallbackList(callbacks) if len(callbacks) > 1 else callbacks[0]
 
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,

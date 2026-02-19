@@ -9,14 +9,16 @@ echo ""
 # 训练预设（可选）
 # - baseline: 保持脚本/代码默认值（最接近“原始能跑通”的行为）
 # - explore20: 特征降维(Top20 IC) + 加大训练强度 + 放宽 pool（用于提升探索效率）
+# - explore20_icir: 在 explore20 基础上，使用 ICIR 目标(MeanStdAlphaPool) + 动态阈值 + 长度惩罚
 PRESET="${ALPHAGEN_PRESET:-baseline}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "用法:"
-    echo "  ./run_training.sh [baseline|explore20]"
+    echo "  ./run_training.sh [baseline|explore20|explore20_icir]"
     echo ""
     echo "示例:"
     echo "  ./run_training.sh"
     echo "  ./run_training.sh explore20"
+    echo "  ./run_training.sh explore20_icir"
     echo ""
     echo "说明:"
     echo "  也可以用环境变量覆盖任意 ALPHAGEN_* 参数（例如 ALPHAGEN_TOTAL_TIMESTEPS）。"
@@ -78,8 +80,28 @@ case "$PRESET" in
         # 避免频繁 KL early-stop 把更新截断；如需更稳可改成 0.1/0.2
         export_default ALPHAGEN_TARGET_KL none
         ;;
+    explore20_icir)
+        # 核心：reward 引导 + pool 目标从 IC 改为 ICIR + 动态阈值（先松后紧）
+        export_default ALPHAGEN_FEATURES_MAX 20
+        export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95
+        export_default ALPHAGEN_TOTAL_TIMESTEPS 800000
+        export_default ALPHAGEN_BATCH_SIZE 256
+        export_default ALPHAGEN_N_STEPS 4096
+        export_default ALPHAGEN_POOL_CAPACITY 20
+        export_default ALPHAGEN_POOL_TYPE meanstd
+        # MeanStdAlphaPool: 默认 lcb_beta=none => optimize ICIR(mean/std)
+        export_default ALPHAGEN_POOL_LCB_BETA none
+        export_default ALPHAGEN_POOL_L1_ALPHA 0.001
+        # 动态阈值：初期更容易入池，后期更严格
+        export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
+        export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
+        export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 2048
+        # 表达式长度惩罚（鼓励简洁/更早 SEP）
+        export_default ALPHAGEN_REWARD_PER_STEP -0.001
+        export_default ALPHAGEN_TARGET_KL none
+        ;;
     *)
-        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20）"
+        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir）"
         exit 1
         ;;
 esac
@@ -155,6 +177,10 @@ echo "  - ALPHAGEN_BATCH_SIZE=${ALPHAGEN_BATCH_SIZE:-128}"
 echo "  - ALPHAGEN_N_STEPS=${ALPHAGEN_N_STEPS:-2048}"
 echo "  - ALPHAGEN_POOL_CAPACITY=${ALPHAGEN_POOL_CAPACITY:-10}"
 echo "  - ALPHAGEN_IC_LOWER_BOUND=${ALPHAGEN_IC_LOWER_BOUND:-0.01}"
+echo "  - ALPHAGEN_POOL_TYPE=${ALPHAGEN_POOL_TYPE:-mse}"
+echo "  - ALPHAGEN_IC_LOWER_BOUND_START=${ALPHAGEN_IC_LOWER_BOUND_START:-${ALPHAGEN_IC_LOWER_BOUND:-0.01}}"
+echo "  - ALPHAGEN_IC_LOWER_BOUND_END=${ALPHAGEN_IC_LOWER_BOUND_END:-${ALPHAGEN_IC_LOWER_BOUND:-0.01}}"
+echo "  - ALPHAGEN_REWARD_PER_STEP=${ALPHAGEN_REWARD_PER_STEP:-0}"
 echo "  - ALPHAGEN_POOL_L1_ALPHA=${ALPHAGEN_POOL_L1_ALPHA:-0.005}"
 echo "  - ALPHAGEN_TARGET_KL=${ALPHAGEN_TARGET_KL:-none}"
 echo ""
