@@ -664,7 +664,10 @@ def main():
         device=device_obj,
     )
 
-    val_calculator = QLibStockDataCalculator(val_data, target)
+    if POOL_TYPE == "meanstd":
+        val_calculator = TensorQLibStockDataCalculator(val_data, target)
+    else:
+        val_calculator = QLibStockDataCalculator(val_data, target)
 
     if pool.size > 0:
         exprs = [e for e in pool.exprs[:pool.size] if e is not None]
@@ -690,6 +693,54 @@ def main():
         print(f"✓ Validation results saved: {OUTPUT_DIR / 'validation_results.json'}")
     else:
         print("⚠ No factors in pool")
+
+    # ==================== 测试集评估 ====================
+    print("\n" + "=" * 60)
+    print("Evaluating on test set...")
+    print("=" * 60)
+
+    test_data = CryptoData(
+        symbols=SYMBOLS,
+        start_time=VAL_END,
+        end_time=END_TIME,
+        timeframe='1h',
+        data_dir=DATA_DIR,
+        max_backtrack_periods=100,
+        max_future_periods=30,
+        features=None,
+        device=device_obj,
+    )
+
+    if POOL_TYPE == "meanstd":
+        test_calculator = TensorQLibStockDataCalculator(test_data, target)
+    else:
+        test_calculator = QLibStockDataCalculator(test_data, target)
+
+    if pool.size > 0:
+        exprs = [e for e in pool.exprs[:pool.size] if e is not None]
+        weights = list(pool.weights)
+        ic, ric = test_calculator.calc_pool_all_ret(exprs, weights)
+        print(f"Test IC: {ic:.4f}")
+        print(f"Test Rank IC: {ric:.4f}")
+
+        test_results = {
+            'ic': float(ic),
+            'rank_ic': float(ric),
+            'n_factors': len(exprs),
+            'factors': [str(expr) for expr in exprs],
+            'weights': [float(w) for w in weights],
+            'n_features_total': int(train_data.n_features),
+            'feature_columns': feature_space.feature_cols,
+            'test_start': str(VAL_END),
+            'test_end': str(END_TIME),
+        }
+
+        with open(OUTPUT_DIR / 'test_results.json', 'w', encoding="utf-8") as f:
+            json.dump(test_results, f, indent=2)
+
+        print(f"✓ Test results saved: {OUTPUT_DIR / 'test_results.json'}")
+    else:
+        print("⚠ No factors in pool (skip test eval)")
 
     print("\n" + "=" * 60)
     print("All done!")
