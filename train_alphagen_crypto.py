@@ -558,6 +558,7 @@ def main():
     LSTM_DROPOUT = float(os.environ.get("ALPHAGEN_LSTM_DROPOUT", "0.1"))
     LEARNING_RATE = float(os.environ.get("ALPHAGEN_LEARNING_RATE", "3e-4"))
     N_STEPS = int(os.environ.get("ALPHAGEN_N_STEPS", "2048"))
+    N_EPOCHS = int(os.environ.get("ALPHAGEN_N_EPOCHS", "10"))
     GAE_LAMBDA = float(os.environ.get("ALPHAGEN_GAE_LAMBDA", "0.95"))
     CLIP_RANGE = float(os.environ.get("ALPHAGEN_CLIP_RANGE", "0.2"))
     # 默认不额外加熵正则（保持与 PPO 默认一致，避免在大 action space 下冷启动卡死）
@@ -606,6 +607,7 @@ def main():
         print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
     if POOL_TYPE == "mse":
         print(f"Pool optimize: lr={POOL_OPT_LR}, max_steps={POOL_OPT_MAX_STEPS}, tol={POOL_OPT_TOLERANCE}")
+    print(f"PPO: n_steps={N_STEPS}, batch_size={BATCH_SIZE}, n_epochs={N_EPOCHS}")
     print(f"Features (dynamic): {len(feature_space.feature_cols)}")
     print()
 
@@ -763,6 +765,7 @@ def main():
         # 允许在恢复训练时微调部分超参（不改网络结构）
         model.ent_coef = ENT_COEF
         model.target_kl = TARGET_KL
+        model.n_epochs = N_EPOCHS
         # learning_rate 在 SB3 里可能是 schedule，这里不强行覆盖，避免产生误解
     else:
         if resume_flag and not Path(resume_path).exists():
@@ -774,6 +777,7 @@ def main():
             batch_size=BATCH_SIZE,
             learning_rate=LEARNING_RATE,
             n_steps=N_STEPS,
+            n_epochs=N_EPOCHS,
             gamma=0.99,
             gae_lambda=GAE_LAMBDA,
             clip_range=CLIP_RANGE,
