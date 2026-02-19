@@ -689,6 +689,47 @@ def main():
             self._last_lb = lb
             return True
 
+    class PoolLcbBetaScheduleCallback(BaseCallback):
+        """
+        动态调整 MeanStdAlphaPool 的 LCB beta（LCB = mean - beta * std）。
+
+        直觉：
+        - beta < 0：等价于“UCB”(mean + |beta|*std)，更偏探索不确定性大的表达式（类似 AlphaQCM 的 variance bonus）
+        - beta > 0：更偏“保守稳健”(惩罚 std)，提升泛化稳定性（val/test 更不容易 flat）
+
+        常用策略：beta 从负到正（先探索后稳健），例如 -0.5 -> +0.5。
+        """
+
+        def __init__(
+            self,
+            pool,
+            total_timesteps: int,
+            start_beta: float,
+            end_beta: float,
+            update_every: int,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self.pool = pool
+            self.total_timesteps = max(1, int(total_timesteps))
+            self.start_beta = float(start_beta)
+            self.end_beta = float(end_beta)
+            self.update_every = max(1, int(update_every))
+            self._last: Optional[float] = None
+
+        def _compute_beta(self) -> float:
+            frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
+            return self.start_beta + frac * (self.end_beta - self.start_beta)
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self.update_every) != 0:
+                return True
+            beta = float(self._compute_beta())
+            setattr(self.pool, "_lcb_beta", beta)
+            self.logger.record("pool/lcb_beta", beta)
+            self._last = beta
+            return True
+
     class MinExprLenScheduleCallback(BaseCallback):
         """
         动态最小表达式长度（MIN_EXPR_LEN）：
@@ -775,6 +816,21 @@ def main():
         POOL_LCB_BETA = None
     else:
         POOL_LCB_BETA = float(pool_lcb_beta_raw)
+
+    # LCB beta schedule（仅对 POOL_TYPE=meanstd 生效；用于“先 UCB 探索、后 LCB 稳健”）
+    pool_lcb_beta_start_raw = os.environ.get("ALPHAGEN_POOL_LCB_BETA_START", str(pool_lcb_beta_raw)).strip().lower()
+    pool_lcb_beta_end_raw = os.environ.get("ALPHAGEN_POOL_LCB_BETA_END", str(pool_lcb_beta_raw)).strip().lower()
+    POOL_LCB_BETA_START: Optional[float]
+    POOL_LCB_BETA_END: Optional[float]
+    if pool_lcb_beta_start_raw in {"none", "null", ""}:
+        POOL_LCB_BETA_START = None
+    else:
+        POOL_LCB_BETA_START = float(pool_lcb_beta_start_raw)
+    if pool_lcb_beta_end_raw in {"none", "null", ""}:
+        POOL_LCB_BETA_END = None
+    else:
+        POOL_LCB_BETA_END = float(pool_lcb_beta_end_raw)
+    pool_lcb_beta_update_every = int(os.environ.get("ALPHAGEN_POOL_LCB_BETA_UPDATE_EVERY", "10000").strip() or 10000)
 
     # 动态 threshold：start/end 任意一个被设置就启用（默认与 IC_LOWER_BOUND 相同 => 等价于关闭）
     ic_lb_start = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_START", str(IC_LOWER_BOUND)))
@@ -945,7 +1001,7 @@ def main():
             calculator=calculator,  # type: ignore[arg-type]
             ic_lower_bound=init_ic_lb,
             l1_alpha=L1_ALPHA,
-            lcb_beta=POOL_LCB_BETA,
+            lcb_beta=POOL_LCB_BETA_START if (POOL_LCB_BETA_START is not None) else POOL_LCB_BETA,
             device=device_obj,
         )
     else:
@@ -1099,6 +1155,19 @@ def main():
                 verbose=0,
             )
         )
+    # LCB beta schedule（仅 meanstd）：beta 从负到正 ≈ “先探索不确定性、后追求稳定”
+    if POOL_TYPE == "meanstd" and (POOL_LCB_BETA_START is not None) and (POOL_LCB_BETA_END is not None):
+        if float(POOL_LCB_BETA_START) != float(POOL_LCB_BETA_END):
+            callbacks.append(
+                PoolLcbBetaScheduleCallback(
+                    pool=pool,
+                    total_timesteps=TOTAL_TIMESTEPS,
+                    start_beta=float(POOL_LCB_BETA_START),
+                    end_beta=float(POOL_LCB_BETA_END),
+                    update_every=int(max(256, pool_lcb_beta_update_every)),
+                    verbose=0,
+                )
+            )
     if ic_lb_start != ic_lb_end:
         callbacks.append(
             IcLowerBoundScheduleCallback(
