@@ -324,17 +324,20 @@ def main():
             print(f"⚠ 保存预筛选结果失败: {e}")
 
     _install_dynamic_feature_type(feature_space.feature_cols)
+    subexprs_max = int(os.environ.get("ALPHAGEN_SUBEXPRS_MAX", "0").strip() or 0)
+    if subexprs_max < 0:
+        subexprs_max = 0
     # alphagen wrapper 的 state dtype 默认是 uint8，因此 action_space 不能超过 255
-    # action_space 大小约等于 len(features) + 常量/算子开销（约 42）
-    if len(feature_space.feature_cols) + 42 > 255:
+    # action_space 大小约等于 len(features) + 常量/算子开销（约 42）+ subexprs
+    if len(feature_space.feature_cols) + 42 + subexprs_max > 255:
         raise RuntimeError(
-            f"特征列过多（{len(feature_space.feature_cols)}），会导致 AlphaGen action_space>255（uint8 溢出）。"
-            f"请减少特征列或改造 alphagen 的 wrapper dtype。"
+            f"action_space 过大：features={len(feature_space.feature_cols)}, subexprs_max={subexprs_max}。"
+            f"这会导致 AlphaGen action_space>255（uint8 溢出）。请减少特征列/子表达式，或改造 alphagen wrapper dtype。"
         )
 
     # 现在再 import alphagen（确保 action space 读到的是动态 FeatureType）
     # 注意：当前 alphagen 版本没有 Close()/Open() 这类快捷构造器，使用 Feature(FeatureType.X) 即可。
-    from alphagen.data.expression import Feature, Ref
+    from alphagen.data.expression import Delta, EMA, Feature, Mean, Ref, Std, WMA
     # 兼容：alphagen 上游 rolling Std/Var 在窗口=1 时会触发 dof<=0 警告并产生 NaN（unbiased=True 的默认行为）。
     # 这里做一次运行时 monkey patch，避免需要修改 submodule 指针（否则会导致他人无法拉取特定 commit）。
     import alphagen.data.expression as _expr_mod
@@ -362,6 +365,65 @@ def main():
     alphagen_path = list(getattr(alphagen_pkg, "__path__", []))
     # namespace package 场景下 __file__ 可能为 None，用 __path__ 更可靠
     print(f"alphagen 包路径: {alphagen_file if alphagen_file else alphagen_path}")
+
+    def _parse_int_list(raw: str, default: List[int]) -> List[int]:
+        s = str(raw).strip()
+        if not s:
+            return default
+        out: List[int] = []
+        for part in s.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                out.append(int(part))
+            except Exception:
+                continue
+        return out or default
+
+    def _build_subexpr_library(max_n: int) -> List["Expression"]:
+        """
+        构建一个“子表达式库”，作为额外动作（ExpressionToken）提供给 agent 复用。
+
+        核心目的：减少逐 token 生成的难度，让 agent 更容易组合出有效结构，从而突破 IC 平台期。
+        """
+        if max_n <= 0:
+            return []
+
+        windows = _parse_int_list(os.environ.get("ALPHAGEN_SUBEXPRS_WINDOWS", "5,10,20,40"), [5, 10, 20, 40])
+        dts = _parse_int_list(os.environ.get("ALPHAGEN_SUBEXPRS_DTS", "1,2,4,8"), [1, 2, 4, 8])
+        windows = [w for w in windows if w > 1]
+        dts = [d for d in dts if d > 0]
+
+        exprs: List["Expression"] = []
+        seen = set()
+
+        def add(e):
+            k = str(e)
+            if k in seen:
+                return
+            seen.add(k)
+            exprs.append(e)
+
+        # 1) 原子：feature 本身（优先 close + 其余特征）
+        for i, col in enumerate(feature_space.feature_cols):
+            ft = sd.FeatureType(i)
+            add(Feature(ft))
+
+        # 2) 常用时序变换：Ref / Delta / Mean / Std / EMA / WMA
+        for i in range(len(feature_space.feature_cols)):
+            base = Feature(sd.FeatureType(i))
+            for dt in dts:
+                add(Ref(base, dt))
+                add(Delta(base, dt))
+            for w in windows:
+                add(Mean(base, w))
+                add(Std(base, w))
+                add(EMA(base, w))
+                add(WMA(base, w))
+
+        # 截断到 max_n（保持确定性顺序）
+        return exprs[:max_n]
 
     class TensorboardCallback(BaseCallback):
         """记录训练指标到TensorBoard"""
@@ -803,7 +865,20 @@ def main():
 
     # ==================== 创建RL环境 ====================
     print("Setting up RL environment...")
-    env = AlphaEnv(pool=pool, device=device_obj)
+    subexprs = _build_subexpr_library(subexprs_max)
+    if subexprs:
+        try:
+            out_dir = Path("./alphagen_output")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "subexprs.json").write_text(
+                json.dumps({"subexprs": [str(e) for e in subexprs]}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"✓ 子表达式库已生成: {out_dir / 'subexprs.json'}（n={len(subexprs)}）")
+        except Exception as e:
+            print(f"⚠ 子表达式库保存失败: {e}")
+
+    env = AlphaEnv(pool=pool, device=device_obj, subexprs=subexprs)
 
     # ==================== 创建PPO模型 ====================
     print("Creating PPO model...")
