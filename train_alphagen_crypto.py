@@ -372,6 +372,36 @@ def main():
         def _on_step(self) -> bool:
             return True
 
+    class AlphaCacheStatsCallback(BaseCallback):
+        """
+        把 alpha 评估缓存命中率写入 TensorBoard（用于定位“越跑越慢”）。
+        只有使用我们这边的 QLibStockDataCalculator / TensorQLibStockDataCalculator 才生效。
+        """
+
+        def __init__(self, calculator_obj, update_every: int = 2048, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._calc = calculator_obj
+            self._update_every = max(1, int(update_every))
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self._update_every) != 0:
+                return True
+            fn = getattr(self._calc, "alpha_cache_stats", None)
+            if fn is None:
+                return True
+            try:
+                st = fn()
+            except Exception:
+                return True
+            self.logger.record("cache/alpha_cache_size", float(st.get("cache_size", 0)))
+            self.logger.record("cache/alpha_cache_len", float(st.get("cache_len", 0)))
+            self.logger.record("cache/alpha_cache_hits", float(st.get("hits", 0)))
+            self.logger.record("cache/alpha_cache_misses", float(st.get("misses", 0)))
+            denom = float(st.get("hits", 0) + st.get("misses", 0))
+            hit_rate = float(st.get("hits", 0)) / denom if denom > 0 else 0.0
+            self.logger.record("cache/alpha_cache_hit_rate", hit_rate)
+            return True
+
     class IcLowerBoundScheduleCallback(BaseCallback):
         """
         动态 IC lower bound：
@@ -615,6 +645,7 @@ def main():
     print()
 
     callbacks = [TensorboardCallback()]
+    callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
     if ic_lb_start != ic_lb_end:
         callbacks.append(
             IcLowerBoundScheduleCallback(

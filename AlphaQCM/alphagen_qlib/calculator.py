@@ -1,4 +1,6 @@
 from typing import List, Optional
+from collections import OrderedDict
+import os
 from torch import Tensor
 import torch
 from alphagen.data.calculator import AlphaCalculator
@@ -9,9 +11,30 @@ from alphagen.utils.pytorch_utils import masked_mean_std, normalize_by_day
 from alphagen_qlib.stock_data import StockData
 
 
+def _get_alpha_cache_size() -> int:
+    """
+    Alpha/target 评估缓存大小（LRU）。
+
+    说明：
+    - AlphaGen 在 pool.try_new_expr 里会频繁计算 mutual IC：新表达式 vs 池内已有表达式。
+      如果不缓存，池内表达式会被重复 evaluate 很多次，导致训练越跑越慢。
+    - 默认开小缓存即可显著提速（通常只要覆盖 pool 容量 + 少量候选表达式）。
+    """
+    raw = os.environ.get("ALPHAGEN_ALPHA_CACHE_SIZE", "64").strip()
+    try:
+        v = int(raw)
+        return max(0, v)
+    except Exception:
+        return 64
+
+
 class QLibStockDataCalculator(AlphaCalculator):
     def __init__(self, data, target: Optional[Expression]):
         self.data = data
+        self._alpha_cache_size = _get_alpha_cache_size()
+        self._alpha_cache: "OrderedDict[str, Tensor]" = OrderedDict()
+        self._alpha_cache_hits = 0
+        self._alpha_cache_misses = 0
         if target is None: # Combination-only mode
             self.target_value = None
         else:
@@ -31,7 +54,32 @@ class QLibStockDataCalculator(AlphaCalculator):
         return out
 
     def _calc_alpha(self, expr: Expression) -> Tensor:
-        return self._normalize_keep_nan(expr.evaluate(self.data))
+        if self._alpha_cache_size <= 0:
+            return self._normalize_keep_nan(expr.evaluate(self.data))
+
+        key = str(expr)
+        cached = self._alpha_cache.get(key)
+        if cached is not None:
+            self._alpha_cache_hits += 1
+            # LRU: move to end
+            self._alpha_cache.move_to_end(key, last=True)
+            return cached
+
+        self._alpha_cache_misses += 1
+        val = self._normalize_keep_nan(expr.evaluate(self.data))
+        self._alpha_cache[key] = val
+        self._alpha_cache.move_to_end(key, last=True)
+        while len(self._alpha_cache) > self._alpha_cache_size:
+            self._alpha_cache.popitem(last=False)
+        return val
+
+    def alpha_cache_stats(self) -> dict:
+        return {
+            "cache_size": int(self._alpha_cache_size),
+            "cache_len": int(len(self._alpha_cache)),
+            "hits": int(self._alpha_cache_hits),
+            "misses": int(self._alpha_cache_misses),
+        }
 
     def _calc_IC(self, value1: Tensor, value2: Tensor) -> float:
         return batch_pearsonr(value1, value2).mean().item()
@@ -144,6 +192,10 @@ class TensorQLibStockDataCalculator(TensorAlphaCalculator):
 
     def __init__(self, data: StockData, target: Optional[Expression]):
         self.data = data
+        self._alpha_cache_size = _get_alpha_cache_size()
+        self._alpha_cache: "OrderedDict[str, Tensor]" = OrderedDict()
+        self._alpha_cache_hits = 0
+        self._alpha_cache_misses = 0
         if target is None:
             target_value = None
         else:
@@ -166,7 +218,31 @@ class TensorQLibStockDataCalculator(TensorAlphaCalculator):
         return out
 
     def evaluate_alpha(self, expr: Expression) -> Tensor:
-        return self._normalize_keep_nan(expr.evaluate(self.data))
+        if self._alpha_cache_size <= 0:
+            return self._normalize_keep_nan(expr.evaluate(self.data))
+
+        key = str(expr)
+        cached = self._alpha_cache.get(key)
+        if cached is not None:
+            self._alpha_cache_hits += 1
+            self._alpha_cache.move_to_end(key, last=True)
+            return cached
+
+        self._alpha_cache_misses += 1
+        val = self._normalize_keep_nan(expr.evaluate(self.data))
+        self._alpha_cache[key] = val
+        self._alpha_cache.move_to_end(key, last=True)
+        while len(self._alpha_cache) > self._alpha_cache_size:
+            self._alpha_cache.popitem(last=False)
+        return val
+
+    def alpha_cache_stats(self) -> dict:
+        return {
+            "cache_size": int(self._alpha_cache_size),
+            "cache_len": int(len(self._alpha_cache)),
+            "hits": int(self._alpha_cache_hits),
+            "misses": int(self._alpha_cache_misses),
+        }
 
     @property
     def n_days(self) -> int:
