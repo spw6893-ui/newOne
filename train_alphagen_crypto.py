@@ -575,6 +575,21 @@ def main():
     reward_per_step = float(os.environ.get("ALPHAGEN_REWARD_PER_STEP", "0").strip() or 0.0)
     env_wrapper.REWARD_PER_STEP = reward_per_step
 
+    # 性能/探索控制：最小表达式长度（防止策略学会“超早 SEP”导致评估次数爆炸，从而越跑越慢）
+    # - 设为 1 表示不限制（默认）
+    # - 建议可先试 6~10（会明显减少 pool.try_new_expr 的调用频率）
+    MIN_EXPR_LEN = int(os.environ.get("ALPHAGEN_MIN_EXPR_LEN", "1").strip() or 1)
+    if MIN_EXPR_LEN < 1:
+        MIN_EXPR_LEN = 1
+
+    # 性能控制：pool 权重优化上限（MseAlphaPool 的 Adam 优化默认 max_steps=10000 很重）
+    # 仅对 POOL_TYPE=mse 生效；MeanStdAlphaPool 有自己的一套优化。
+    POOL_OPT_LR = float(os.environ.get("ALPHAGEN_POOL_OPT_LR", "5e-4"))
+    POOL_OPT_MAX_STEPS = int(os.environ.get("ALPHAGEN_POOL_OPT_MAX_STEPS", "10000"))
+    POOL_OPT_TOLERANCE = int(os.environ.get("ALPHAGEN_POOL_OPT_TOLERANCE", "500"))
+    POOL_OPT_MAX_STEPS = max(50, POOL_OPT_MAX_STEPS)
+    POOL_OPT_TOLERANCE = max(10, POOL_OPT_TOLERANCE)
+
     # 周期性评估（默认关闭，>0 开启）
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
@@ -587,6 +602,10 @@ def main():
     print(f"Train: {START_TIME} -> {TRAIN_END}")
     print(f"Val: {TRAIN_END} -> {VAL_END}")
     print(f"Test: {VAL_END} -> {END_TIME}")
+    if MIN_EXPR_LEN > 1:
+        print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
+    if POOL_TYPE == "mse":
+        print(f"Pool optimize: lr={POOL_OPT_LR}, max_steps={POOL_OPT_MAX_STEPS}, tol={POOL_OPT_TOLERANCE}")
     print(f"Features (dynamic): {len(feature_space.feature_cols)}")
     print()
 
@@ -683,13 +702,38 @@ def main():
             device=device_obj,
         )
     else:
-        pool = MseAlphaPool(
+        class TunableMseAlphaPool(MseAlphaPool):
+            def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:  # type: ignore[override]
+                return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+
+        pool = TunableMseAlphaPool(
             capacity=POOL_CAPACITY,
             calculator=calculator,
             ic_lower_bound=init_ic_lb,
             l1_alpha=L1_ALPHA,
             device=device_obj,
         )
+
+    # 可选：限制最小表达式长度（通过 monkey patch core 的 stop 有效性）
+    if MIN_EXPR_LEN > 1:
+        try:
+            import alphagen.rl.env.core as _core_mod
+
+            _orig_valid_action_types = _core_mod.AlphaEnvCore._valid_action_types
+
+            def _valid_action_types_with_min_len(self):  # type: ignore[no-redef]
+                ret = _orig_valid_action_types(self)
+                # self._tokens 包含 BEG_TOKEN，真实 token 数 = len(_tokens)-1
+                if (len(getattr(self, "_tokens", [])) - 1) < MIN_EXPR_LEN:
+                    try:
+                        ret["select"][4] = False  # SEP
+                    except Exception:
+                        pass
+                return ret
+
+            _core_mod.AlphaEnvCore._valid_action_types = _valid_action_types_with_min_len  # type: ignore[assignment]
+        except Exception as e:
+            print(f"⚠ 设置 MIN_EXPR_LEN 失败（将忽略）：{e}")
 
     # ==================== 创建RL环境 ====================
     print("Setting up RL environment...")
