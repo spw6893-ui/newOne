@@ -126,8 +126,11 @@ case "$PRESET" in
         export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
         export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
 
-        # 防止策略学会超早 SEP（导致评估次数爆炸）；先保底长度，再决定要不要加 per-step 惩罚
-        export_default ALPHAGEN_MIN_EXPR_LEN 8
+        # 防止策略学会超早 SEP（导致评估次数爆炸）：
+        # - 冷启动先允许短表达式（学会“能生成合法表达式 + 会 SEP”）
+        # - 训练中后期逐步抬高最小长度（降低评估频率，显著缓解越跑越慢）
+        export_default ALPHAGEN_MIN_EXPR_LEN_START 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_END 8
         export_default ALPHAGEN_REWARD_PER_STEP 0
 
         # 子表达式库（突破平台期的关键手段之一）：让 agent 直接选择常用子结构再组合

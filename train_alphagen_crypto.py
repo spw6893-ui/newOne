@@ -628,6 +628,48 @@ def main():
             self._last_lb = lb
             return True
 
+    class MinExprLenScheduleCallback(BaseCallback):
+        """
+        动态最小表达式长度（MIN_EXPR_LEN）：
+        - 训练初期允许更短表达式，先把“生成合法表达式/会 SEP”学会；
+        - 训练后期逐步抬高最小长度，降低“每步都在评估”的频率，缓解越跑越慢。
+
+        说明：
+        - 该值通过运行时 monkey patch 影响 AlphaEnvCore._valid_action_types，从而控制 SEP 的可用性；
+        - 这是性能/稳定性的工程性约束，不改变 pool 的 IC 口径。
+        """
+
+        def __init__(
+            self,
+            total_timesteps: int,
+            start_len: int,
+            end_len: int,
+            update_every: int,
+            holder: dict,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self.total_timesteps = max(1, int(total_timesteps))
+            self.start_len = max(1, int(start_len))
+            self.end_len = max(1, int(end_len))
+            self.update_every = max(1, int(update_every))
+            self.holder = holder
+            self._last: Optional[int] = None
+
+        def _compute_len(self) -> int:
+            frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
+            v = self.start_len + frac * (self.end_len - self.start_len)
+            return max(1, int(round(v)))
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self.update_every) != 0:
+                return True
+            v = int(self._compute_len())
+            self.holder["value"] = v
+            self.logger.record("env/min_expr_len", float(v))
+            self._last = v
+            return True
+
     class NaNFriendlyMeanStdAlphaPool(MeanStdAlphaPool):
         """
         MeanStdAlphaPool 的 NaN 友好版本：
@@ -705,9 +747,19 @@ def main():
     # 性能/探索控制：最小表达式长度（防止策略学会“超早 SEP”导致评估次数爆炸，从而越跑越慢）
     # - 设为 1 表示不限制（默认）
     # - 建议可先试 6~10（会明显减少 pool.try_new_expr 的调用频率）
+    # 课程化建议：先用较小的 start（例如 1~3）让模型学会生成“可评估表达式”，再逐步拉到 end（例如 8~12）
     MIN_EXPR_LEN = int(os.environ.get("ALPHAGEN_MIN_EXPR_LEN", "1").strip() or 1)
     if MIN_EXPR_LEN < 1:
         MIN_EXPR_LEN = 1
+    MIN_EXPR_LEN_START = int(os.environ.get("ALPHAGEN_MIN_EXPR_LEN_START", str(MIN_EXPR_LEN)).strip() or MIN_EXPR_LEN)
+    MIN_EXPR_LEN_END = int(os.environ.get("ALPHAGEN_MIN_EXPR_LEN_END", str(MIN_EXPR_LEN)).strip() or MIN_EXPR_LEN)
+    MIN_EXPR_LEN_START = max(1, MIN_EXPR_LEN_START)
+    MIN_EXPR_LEN_END = max(1, MIN_EXPR_LEN_END)
+    MIN_EXPR_LEN_UPDATE_EVERY = int(os.environ.get("ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY", "2048").strip() or 2048)
+    MIN_EXPR_LEN_UPDATE_EVERY = max(256, MIN_EXPR_LEN_UPDATE_EVERY)
+    min_expr_len_holder = {"value": int(MIN_EXPR_LEN_START)}
+    stack_guard_raw = os.environ.get("ALPHAGEN_STACK_GUARD", "1").strip().lower()
+    STACK_GUARD = stack_guard_raw in {"1", "true", "yes", "y", "on"}
 
     # 性能控制：pool 权重优化上限（MseAlphaPool 的 Adam 优化默认 max_steps=10000 很重）
     # 仅对 POOL_TYPE=mse 生效；MeanStdAlphaPool 有自己的一套优化。
@@ -729,8 +781,14 @@ def main():
     print(f"Train: {START_TIME} -> {TRAIN_END}")
     print(f"Val: {TRAIN_END} -> {VAL_END}")
     print(f"Test: {VAL_END} -> {END_TIME}")
-    if MIN_EXPR_LEN > 1:
+    if MIN_EXPR_LEN_START != MIN_EXPR_LEN_END:
+        print(
+            f"Min expr len schedule: {MIN_EXPR_LEN_START}->{MIN_EXPR_LEN_END} "
+            f"(every {MIN_EXPR_LEN_UPDATE_EVERY} steps)"
+        )
+    elif MIN_EXPR_LEN > 1:
         print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
+    print(f"Stack guard: {'ON' if STACK_GUARD else 'OFF'}（避免栈过深导致最终表达式无效 => reward=-1）")
     if POOL_TYPE == "mse":
         print(f"Pool optimize: lr={POOL_OPT_LR}, max_steps={POOL_OPT_MAX_STEPS}, tol={POOL_OPT_TOLERANCE}")
     print(f"PPO: n_steps={N_STEPS}, batch_size={BATCH_SIZE}, n_epochs={N_EPOCHS}")
@@ -842,8 +900,10 @@ def main():
             device=device_obj,
         )
 
-    # 可选：限制最小表达式长度（通过 monkey patch core 的 stop 有效性）
-    if MIN_EXPR_LEN > 1:
+    # 可选：限制最小表达式长度/启用 stack guard（通过 monkey patch core 的 stop 有效性）
+    # - MIN_EXPR_LEN：控制 SEP 何时可用（减少评估频率 => 提速）
+    # - STACK_GUARD：避免栈过深导致最终表达式无效（reward=-1），提升冷启动可训练性
+    if (MIN_EXPR_LEN_START > 1) or (MIN_EXPR_LEN_END > 1) or STACK_GUARD:
         try:
             import alphagen.rl.env.core as _core_mod
 
@@ -851,10 +911,28 @@ def main():
 
             def _valid_action_types_with_min_len(self):  # type: ignore[no-redef]
                 ret = _orig_valid_action_types(self)
+                tokens = getattr(self, "_tokens", [])
                 # self._tokens 包含 BEG_TOKEN，真实 token 数 = len(_tokens)-1
-                if (len(getattr(self, "_tokens", [])) - 1) < MIN_EXPR_LEN:
+                min_len = int(min_expr_len_holder.get("value", 1))
+                if (len(tokens) - 1) < min_len:
+                    ret["select"][4] = False  # SEP
+
+                # Stack guard：当栈太深且剩余 token 太少时，禁止继续 push（特征/常量/dt/子表达式），
+                # 强制策略优先选择 Operator 来“收栈”，避免最终长度到顶时表达式无效 => reward=-1。
+                #
+                # 这是一个启发式约束（默认开启，可用 ALPHAGEN_STACK_GUARD=0 关闭），
+                # 目标是让训练更快进入“可评估表达式”的轨道，并减少无意义的 -1 episode。
+                if STACK_GUARD:
                     try:
-                        ret["select"][4] = False  # SEP
+                        stack_size = len(getattr(getattr(self, "_builder", None), "stack", []))
+                        remaining = int(MAX_EXPR_LENGTH) - int(len(tokens))
+                        if remaining < 0:
+                            remaining = 0
+                        # 只有当当前确实存在可选 Operator 时才收紧（避免把 action mask 收到全 False）
+                        if bool(ret["select"][0]) and (stack_size > (remaining + 1)):
+                            ret["select"][1] = False  # Features / Sub-expressions
+                            ret["select"][2] = False  # Constants
+                            ret["select"][3] = False  # Delta time
                     except Exception:
                         pass
                 return ret
@@ -937,6 +1015,18 @@ def main():
 
     callbacks = [TensorboardCallback()]
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
+    # 动态最小长度（可选）：帮助解决“后期越跑越慢（评估过频）”以及“冷启动全 -1（表达式无效）”
+    if (MIN_EXPR_LEN_START != MIN_EXPR_LEN_END) or (MIN_EXPR_LEN_START > 1):
+        callbacks.append(
+            MinExprLenScheduleCallback(
+                total_timesteps=TOTAL_TIMESTEPS,
+                start_len=MIN_EXPR_LEN_START,
+                end_len=MIN_EXPR_LEN_END,
+                update_every=MIN_EXPR_LEN_UPDATE_EVERY,
+                holder=min_expr_len_holder,
+                verbose=0,
+            )
+        )
     if eval_every_steps > 0 and val_calculator_periodic is not None:
         callbacks.append(
             PeriodicValTestEvalCallback(
