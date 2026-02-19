@@ -395,6 +395,18 @@ def main():
         windows = [w for w in windows if w > 1]
         dts = [d for d in dts if d > 0]
 
+        # 子表达式库的“构成”非常关键：
+        # 之前如果简单按顺序 add(Feature(...)) 再 add(Mean/Std/...)，
+        # 一旦 max_n 较小（例如 30），就会被“原子 feature”占满，导致库里几乎没有任何可复用结构，
+        # 实际上对探索帮助有限（看起来“开了 subexprs”，但效果接近没开）。
+        #
+        # 新策略：预算拆分
+        # - 先放少量原子 feature（保证最基本可用）
+        # - 优先放常用的 rolling/Ref/Delta 等结构（才是能“复用”的东西）
+        # - 最后如果还有预算，再补更多原子 feature
+        raw_max = int(os.environ.get("ALPHAGEN_SUBEXPRS_RAW_MAX", "10").strip() or 10)
+        raw_max = max(0, raw_max)
+
         exprs: List["Expression"] = []
         seen = set()
 
@@ -405,13 +417,31 @@ def main():
             seen.add(k)
             exprs.append(e)
 
-        # 1) 原子：feature 本身（优先 close + 其余特征）
-        for i, col in enumerate(feature_space.feature_cols):
-            ft = sd.FeatureType(i)
-            add(Feature(ft))
+        # 1) 选择一小批“核心原子 feature”：close + 前 raw_max-1 个
+        cols = list(feature_space.feature_cols)
+        core_cols: List[str] = []
+        if "close" in cols:
+            core_cols.append("close")
+        for c in cols:
+            if c == "close":
+                continue
+            if len(core_cols) >= max(1, raw_max):
+                break
+            core_cols.append(c)
 
-        # 2) 常用时序变换：Ref / Delta / Mean / Std / EMA / WMA
-        for i in range(len(feature_space.feature_cols)):
+        core_indices: List[int] = []
+        for c in core_cols:
+            try:
+                core_indices.append(cols.index(c))
+            except ValueError:
+                continue
+
+        # 2) 先放少量原子 feature（避免被原子塞满：只放 core）
+        for i in core_indices:
+            add(Feature(sd.FeatureType(i)))
+
+        # 3) 优先放“可复用结构”：对 core feature 做 Ref/Delta/rolling
+        for i in core_indices:
             base = Feature(sd.FeatureType(i))
             for dt in dts:
                 add(Ref(base, dt))
@@ -421,6 +451,37 @@ def main():
                 add(Std(base, w))
                 add(EMA(base, w))
                 add(WMA(base, w))
+
+        # 4) 若还有预算，再补其它 feature 的少量 rolling（提升表达力，但避免爆炸）
+        if len(exprs) < max_n:
+            extra_indices = [i for i in range(len(cols)) if i not in set(core_indices)]
+            extra_budget = max_n - len(exprs)
+            # 每个 feature 最多补 2 个结构（优先 Mean/Std）
+            per_feat = 2
+            for i in extra_indices:
+                if extra_budget <= 0:
+                    break
+                base = Feature(sd.FeatureType(i))
+                if windows:
+                    add(Mean(base, windows[0]))
+                    extra_budget -= 1
+                    if extra_budget <= 0:
+                        break
+                    add(Std(base, windows[0]))
+                    extra_budget -= 1
+                if extra_budget <= 0:
+                    break
+                # 兜底：如果 windows 为空，就补原子
+                if not windows:
+                    add(base)
+                    extra_budget -= 1
+
+        # 5) 最后，如果还有预算，再把原子 feature 补齐（用来提升组合多样性）
+        if len(exprs) < max_n:
+            for i in range(len(cols)):
+                add(Feature(sd.FeatureType(i)))
+                if len(exprs) >= max_n:
+                    break
 
         # 截断到 max_n（保持确定性顺序）
         return exprs[:max_n]

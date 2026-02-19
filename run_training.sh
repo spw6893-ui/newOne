@@ -134,7 +134,8 @@ case "$PRESET" in
         export_default ALPHAGEN_REWARD_PER_STEP 0
 
         # 子表达式库（突破平台期的关键手段之一）：让 agent 直接选择常用子结构再组合
-        export_default ALPHAGEN_SUBEXPRS_MAX 30
+        # 子表达式库加大一些（配合 train_alphagen_crypto.py 的“结构优先”库构建策略，能更明显突破平台期）
+        export_default ALPHAGEN_SUBEXPRS_MAX 80
         export_default ALPHAGEN_SUBEXPRS_WINDOWS "5,10,20,40"
         export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
 
