@@ -21,7 +21,7 @@ import numpy as np
 
 _RE_OP = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\(")
 _RE_FEAT = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
-_RE_INT = re.compile(r"(?:,|\()\\s*(\\d{1,5})\\s*(?:\\)|,)")
+_RE_INT = re.compile(r"(?:,|\()\s*(\d{1,5})\s*(?:\)|,)")
 
 
 def _stable_hash(s: str) -> int:
@@ -99,4 +99,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
