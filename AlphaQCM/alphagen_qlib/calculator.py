@@ -1,6 +1,7 @@
 from typing import List, Optional
 from collections import OrderedDict
 import os
+import time
 from torch import Tensor
 import torch
 from alphagen.data.calculator import AlphaCalculator
@@ -35,6 +36,18 @@ class QLibStockDataCalculator(AlphaCalculator):
         self._alpha_cache: "OrderedDict[str, Tensor]" = OrderedDict()
         self._alpha_cache_hits = 0
         self._alpha_cache_misses = 0
+        perf_raw = os.environ.get("ALPHAGEN_PERF_LOG", "0").strip().lower()
+        self._perf_enabled = perf_raw in {"1", "true", "yes", "y", "on"}
+        self._perf = {
+            "alpha_calls": 0,
+            "alpha_hit_calls": 0,
+            "alpha_miss_calls": 0,
+            "alpha_time_s": 0.0,
+            "alpha_hit_time_s": 0.0,
+            "alpha_miss_time_s": 0.0,
+            "ic_calls": 0,
+            "ic_time_s": 0.0,
+        }
         if target is None: # Combination-only mode
             self.target_value = None
         else:
@@ -54,8 +67,16 @@ class QLibStockDataCalculator(AlphaCalculator):
         return out
 
     def _calc_alpha(self, expr: Expression) -> Tensor:
+        t0 = time.perf_counter() if self._perf_enabled else 0.0
         if self._alpha_cache_size <= 0:
-            return self._normalize_keep_nan(expr.evaluate(self.data))
+            val = self._normalize_keep_nan(expr.evaluate(self.data))
+            if self._perf_enabled:
+                dt = time.perf_counter() - t0
+                self._perf["alpha_calls"] += 1
+                self._perf["alpha_miss_calls"] += 1
+                self._perf["alpha_time_s"] += dt
+                self._perf["alpha_miss_time_s"] += dt
+            return val
 
         key = str(expr)
         cached = self._alpha_cache.get(key)
@@ -63,6 +84,12 @@ class QLibStockDataCalculator(AlphaCalculator):
             self._alpha_cache_hits += 1
             # LRU: move to end
             self._alpha_cache.move_to_end(key, last=True)
+            if self._perf_enabled:
+                dt = time.perf_counter() - t0
+                self._perf["alpha_calls"] += 1
+                self._perf["alpha_hit_calls"] += 1
+                self._perf["alpha_time_s"] += dt
+                self._perf["alpha_hit_time_s"] += dt
             return cached
 
         self._alpha_cache_misses += 1
@@ -71,18 +98,44 @@ class QLibStockDataCalculator(AlphaCalculator):
         self._alpha_cache.move_to_end(key, last=True)
         while len(self._alpha_cache) > self._alpha_cache_size:
             self._alpha_cache.popitem(last=False)
+        if self._perf_enabled:
+            dt = time.perf_counter() - t0
+            self._perf["alpha_calls"] += 1
+            self._perf["alpha_miss_calls"] += 1
+            self._perf["alpha_time_s"] += dt
+            self._perf["alpha_miss_time_s"] += dt
         return val
 
     def alpha_cache_stats(self) -> dict:
-        return {
+        out = {
             "cache_size": int(self._alpha_cache_size),
             "cache_len": int(len(self._alpha_cache)),
             "hits": int(self._alpha_cache_hits),
             "misses": int(self._alpha_cache_misses),
         }
+        if self._perf_enabled:
+            out.update(
+                {
+                    "alpha_calls": int(self._perf["alpha_calls"]),
+                    "alpha_hit_calls": int(self._perf["alpha_hit_calls"]),
+                    "alpha_miss_calls": int(self._perf["alpha_miss_calls"]),
+                    "alpha_time_s": float(self._perf["alpha_time_s"]),
+                    "alpha_hit_time_s": float(self._perf["alpha_hit_time_s"]),
+                    "alpha_miss_time_s": float(self._perf["alpha_miss_time_s"]),
+                    "ic_calls": int(self._perf["ic_calls"]),
+                    "ic_time_s": float(self._perf["ic_time_s"]),
+                }
+            )
+        return out
 
     def _calc_IC(self, value1: Tensor, value2: Tensor) -> float:
-        return batch_pearsonr(value1, value2).mean().item()
+        if not self._perf_enabled:
+            return batch_pearsonr(value1, value2).mean().item()
+        t0 = time.perf_counter()
+        out = batch_pearsonr(value1, value2).mean().item()
+        self._perf["ic_calls"] += 1
+        self._perf["ic_time_s"] += time.perf_counter() - t0
+        return out
 
     def _calc_rIC(self, value1: Tensor, value2: Tensor) -> float:
         return batch_spearmanr(value1, value2).mean().item()
@@ -196,6 +249,16 @@ class TensorQLibStockDataCalculator(TensorAlphaCalculator):
         self._alpha_cache: "OrderedDict[str, Tensor]" = OrderedDict()
         self._alpha_cache_hits = 0
         self._alpha_cache_misses = 0
+        perf_raw = os.environ.get("ALPHAGEN_PERF_LOG", "0").strip().lower()
+        self._perf_enabled = perf_raw in {"1", "true", "yes", "y", "on"}
+        self._perf = {
+            "alpha_calls": 0,
+            "alpha_hit_calls": 0,
+            "alpha_miss_calls": 0,
+            "alpha_time_s": 0.0,
+            "alpha_hit_time_s": 0.0,
+            "alpha_miss_time_s": 0.0,
+        }
         if target is None:
             target_value = None
         else:
@@ -218,14 +281,28 @@ class TensorQLibStockDataCalculator(TensorAlphaCalculator):
         return out
 
     def evaluate_alpha(self, expr: Expression) -> Tensor:
+        t0 = time.perf_counter() if self._perf_enabled else 0.0
         if self._alpha_cache_size <= 0:
-            return self._normalize_keep_nan(expr.evaluate(self.data))
+            val = self._normalize_keep_nan(expr.evaluate(self.data))
+            if self._perf_enabled:
+                dt = time.perf_counter() - t0
+                self._perf["alpha_calls"] += 1
+                self._perf["alpha_miss_calls"] += 1
+                self._perf["alpha_time_s"] += dt
+                self._perf["alpha_miss_time_s"] += dt
+            return val
 
         key = str(expr)
         cached = self._alpha_cache.get(key)
         if cached is not None:
             self._alpha_cache_hits += 1
             self._alpha_cache.move_to_end(key, last=True)
+            if self._perf_enabled:
+                dt = time.perf_counter() - t0
+                self._perf["alpha_calls"] += 1
+                self._perf["alpha_hit_calls"] += 1
+                self._perf["alpha_time_s"] += dt
+                self._perf["alpha_hit_time_s"] += dt
             return cached
 
         self._alpha_cache_misses += 1
@@ -234,6 +311,12 @@ class TensorQLibStockDataCalculator(TensorAlphaCalculator):
         self._alpha_cache.move_to_end(key, last=True)
         while len(self._alpha_cache) > self._alpha_cache_size:
             self._alpha_cache.popitem(last=False)
+        if self._perf_enabled:
+            dt = time.perf_counter() - t0
+            self._perf["alpha_calls"] += 1
+            self._perf["alpha_miss_calls"] += 1
+            self._perf["alpha_time_s"] += dt
+            self._perf["alpha_miss_time_s"] += dt
         return val
 
     def make_ensemble_alpha(self, exprs: List[Expression], weights: List[float]) -> Tensor:
@@ -252,12 +335,24 @@ class TensorQLibStockDataCalculator(TensorAlphaCalculator):
         return out
 
     def alpha_cache_stats(self) -> dict:
-        return {
+        out = {
             "cache_size": int(self._alpha_cache_size),
             "cache_len": int(len(self._alpha_cache)),
             "hits": int(self._alpha_cache_hits),
             "misses": int(self._alpha_cache_misses),
         }
+        if self._perf_enabled:
+            out.update(
+                {
+                    "alpha_calls": int(self._perf["alpha_calls"]),
+                    "alpha_hit_calls": int(self._perf["alpha_hit_calls"]),
+                    "alpha_miss_calls": int(self._perf["alpha_miss_calls"]),
+                    "alpha_time_s": float(self._perf["alpha_time_s"]),
+                    "alpha_hit_time_s": float(self._perf["alpha_hit_time_s"]),
+                    "alpha_miss_time_s": float(self._perf["alpha_miss_time_s"]),
+                }
+            )
+        return out
 
     @property
     def n_days(self) -> int:

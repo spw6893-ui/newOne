@@ -523,6 +523,100 @@ def main():
             denom = float(st.get("hits", 0) + st.get("misses", 0))
             hit_rate = float(st.get("hits", 0)) / denom if denom > 0 else 0.0
             self.logger.record("cache/alpha_cache_hit_rate", hit_rate)
+            # 可选性能打点（默认关闭，设置 ALPHAGEN_PERF_LOG=1 开启）
+            if "alpha_time_s" in st:
+                alpha_calls = float(st.get("alpha_calls", 0))
+                alpha_hit_calls = float(st.get("alpha_hit_calls", 0))
+                alpha_miss_calls = float(st.get("alpha_miss_calls", 0))
+                alpha_time_s = float(st.get("alpha_time_s", 0.0))
+                alpha_hit_time_s = float(st.get("alpha_hit_time_s", 0.0))
+                alpha_miss_time_s = float(st.get("alpha_miss_time_s", 0.0))
+                self.logger.record("perf/alpha_time_s_total", alpha_time_s)
+                if alpha_calls > 0:
+                    self.logger.record("perf/alpha_ms_per_call", 1000.0 * alpha_time_s / alpha_calls)
+                if alpha_hit_calls > 0:
+                    self.logger.record("perf/alpha_hit_ms_per_call", 1000.0 * alpha_hit_time_s / alpha_hit_calls)
+                if alpha_miss_calls > 0:
+                    self.logger.record("perf/alpha_miss_ms_per_call", 1000.0 * alpha_miss_time_s / alpha_miss_calls)
+            if "ic_time_s" in st:
+                ic_calls = float(st.get("ic_calls", 0))
+                ic_time_s = float(st.get("ic_time_s", 0.0))
+                self.logger.record("perf/ic_time_s_total", ic_time_s)
+                if ic_calls > 0:
+                    self.logger.record("perf/ic_ms_per_call", 1000.0 * ic_time_s / ic_calls)
+            return True
+
+    class PoolPerfStatsCallback(BaseCallback):
+        """
+        记录 pool 侧的关键状态与耗时（用于定位 fps 衰减的根因）。
+
+        说明：
+        - 默认只记录轻量指标（pool/size, pool/eval_cnt）；
+        - 若 pool 实例提供 perf_stats()（本脚本会在创建 pool 时按需注入），则额外记录耗时。
+        """
+
+        def __init__(self, pool_obj, update_every: int = 2048, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._pool = pool_obj
+            self._every = max(1, int(update_every))
+            self._last = None
+
+        @staticmethod
+        def _safe_float(v) -> float:
+            try:
+                return float(v)
+            except Exception:
+                return 0.0
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self._every) != 0:
+                return True
+            try:
+                self.logger.record("pool/size", float(getattr(self._pool, "size", 0)))
+                self.logger.record("pool/eval_cnt", float(getattr(self._pool, "eval_cnt", 0)))
+            except Exception:
+                pass
+
+            fn = getattr(self._pool, "perf_stats", None)
+            if fn is None:
+                return True
+            try:
+                st = fn()
+            except Exception:
+                return True
+            if not isinstance(st, dict):
+                return True
+            if self._last is None:
+                self._last = dict(st)
+                return True
+
+            def delta(key: str) -> float:
+                return self._safe_float(st.get(key, 0.0)) - self._safe_float(self._last.get(key, 0.0))
+
+            # delta over interval
+            te_calls = delta("try_new_expr_calls")
+            te_time = delta("try_new_expr_time_s")
+            opt_calls = delta("optimize_calls")
+            opt_time = delta("optimize_time_s")
+            ics_calls = delta("calc_ics_calls")
+            ics_time = delta("calc_ics_time_s")
+
+            self.logger.record("perf/pool_try_new_expr_calls", te_calls)
+            self.logger.record("perf/pool_try_new_expr_time_s", te_time)
+            if te_calls > 0:
+                self.logger.record("perf/pool_try_new_expr_ms_per_call", 1000.0 * te_time / te_calls)
+
+            self.logger.record("perf/pool_optimize_calls", opt_calls)
+            self.logger.record("perf/pool_optimize_time_s", opt_time)
+            if opt_calls > 0:
+                self.logger.record("perf/pool_optimize_ms_per_call", 1000.0 * opt_time / opt_calls)
+
+            self.logger.record("perf/pool_calc_ics_calls", ics_calls)
+            self.logger.record("perf/pool_calc_ics_time_s", ics_time)
+            if ics_calls > 0:
+                self.logger.record("perf/pool_calc_ics_ms_per_call", 1000.0 * ics_time / ics_calls)
+
+            self._last = dict(st)
             return True
 
     class PeriodicValTestEvalCallback(BaseCallback):
@@ -995,11 +1089,59 @@ def main():
         + (f" [schedule {ic_lb_start}->{ic_lb_end}]" if ic_lb_start != ic_lb_end else "")
     )
     if POOL_TYPE == "meanstd":
+        perf_raw = os.environ.get("ALPHAGEN_PERF_LOG", "0").strip().lower()
+        PERF_LOG = perf_raw in {"1", "true", "yes", "y", "on"}
+
         class TunableNaNFriendlyMeanStdAlphaPool(NaNFriendlyMeanStdAlphaPool):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._perf_enabled = bool(PERF_LOG)
+                self._perf = {
+                    "try_new_expr_calls": 0,
+                    "try_new_expr_time_s": 0.0,
+                    "calc_ics_calls": 0,
+                    "calc_ics_time_s": 0.0,
+                    "optimize_calls": 0,
+                    "optimize_time_s": 0.0,
+                }
+
+            def perf_stats(self) -> dict:
+                return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
+
+            def try_new_expr(self, expr):  # type: ignore[override]
+                if not getattr(self, "_perf_enabled", False):
+                    return super().try_new_expr(expr)
+                import time as _time
+                t0 = _time.perf_counter()
+                out = super().try_new_expr(expr)
+                dt = _time.perf_counter() - t0
+                self._perf["try_new_expr_calls"] += 1
+                self._perf["try_new_expr_time_s"] += float(dt)
+                return out
+
+            def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
+                if not getattr(self, "_perf_enabled", False):
+                    return super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
+                import time as _time
+                t0 = _time.perf_counter()
+                out = super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
+                dt = _time.perf_counter() - t0
+                self._perf["calc_ics_calls"] += 1
+                self._perf["calc_ics_time_s"] += float(dt)
+                return out
+
             def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:  # type: ignore[override]
                 # MeanStdAlphaPool 默认 optimize(max_steps=10000) 在 days*stocks 很大时非常慢。
                 # 这里复用 ALPHAGEN_POOL_OPT_* 作为统一的“优化预算阀门”，方便在脚本里提速/稳住。
-                return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                if not getattr(self, "_perf_enabled", False):
+                    return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                import time as _time
+                t0 = _time.perf_counter()
+                out = super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                dt = _time.perf_counter() - t0
+                self._perf["optimize_calls"] += 1
+                self._perf["optimize_time_s"] += float(dt)
+                return out
 
         pool = TunableNaNFriendlyMeanStdAlphaPool(
             capacity=POOL_CAPACITY,
@@ -1010,9 +1152,57 @@ def main():
             device=device_obj,
         )
     else:
+        perf_raw = os.environ.get("ALPHAGEN_PERF_LOG", "0").strip().lower()
+        PERF_LOG = perf_raw in {"1", "true", "yes", "y", "on"}
+
         class TunableMseAlphaPool(MseAlphaPool):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._perf_enabled = bool(PERF_LOG)
+                self._perf = {
+                    "try_new_expr_calls": 0,
+                    "try_new_expr_time_s": 0.0,
+                    "calc_ics_calls": 0,
+                    "calc_ics_time_s": 0.0,
+                    "optimize_calls": 0,
+                    "optimize_time_s": 0.0,
+                }
+
+            def perf_stats(self) -> dict:
+                return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
+
+            def try_new_expr(self, expr):  # type: ignore[override]
+                if not getattr(self, "_perf_enabled", False):
+                    return super().try_new_expr(expr)
+                import time as _time
+                t0 = _time.perf_counter()
+                out = super().try_new_expr(expr)
+                dt = _time.perf_counter() - t0
+                self._perf["try_new_expr_calls"] += 1
+                self._perf["try_new_expr_time_s"] += float(dt)
+                return out
+
+            def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
+                if not getattr(self, "_perf_enabled", False):
+                    return super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
+                import time as _time
+                t0 = _time.perf_counter()
+                out = super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
+                dt = _time.perf_counter() - t0
+                self._perf["calc_ics_calls"] += 1
+                self._perf["calc_ics_time_s"] += float(dt)
+                return out
+
             def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:  # type: ignore[override]
-                return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                if not getattr(self, "_perf_enabled", False):
+                    return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                import time as _time
+                t0 = _time.perf_counter()
+                out = super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                dt = _time.perf_counter() - t0
+                self._perf["optimize_calls"] += 1
+                self._perf["optimize_time_s"] += float(dt)
+                return out
 
         pool = TunableMseAlphaPool(
             capacity=POOL_CAPACITY,
@@ -1137,6 +1327,7 @@ def main():
 
     callbacks = [TensorboardCallback()]
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
+    callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
     # 动态最小长度（可选）：帮助解决“后期越跑越慢（评估过频）”以及“冷启动全 -1（表达式无效）”
     if (MIN_EXPR_LEN_START != MIN_EXPR_LEN_END) or (MIN_EXPR_LEN_START > 1):
         callbacks.append(
