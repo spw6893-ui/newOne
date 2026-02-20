@@ -348,6 +348,8 @@ case "$PRESET" in
         export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
         # 把长度课程压缩到 150k steps 内完成（更早进入“长表达式/少评估”的阶段）
         export_default ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS 150000
+        # 冷启动 warmup：前 50k steps 固定 min_expr_len=start（避免一上来就抬太高导致 -1/15 卡死）
+        export_default ALPHAGEN_MIN_EXPR_LEN_WARMUP_STEPS 50000
         export_default ALPHAGEN_REWARD_PER_STEP 0
 
         export_default ALPHAGEN_SUBEXPRS_MAX 80

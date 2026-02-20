@@ -1009,6 +1009,7 @@ def main():
             update_every: int,
             holder: dict,
             schedule_steps: Optional[int] = None,
+            warmup_steps: Optional[int] = None,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
@@ -1018,6 +1019,10 @@ def main():
                 self.schedule_steps = self.total_timesteps
             else:
                 self.schedule_steps = max(1, int(schedule_steps))
+            if warmup_steps is None:
+                self.warmup_steps = 0
+            else:
+                self.warmup_steps = max(0, int(warmup_steps))
             self.start_len = max(1, int(start_len))
             self.end_len = max(1, int(end_len))
             self.update_every = max(1, int(update_every))
@@ -1025,7 +1030,10 @@ def main():
             self._last: Optional[int] = None
 
         def _compute_len(self) -> int:
-            frac = min(1.0, float(self.num_timesteps) / float(self.schedule_steps))
+            if self.num_timesteps <= self.warmup_steps:
+                frac = 0.0
+            else:
+                frac = min(1.0, float(self.num_timesteps - self.warmup_steps) / float(self.schedule_steps))
             v = self.start_len + frac * (self.end_len - self.start_len)
             return max(1, int(round(v)))
 
@@ -1193,6 +1201,18 @@ def main():
             MIN_EXPR_LEN_SCHEDULE_STEPS = None if v <= 0 else v
         except Exception:
             MIN_EXPR_LEN_SCHEDULE_STEPS = None
+
+    # 可选：长度课程 warmup（前 N steps 固定为 start_len，用于解决冷启动 -1/15 卡死）
+    min_expr_len_warmup_raw = os.environ.get("ALPHAGEN_MIN_EXPR_LEN_WARMUP_STEPS", "").strip()
+    MIN_EXPR_LEN_WARMUP_STEPS: Optional[int]
+    if not min_expr_len_warmup_raw:
+        MIN_EXPR_LEN_WARMUP_STEPS = None
+    else:
+        try:
+            v = int(float(min_expr_len_warmup_raw))
+            MIN_EXPR_LEN_WARMUP_STEPS = None if v <= 0 else v
+        except Exception:
+            MIN_EXPR_LEN_WARMUP_STEPS = None
     min_expr_len_holder = {"value": int(MIN_EXPR_LEN_START)}
     stack_guard_raw = os.environ.get("ALPHAGEN_STACK_GUARD", "1").strip().lower()
     STACK_GUARD = stack_guard_raw in {"1", "true", "yes", "y", "on"}
@@ -1241,6 +1261,8 @@ def main():
         )
         if MIN_EXPR_LEN_SCHEDULE_STEPS is not None:
             print(f"Min expr len schedule steps: {MIN_EXPR_LEN_SCHEDULE_STEPS}")
+        if MIN_EXPR_LEN_WARMUP_STEPS is not None:
+            print(f"Min expr len warmup steps: {MIN_EXPR_LEN_WARMUP_STEPS}")
     elif MIN_EXPR_LEN > 1:
         print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
     print(f"Stack guard: {'ON' if STACK_GUARD else 'OFF'}（避免栈过深导致最终表达式无效 => reward=-1）")
@@ -1722,6 +1744,16 @@ def main():
                             ret["select"][1] = False  # Features / Sub-expressions
                             ret["select"][2] = False  # Constants
                             ret["select"][3] = False  # Delta time
+                            # 同时尽量禁止 UnaryOperator（它不会减少栈深），强制优先使用“能收栈”的算子。
+                            # 否则策略可能连续选 unary，导致剩余 token 不足以把栈收回到 1，最终仍以 -1 结束。
+                            try:
+                                has_reducing = bool(ret["op"].get(_core_mod.BinaryOperator, False)) or bool(
+                                    ret["op"].get(_core_mod.RollingOperator, False)
+                                ) or bool(ret["op"].get(_core_mod.PairRollingOperator, False))
+                                if has_reducing:
+                                    ret["op"][_core_mod.UnaryOperator] = False
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                 return ret
@@ -1842,6 +1874,7 @@ def main():
                 update_every=MIN_EXPR_LEN_UPDATE_EVERY,
                 holder=min_expr_len_holder,
                 schedule_steps=MIN_EXPR_LEN_SCHEDULE_STEPS,
+                warmup_steps=MIN_EXPR_LEN_WARMUP_STEPS,
                 verbose=0,
             )
         )
