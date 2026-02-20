@@ -911,10 +911,16 @@ def main():
             end_len: int,
             update_every: int,
             holder: dict,
+            schedule_steps: Optional[int] = None,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
             self.total_timesteps = max(1, int(total_timesteps))
+            # 允许把“长度课程”压缩到更短步数内完成（更快降低评估频率/提升 fps）
+            if schedule_steps is None:
+                self.schedule_steps = self.total_timesteps
+            else:
+                self.schedule_steps = max(1, int(schedule_steps))
             self.start_len = max(1, int(start_len))
             self.end_len = max(1, int(end_len))
             self.update_every = max(1, int(update_every))
@@ -922,7 +928,7 @@ def main():
             self._last: Optional[int] = None
 
         def _compute_len(self) -> int:
-            frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
+            frac = min(1.0, float(self.num_timesteps) / float(self.schedule_steps))
             v = self.start_len + frac * (self.end_len - self.start_len)
             return max(1, int(round(v)))
 
@@ -1078,6 +1084,18 @@ def main():
     MIN_EXPR_LEN_END = max(1, MIN_EXPR_LEN_END)
     MIN_EXPR_LEN_UPDATE_EVERY = int(os.environ.get("ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY", "2048").strip() or 2048)
     MIN_EXPR_LEN_UPDATE_EVERY = max(256, MIN_EXPR_LEN_UPDATE_EVERY)
+    # 可选：把“最小长度课程”在更短 steps 内完成（例如 150k 内从 1->12）
+    # 目的：更快降低评估频率，避免 200k 后 fps 过低。
+    min_expr_len_sched_steps_raw = os.environ.get("ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS", "").strip()
+    MIN_EXPR_LEN_SCHEDULE_STEPS: Optional[int]
+    if not min_expr_len_sched_steps_raw:
+        MIN_EXPR_LEN_SCHEDULE_STEPS = None
+    else:
+        try:
+            v = int(float(min_expr_len_sched_steps_raw))
+            MIN_EXPR_LEN_SCHEDULE_STEPS = None if v <= 0 else v
+        except Exception:
+            MIN_EXPR_LEN_SCHEDULE_STEPS = None
     min_expr_len_holder = {"value": int(MIN_EXPR_LEN_START)}
     stack_guard_raw = os.environ.get("ALPHAGEN_STACK_GUARD", "1").strip().lower()
     STACK_GUARD = stack_guard_raw in {"1", "true", "yes", "y", "on"}
@@ -1118,6 +1136,8 @@ def main():
             f"Min expr len schedule: {MIN_EXPR_LEN_START}->{MIN_EXPR_LEN_END} "
             f"(every {MIN_EXPR_LEN_UPDATE_EVERY} steps)"
         )
+        if MIN_EXPR_LEN_SCHEDULE_STEPS is not None:
+            print(f"Min expr len schedule steps: {MIN_EXPR_LEN_SCHEDULE_STEPS}")
     elif MIN_EXPR_LEN > 1:
         print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
     print(f"Stack guard: {'ON' if STACK_GUARD else 'OFF'}（避免栈过深导致最终表达式无效 => reward=-1）")
@@ -1704,6 +1724,7 @@ def main():
                 end_len=MIN_EXPR_LEN_END,
                 update_every=MIN_EXPR_LEN_UPDATE_EVERY,
                 holder=min_expr_len_holder,
+                schedule_steps=MIN_EXPR_LEN_SCHEDULE_STEPS,
                 verbose=0,
             )
         )
