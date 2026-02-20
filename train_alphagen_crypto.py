@@ -1294,6 +1294,49 @@ def main():
     ic_lb_end = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_END", str(IC_LOWER_BOUND)))
     ic_lb_update_every = int(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY", "2048"))
 
+    # 把关键运行参数落盘，便于确认“你实际跑的是什么配置”（避免命令行覆盖失败却不自知）
+    try:
+        run_cfg = {
+            "seed": SEED,
+            "total_timesteps": TOTAL_TIMESTEPS,
+            "batch_size": BATCH_SIZE,
+            "n_steps": int(os.environ.get("ALPHAGEN_N_STEPS", "2048")),
+            "n_epochs": int(os.environ.get("ALPHAGEN_N_EPOCHS", "10")),
+            "learning_rate": float(os.environ.get("ALPHAGEN_LEARNING_RATE", "3e-4")),
+            "clip_range": float(os.environ.get("ALPHAGEN_CLIP_RANGE", "0.2")),
+            "target_kl": TARGET_KL,
+            "pool": {
+                "type": POOL_TYPE,
+                "capacity": POOL_CAPACITY,
+                "l1_alpha": L1_ALPHA,
+                "ic_lower_bound": IC_LOWER_BOUND,
+                "ic_lower_bound_start": ic_lb_start,
+                "ic_lower_bound_end": ic_lb_end,
+                "ic_lower_bound_update_every": ic_lb_update_every,
+                "ic_lower_bound_abs": bool(IC_LOWER_BOUND_ABS),
+                "mutual_ic_threshold": float(MUTUAL_IC_THRESHOLD),
+                "lcb_beta": POOL_LCB_BETA,
+                "lcb_beta_start": POOL_LCB_BETA_START,
+                "lcb_beta_end": POOL_LCB_BETA_END,
+                "lcb_beta_update_every": int(pool_lcb_beta_update_every),
+            },
+            "trial_log": {
+                "enabled": bool(TRIAL_LOG),
+                "path": str(TRIAL_LOG_PATH),
+            },
+            "surrogate": {
+                "enabled": bool(SURROGATE_GATE and (surrogate is not None)),
+                "model_path": str(SURROGATE_MODEL_PATH),
+                "score_threshold": float(SURROGATE_SCORE_THRESHOLD),
+                "random_accept_prob": float(SURROGATE_RANDOM_ACCEPT_PROB),
+                "only_when_full": bool(SURROGATE_ONLY_WHEN_FULL),
+            },
+        }
+        (OUTPUT_DIR / "run_config.json").write_text(json.dumps(run_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"✓ 运行配置已保存: {OUTPUT_DIR / 'run_config.json'}")
+    except Exception:
+        pass
+
     # 模型/训练超参（允许通过环境变量配置，便于 alphagen_config.sh 生效）
     LSTM_LAYERS = int(os.environ.get("ALPHAGEN_LSTM_LAYERS", "2"))
     LSTM_DIM = int(os.environ.get("ALPHAGEN_LSTM_DIM", "128"))
