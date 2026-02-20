@@ -525,6 +525,43 @@ def main():
             self.logger.record("cache/alpha_cache_hit_rate", hit_rate)
             return True
 
+    class FastGateStatsCallback(BaseCallback):
+        """
+        把 FastGate 的粗筛统计写入 TensorBoard，便于判断：
+        - 是否真的在“pool 满后”帮你省掉了大量评估开销
+        - 阈值是否设得过高（skips 过多可能导致学习信号变稀疏）
+        """
+
+        def __init__(self, pool_obj, update_every: int = 2048, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._pool = pool_obj
+            self._update_every = max(1, int(update_every))
+            self._last = {"calls": 0, "skips": 0, "time_s": 0.0}
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self._update_every) != 0:
+                return True
+            st = getattr(self._pool, "_fast_gate_stats", None)
+            if not isinstance(st, dict):
+                return True
+            calls = int(st.get("calls", 0))
+            skips = int(st.get("skips", 0))
+            time_s = float(st.get("time_s", 0.0))
+
+            dc = calls - int(self._last.get("calls", 0))
+            ds = skips - int(self._last.get("skips", 0))
+            dt = time_s - float(self._last.get("time_s", 0.0))
+
+            self.logger.record("perf/fast_gate_calls", float(dc))
+            self.logger.record("perf/fast_gate_skips", float(ds))
+            self.logger.record("perf/fast_gate_time_s", float(dt))
+            if dc > 0:
+                self.logger.record("perf/fast_gate_ms_per_call", 1000.0 * float(dt) / float(dc))
+                self.logger.record("perf/fast_gate_skip_rate", float(ds) / float(dc))
+
+            self._last = {"calls": calls, "skips": skips, "time_s": time_s}
+            return True
+
     class PeriodicValTestEvalCallback(BaseCallback):
         """
         周期性在验证/测试集评估当前因子池（IC/RankIC），并写入 TensorBoard 标量。
@@ -896,6 +933,23 @@ def main():
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
 
+    # 近似评估（FastGate）：pool 已满时先用“小样本数据”估计 single-IC，
+    # 不达标则跳过完整评估（节省 mutual IC 与 pool optimize 的开销）。
+    #
+    # 设计原则：
+    # - 默认关闭（避免对训练动态产生不可预期影响）
+    # - 默认只在 pool 满时启用（尽量不影响冷启动/早期探索）
+    fast_gate_raw = os.environ.get("ALPHAGEN_FAST_GATE", "0").strip().lower()
+    FAST_GATE = fast_gate_raw in {"1", "true", "yes", "y", "on"}
+    fast_gate_only_full_raw = os.environ.get("ALPHAGEN_FAST_GATE_ONLY_WHEN_FULL", "1").strip().lower()
+    FAST_GATE_ONLY_WHEN_FULL = fast_gate_only_full_raw in {"1", "true", "yes", "y", "on"}
+    FAST_GATE_SYMBOLS = int(os.environ.get("ALPHAGEN_FAST_GATE_SYMBOLS", "20").strip() or 20)
+    FAST_GATE_PERIODS = int(os.environ.get("ALPHAGEN_FAST_GATE_PERIODS", "4000").strip() or 4000)  # 1h bars
+    FAST_GATE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_FAST_GATE_MIN_ABS_IC", "0.0").strip() or 0.0)
+    FAST_GATE_SYMBOLS = max(4, FAST_GATE_SYMBOLS)
+    FAST_GATE_PERIODS = max(256, FAST_GATE_PERIODS)
+    FAST_GATE_MIN_ABS_IC = max(0.0, FAST_GATE_MIN_ABS_IC)
+
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
     print("=" * 60)
@@ -947,6 +1001,52 @@ def main():
     target = Ref(close_expr, -1) / close_expr - 1
 
     print(f"Target: 1-hour forward return")
+
+    # FastGate：构造一个更小的“训练子集”，仅用于 single-IC 粗筛（不改变最终 IC 口径）
+    fast_gate_calc = None
+    if FAST_GATE:
+        try:
+            class _StockDataView:
+                def __init__(self, base, data_tensor: torch.Tensor):
+                    self.data = data_tensor
+                    self.max_backtrack_days = int(getattr(base, "max_backtrack_days"))
+                    self.max_future_days = int(getattr(base, "max_future_days"))
+
+                @property
+                def n_features(self) -> int:
+                    return int(self.data.shape[1])
+
+                @property
+                def n_stocks(self) -> int:
+                    return int(self.data.shape[2])
+
+                @property
+                def n_days(self) -> int:
+                    return int(self.data.shape[0] - self.max_backtrack_days - self.max_future_days)
+
+            total_symbols = int(getattr(train_data, "n_stocks", 0))
+            take_symbols = min(int(FAST_GATE_SYMBOLS), max(1, total_symbols))
+            rng = np.random.default_rng(SEED)
+            idx = np.array(sorted(rng.choice(total_symbols, size=take_symbols, replace=False).tolist()), dtype=np.int64)
+
+            base_tensor = train_data.data
+            need_len = int(FAST_GATE_PERIODS + train_data.max_backtrack_days + train_data.max_future_days + 1)
+            start = max(0, int(base_tensor.shape[0]) - need_len)
+            fast_tensor = base_tensor[start:, :, :].index_select(2, torch.tensor(idx, device=base_tensor.device))
+            fast_view = _StockDataView(train_data, fast_tensor)
+
+            # 注意：这里用的是“同口径 calculator”，但数据更小，速度更快
+            if POOL_TYPE == "meanstd":
+                fast_gate_calc = TensorQLibStockDataCalculator(fast_view, target)
+            else:
+                fast_gate_calc = QLibStockDataCalculator(fast_view, target)
+            print(
+                f"✓ FastGate 已启用：symbols={take_symbols}/{total_symbols}, periods≈{FAST_GATE_PERIODS}, "
+                f"min_abs_ic={FAST_GATE_MIN_ABS_IC}, only_when_full={FAST_GATE_ONLY_WHEN_FULL}"
+            )
+        except Exception as e:
+            print(f"⚠ FastGate 初始化失败（将禁用）：{e}")
+            fast_gate_calc = None
 
     # ==================== 创建Calculator ====================
     print("\nInitializing calculator...")
@@ -1027,6 +1127,41 @@ def main():
             l1_alpha=L1_ALPHA,
             device=device_obj,
         )
+
+    # 可选：FastGate（近似 single-IC 粗筛）
+    # 说明：返回 0.0 表示“这次不值得做完整评估”，不改变 pool 状态。
+    if fast_gate_calc is not None:
+        import types
+        import time as _time
+
+        pool._fast_gate_stats = {"calls": 0, "skips": 0, "time_s": 0.0}  # type: ignore[attr-defined]
+
+        _orig_try_new_expr = pool.__class__.try_new_expr
+
+        def _try_new_expr_fast_gate(self, expr):  # type: ignore[no-redef]
+            only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
+            if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                t0g = _time.perf_counter()
+                try:
+                    ic_fast = float(fast_gate_calc.calc_single_IC_ret(expr))
+                except Exception:
+                    ic_fast = float("nan")
+                dtg = _time.perf_counter() - t0g
+
+                st = getattr(self, "_fast_gate_stats", None)
+                if isinstance(st, dict):
+                    st["calls"] = int(st.get("calls", 0)) + 1
+                    st["time_s"] = float(st.get("time_s", 0.0)) + float(dtg)
+
+                thr = float(FAST_GATE_MIN_ABS_IC)
+                if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
+                    if isinstance(st, dict):
+                        st["skips"] = int(st.get("skips", 0)) + 1
+                    return 0.0
+
+            return _orig_try_new_expr(self, expr)
+
+        pool.try_new_expr = types.MethodType(_try_new_expr_fast_gate, pool)  # type: ignore[assignment]
 
     # 可选：限制最小表达式长度/启用 stack guard（通过 monkey patch core 的 stop 有效性）
     # - MIN_EXPR_LEN：控制 SEP 何时可用（减少评估频率 => 提速）
@@ -1143,6 +1278,8 @@ def main():
 
     callbacks = [TensorboardCallback()]
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
+    if fast_gate_calc is not None:
+        callbacks.append(FastGateStatsCallback(pool_obj=pool, update_every=2048))
     # 动态最小长度（可选）：帮助解决“后期越跑越慢（评估过频）”以及“冷启动全 -1（表达式无效）”
     if (MIN_EXPR_LEN_START != MIN_EXPR_LEN_END) or (MIN_EXPR_LEN_START > 1):
         callbacks.append(
