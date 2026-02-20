@@ -347,6 +347,7 @@ def main():
         return operand.var(dim=-1, unbiased=False)
     _expr_mod.Std._apply = _std_apply_unbiased_false  # type: ignore[assignment]
     _expr_mod.Var._apply = _var_apply_unbiased_false  # type: ignore[assignment]
+    from alphagen.data.pool_update import AddRemoveAlphas
     from alphagen.models.linear_alpha_pool import MeanStdAlphaPool, MseAlphaPool
     from alphagen.rl.env.wrapper import AlphaEnv
     import alphagen.rl.env.wrapper as env_wrapper
@@ -866,6 +867,47 @@ def main():
             self._last = v
             return True
 
+    class PoolOptimizeEveryScheduleCallback(BaseCallback):
+        """
+        动态调整 Pool 的“权重优化频率”（optimize_every_updates）：
+        - 训练早期：每次有新 alpha 入池都优化（更强训练信号，避免冷启动训不动）
+        - 训练后期：降低优化频率（显著缓解 MeanStdAlphaPool.optimize() 带来的 fps 衰减）
+        """
+
+        def __init__(
+            self,
+            pool,
+            total_timesteps: int,
+            start_every: int,
+            end_every: int,
+            update_every: int,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self.pool = pool
+            self.total_timesteps = max(1, int(total_timesteps))
+            self.start_every = max(1, int(start_every))
+            self.end_every = max(1, int(end_every))
+            self.update_every = max(1, int(update_every))
+            self._last: Optional[int] = None
+
+        def _compute_every(self) -> int:
+            frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
+            v = self.start_every + frac * (self.end_every - self.start_every)
+            return max(1, int(round(v)))
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self.update_every) != 0:
+                return True
+            v = int(self._compute_every())
+            try:
+                setattr(self.pool, "_optimize_every_updates", v)
+            except Exception:
+                return True
+            self.logger.record("pool/optimize_every_updates", float(v))
+            self._last = v
+            return True
+
     class NaNFriendlyMeanStdAlphaPool(MeanStdAlphaPool):
         """
         MeanStdAlphaPool 的 NaN 友好版本：
@@ -980,6 +1022,17 @@ def main():
     POOL_OPT_MAX_STEPS = max(50, POOL_OPT_MAX_STEPS)
     POOL_OPT_TOLERANCE = max(10, POOL_OPT_TOLERANCE)
 
+    # 性能控制：pool 权重优化频率（默认=1，保持原始行为：每次入池都 optimize）
+    # 建议：MeanStdAlphaPool 在后期 fps 掉得厉害时，逐步拉到 4~12（能显著改善）
+    POOL_OPT_EVERY_UPDATES = int(os.environ.get("ALPHAGEN_POOL_OPT_EVERY_UPDATES", "1").strip() or 1)
+    POOL_OPT_EVERY_UPDATES = max(1, POOL_OPT_EVERY_UPDATES)
+    POOL_OPT_EVERY_UPDATES_START = int(os.environ.get("ALPHAGEN_POOL_OPT_EVERY_UPDATES_START", str(POOL_OPT_EVERY_UPDATES)).strip() or POOL_OPT_EVERY_UPDATES)
+    POOL_OPT_EVERY_UPDATES_END = int(os.environ.get("ALPHAGEN_POOL_OPT_EVERY_UPDATES_END", str(POOL_OPT_EVERY_UPDATES)).strip() or POOL_OPT_EVERY_UPDATES)
+    POOL_OPT_EVERY_UPDATES_START = max(1, POOL_OPT_EVERY_UPDATES_START)
+    POOL_OPT_EVERY_UPDATES_END = max(1, POOL_OPT_EVERY_UPDATES_END)
+    POOL_OPT_EVERY_UPDATES_UPDATE_EVERY = int(os.environ.get("ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY", "20000").strip() or 20000)
+    POOL_OPT_EVERY_UPDATES_UPDATE_EVERY = max(256, POOL_OPT_EVERY_UPDATES_UPDATE_EVERY)
+
     # 周期性评估（默认关闭，>0 开启）
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
@@ -1001,6 +1054,15 @@ def main():
         print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
     print(f"Stack guard: {'ON' if STACK_GUARD else 'OFF'}（避免栈过深导致最终表达式无效 => reward=-1）")
     print(f"Pool optimize: lr={POOL_OPT_LR}, max_steps={POOL_OPT_MAX_STEPS}, tol={POOL_OPT_TOLERANCE}")
+    if POOL_OPT_EVERY_UPDATES_START != POOL_OPT_EVERY_UPDATES_END or POOL_OPT_EVERY_UPDATES_START != 1:
+        if POOL_OPT_EVERY_UPDATES_START != POOL_OPT_EVERY_UPDATES_END:
+            print(
+                "Pool optimize schedule: "
+                f"every_updates {POOL_OPT_EVERY_UPDATES_START}->{POOL_OPT_EVERY_UPDATES_END} "
+                f"(every {POOL_OPT_EVERY_UPDATES_UPDATE_EVERY} env steps)"
+            )
+        else:
+            print(f"Pool optimize every_updates: {POOL_OPT_EVERY_UPDATES_START}")
     print(f"PPO: n_steps={N_STEPS}, batch_size={BATCH_SIZE}, n_epochs={N_EPOCHS}")
     print(f"Features (dynamic): {len(feature_space.feature_cols)}")
     print()
@@ -1104,16 +1166,98 @@ def main():
                     "optimize_calls": 0,
                     "optimize_time_s": 0.0,
                 }
+                self._optimize_every_updates = int(POOL_OPT_EVERY_UPDATES_START)
+                self._lazy_updates_since_opt = 0
+                self._did_first_full_optimize = False
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
 
+            @staticmethod
+            def _safe_abs_min_idx(x: np.ndarray) -> int:
+                if x.size <= 0:
+                    return 0
+                return int(np.argmin(np.abs(x)))
+
+            def _try_new_expr_lazy(self, expr):
+                """
+                Lazy 模式：不是每次入池都做 optimize（MeanStd 的 optimize 很重，会导致后期 fps 崩）。
+                - 入池/互相关筛选仍然严格；
+                - 超容量时用 |single IC| 的启发式做一次快速剔除；
+                - 仅当累计 N 次“成功入池/替换”后才做一次 optimize 来更新 weights。
+                """
+                ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=0.99)
+                if ic_ret is None or ic_mut is None or np.isnan(ic_ret) or np.isnan(ic_mut).any():
+                    return 0.0
+                if str(expr) in self._failure_cache:
+                    return self.best_obj
+
+                self.eval_cnt += 1
+                old_pool = self.exprs[: self.size]  # type: ignore
+                self._add_factor(expr, ic_ret, ic_mut)
+
+                worst_idx = None
+                if self.size > self.capacity:
+                    worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
+                    if worst_idx == self.capacity:
+                        self._pop(worst_idx)
+                        self._failure_cache.add(str(expr))
+                        return self.best_obj
+                    self._pop(worst_idx)
+
+                removed_idx = [worst_idx] if worst_idx is not None else []
+
+                # optimize 频率控制（优先保证：pool 第一次填满时至少 optimize 一次）
+                do_opt = False
+                if self.size > 1:
+                    if (not self._did_first_full_optimize) and (self.size >= self.capacity):
+                        do_opt = True
+                        self._did_first_full_optimize = True
+                    else:
+                        self._lazy_updates_since_opt += 1
+                        every = int(getattr(self, "_optimize_every_updates", 1) or 1)
+                        every = max(1, every)
+                        do_opt = (every == 1) or (self._lazy_updates_since_opt >= every)
+
+                if do_opt:
+                    self.weights = self.optimize()
+                    self._lazy_updates_since_opt = 0
+
+                self.update_history.append(
+                    AddRemoveAlphas(
+                        added_exprs=[expr],
+                        removed_idx=removed_idx,
+                        old_pool=old_pool,
+                        old_pool_ic=self.best_ic_ret,
+                        new_pool_ic=ic_ret,
+                    )
+                )
+
+                self._failure_cache = set()
+                new_ic_ret, new_obj = self.calculate_ic_and_objective()
+                self._maybe_update_best(new_ic_ret, new_obj)
+                return new_obj
+
             def try_new_expr(self, expr):  # type: ignore[override]
+                # 默认（every_updates=1）：保持 LinearAlphaPool 原始行为（每次入池都 optimize）
+                every = int(getattr(self, "_optimize_every_updates", 1) or 1)
+                if every <= 1:
+                    if not getattr(self, "_perf_enabled", False):
+                        return super().try_new_expr(expr)
+                    import time as _time
+                    t0 = _time.perf_counter()
+                    out = super().try_new_expr(expr)
+                    dt = _time.perf_counter() - t0
+                    self._perf["try_new_expr_calls"] += 1
+                    self._perf["try_new_expr_time_s"] += float(dt)
+                    return out
+
+                # Lazy（every_updates>1）：减少 optimize 调用，避免后期 fps 崩
                 if not getattr(self, "_perf_enabled", False):
-                    return super().try_new_expr(expr)
+                    return self._try_new_expr_lazy(expr)
                 import time as _time
                 t0 = _time.perf_counter()
-                out = super().try_new_expr(expr)
+                out = self._try_new_expr_lazy(expr)
                 dt = _time.perf_counter() - t0
                 self._perf["try_new_expr_calls"] += 1
                 self._perf["try_new_expr_time_s"] += float(dt)
@@ -1167,16 +1311,89 @@ def main():
                     "optimize_calls": 0,
                     "optimize_time_s": 0.0,
                 }
+                self._optimize_every_updates = int(POOL_OPT_EVERY_UPDATES_START)
+                self._lazy_updates_since_opt = 0
+                self._did_first_full_optimize = False
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
 
+            @staticmethod
+            def _safe_abs_min_idx(x: np.ndarray) -> int:
+                if x.size <= 0:
+                    return 0
+                return int(np.argmin(np.abs(x)))
+
+            def _try_new_expr_lazy(self, expr):
+                ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=0.99)
+                if ic_ret is None or ic_mut is None or np.isnan(ic_ret) or np.isnan(ic_mut).any():
+                    return 0.0
+                if str(expr) in self._failure_cache:
+                    return self.best_obj
+
+                self.eval_cnt += 1
+                old_pool = self.exprs[: self.size]  # type: ignore
+                self._add_factor(expr, ic_ret, ic_mut)
+
+                worst_idx = None
+                if self.size > self.capacity:
+                    worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
+                    if worst_idx == self.capacity:
+                        self._pop(worst_idx)
+                        self._failure_cache.add(str(expr))
+                        return self.best_obj
+                    self._pop(worst_idx)
+
+                removed_idx = [worst_idx] if worst_idx is not None else []
+
+                do_opt = False
+                if self.size > 1:
+                    if (not self._did_first_full_optimize) and (self.size >= self.capacity):
+                        do_opt = True
+                        self._did_first_full_optimize = True
+                    else:
+                        self._lazy_updates_since_opt += 1
+                        every = int(getattr(self, "_optimize_every_updates", 1) or 1)
+                        every = max(1, every)
+                        do_opt = (every == 1) or (self._lazy_updates_since_opt >= every)
+
+                if do_opt:
+                    self.weights = self.optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                    self._lazy_updates_since_opt = 0
+
+                self.update_history.append(
+                    AddRemoveAlphas(
+                        added_exprs=[expr],
+                        removed_idx=removed_idx,
+                        old_pool=old_pool,
+                        old_pool_ic=self.best_ic_ret,
+                        new_pool_ic=ic_ret,
+                    )
+                )
+
+                self._failure_cache = set()
+                new_ic_ret, new_obj = self.calculate_ic_and_objective()
+                self._maybe_update_best(new_ic_ret, new_obj)
+                return new_obj
+
             def try_new_expr(self, expr):  # type: ignore[override]
+                every = int(getattr(self, "_optimize_every_updates", 1) or 1)
+                if every <= 1:
+                    if not getattr(self, "_perf_enabled", False):
+                        return super().try_new_expr(expr)
+                    import time as _time
+                    t0 = _time.perf_counter()
+                    out = super().try_new_expr(expr)
+                    dt = _time.perf_counter() - t0
+                    self._perf["try_new_expr_calls"] += 1
+                    self._perf["try_new_expr_time_s"] += float(dt)
+                    return out
+
                 if not getattr(self, "_perf_enabled", False):
-                    return super().try_new_expr(expr)
+                    return self._try_new_expr_lazy(expr)
                 import time as _time
                 t0 = _time.perf_counter()
-                out = super().try_new_expr(expr)
+                out = self._try_new_expr_lazy(expr)
                 dt = _time.perf_counter() - t0
                 self._perf["try_new_expr_calls"] += 1
                 self._perf["try_new_expr_time_s"] += float(dt)
@@ -1393,6 +1610,23 @@ def main():
     callbacks = [TensorboardCallback()]
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
     callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
+    # pool.optimize 频率 schedule（默认关闭：start=end=1 时等价于原行为）
+    if POOL_OPT_EVERY_UPDATES_START != POOL_OPT_EVERY_UPDATES_END:
+        callbacks.append(
+            PoolOptimizeEveryScheduleCallback(
+                pool=pool,
+                total_timesteps=TOTAL_TIMESTEPS,
+                start_every=POOL_OPT_EVERY_UPDATES_START,
+                end_every=POOL_OPT_EVERY_UPDATES_END,
+                update_every=POOL_OPT_EVERY_UPDATES_UPDATE_EVERY,
+                verbose=0,
+            )
+        )
+    else:
+        try:
+            setattr(pool, "_optimize_every_updates", int(POOL_OPT_EVERY_UPDATES_START))
+        except Exception:
+            pass
     # 动态最小长度（可选）：帮助解决“后期越跑越慢（评估过频）”以及“冷启动全 -1（表达式无效）”
     if (MIN_EXPR_LEN_START != MIN_EXPR_LEN_END) or (MIN_EXPR_LEN_START > 1):
         callbacks.append(

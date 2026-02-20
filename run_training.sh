@@ -13,10 +13,11 @@ echo ""
 # - explore20_faststable: 在 explore20 基础上，偏“更快 + 更稳 + 更好泛化”的组合（推荐日常跑）
 # - explore20_lcb: 走“思路2”：Pool 目标改为 LCB(mean - beta*std)，更偏泛化稳定性（冲更高 OOS IC）
 # - explore20_ucblcb: 参考 AlphaQCM 的“方差引导探索”直觉：beta 从负到正（先 UCB 探索，后 LCB 稳健）
+# - explore20_ucblcb_fast: 在 explore20_ucblcb 基础上，降低后期 pool.optimize() 频率，显著缓解 fps 衰减
 PRESET="${ALPHAGEN_PRESET:-baseline}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "用法:"
-    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb|explore20_ucblcb]"
+    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb|explore20_ucblcb|explore20_ucblcb_fast]"
     echo ""
     echo "示例:"
     echo "  ./run_training.sh"
@@ -25,6 +26,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "  ./run_training.sh explore20_faststable"
     echo "  ./run_training.sh explore20_lcb"
     echo "  ./run_training.sh explore20_ucblcb"
+    echo "  ./run_training.sh explore20_ucblcb_fast"
     echo ""
     echo "说明:"
     echo "  也可以用环境变量覆盖任意 ALPHAGEN_* 参数（例如 ALPHAGEN_TOTAL_TIMESTEPS）。"
@@ -248,8 +250,58 @@ case "$PRESET" in
         export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
         export_default ALPHAGEN_EVAL_TEST 1
         ;;
+    explore20_ucblcb_fast)
+        # explore20_ucblcb 的“提速版”：不改变早期训练信号密度，
+        # 但在训练推进后逐步降低 pool.optimize() 触发频率，以防止 200k+ 后 fps 持续衰减。
+        export_default ALPHAGEN_FEATURES_MAX 20
+        export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95
+        export_default ALPHAGEN_TOTAL_TIMESTEPS 800000
+
+        export_default ALPHAGEN_BATCH_SIZE 512
+        export_default ALPHAGEN_N_STEPS 8192
+        export_default ALPHAGEN_N_EPOCHS 10
+        export_default ALPHAGEN_LEARNING_RATE 0.0001
+        export_default ALPHAGEN_CLIP_RANGE 0.2
+        export_default ALPHAGEN_TARGET_KL none
+        export_default ALPHAGEN_ENT_COEF 0
+
+        export_default ALPHAGEN_POOL_TYPE meanstd
+        export_default ALPHAGEN_POOL_CAPACITY 30
+        export_default ALPHAGEN_POOL_L1_ALPHA 0.001
+
+        export_default ALPHAGEN_POOL_LCB_BETA_START -0.5
+        export_default ALPHAGEN_POOL_LCB_BETA_END 0.5
+        export_default ALPHAGEN_POOL_LCB_BETA_UPDATE_EVERY 10000
+
+        export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
+        export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
+
+        # 新增：pool optimize 触发频率 schedule（1 -> 8）
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000
+
+        export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
+        export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
+        export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 10000
+
+        export_default ALPHAGEN_STACK_GUARD 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_START 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_END 10
+        export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
+        export_default ALPHAGEN_REWARD_PER_STEP 0
+
+        export_default ALPHAGEN_SUBEXPRS_MAX 80
+        export_default ALPHAGEN_SUBEXPRS_RAW_MAX 10
+        export_default ALPHAGEN_SUBEXPRS_WINDOWS "5,10,20,40"
+        export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
+
+        export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
+        export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
+        export_default ALPHAGEN_EVAL_TEST 1
+        ;;
     *)
-        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb）"
+        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast）"
         exit 1
         ;;
 esac
