@@ -1259,6 +1259,12 @@ def main():
     # Alpha Pool配置 - 针对高维特征优化
     POOL_CAPACITY = int(os.environ.get("ALPHAGEN_POOL_CAPACITY", "10"))
     IC_LOWER_BOUND = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND", "0.01"))
+    # 默认沿用 alphagen 的单因子筛选逻辑：只接受 single_ic >= lower_bound（会拒绝负 IC）。
+    # 对于 crypto/可做空组合，更合理的是接受 abs(single_ic) >= lower_bound，让 optimize 自己学符号。
+    ic_lb_abs_raw = os.environ.get("ALPHAGEN_IC_LOWER_BOUND_ABS", "0").strip().lower()
+    IC_LOWER_BOUND_ABS = ic_lb_abs_raw in {"1", "true", "yes", "y", "on"}
+    # mutual IC 阈值：越大越“宽松”（更不容易因为相似被拒），但会让 mutual 计算更常走完（略慢）
+    MUTUAL_IC_THRESHOLD = float(os.environ.get("ALPHAGEN_MUTUAL_IC_THRESHOLD", "0.99").strip() or 0.99)
     L1_ALPHA = float(os.environ.get("ALPHAGEN_POOL_L1_ALPHA", "0.005"))
     POOL_TYPE = os.environ.get("ALPHAGEN_POOL_TYPE", "mse").strip().lower()  # mse / meanstd
     pool_lcb_beta_raw = os.environ.get("ALPHAGEN_POOL_LCB_BETA", "none").strip().lower()
@@ -1709,8 +1715,40 @@ def main():
                 return out
 
             def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
+                # 使用 env 配置的 mutual 阈值（覆盖 super().try_new_expr 传入的默认值 0.99）
+                ic_mut_threshold = float(MUTUAL_IC_THRESHOLD)
                 if not getattr(self, "_perf_enabled", False):
-                    out = super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
+                    try:
+                        single_ic = float(self.calculator.calc_single_IC_ret(expr))
+                    except Exception:
+                        return float("nan"), None
+
+                    # 单因子阈值：可选 abs 版本（适合可做空组合）
+                    try:
+                        under = bool(getattr(self, "_under_thres_alpha"))
+                    except Exception:
+                        under = False
+                    lb = float(getattr(self, "_ic_lower_bound", -1.0))
+                    if (not under) and (self.size > 0) and np.isfinite(lb):
+                        v = abs(single_ic) if IC_LOWER_BOUND_ABS else single_ic
+                        if v < lb:
+                            self._last_single_ic = float(single_ic)
+                            self._last_mutual_max = float("nan")
+                            return float(single_ic), None
+
+                    mutual_ics = []
+                    for i in range(int(getattr(self, "size", 0) or 0)):
+                        try:
+                            mi = float(self.calculator.calc_mutual_IC(expr, self.exprs[i]))  # type: ignore[index]
+                        except Exception:
+                            mi = float("nan")
+                        if ic_mut_threshold is not None and np.isfinite(mi) and (mi > float(ic_mut_threshold)):
+                            self._last_single_ic = float(single_ic)
+                            self._last_mutual_max = float(mi)
+                            return float(single_ic), None
+                        mutual_ics.append(mi)
+
+                    out = (float(single_ic), mutual_ics)
                     try:
                         single_ic, ic_mut = out
                         self._last_single_ic = float(single_ic)
@@ -1728,7 +1766,38 @@ def main():
                     return out
                 import time as _time
                 t0 = _time.perf_counter()
-                out = super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
+                try:
+                    single_ic = float(self.calculator.calc_single_IC_ret(expr))
+                except Exception:
+                    out = (float("nan"), None)
+                else:
+                    try:
+                        under = bool(getattr(self, "_under_thres_alpha"))
+                    except Exception:
+                        under = False
+                    lb = float(getattr(self, "_ic_lower_bound", -1.0))
+                    if (not under) and (self.size > 0) and np.isfinite(lb):
+                        v = abs(single_ic) if IC_LOWER_BOUND_ABS else single_ic
+                        if v < lb:
+                            out = (float(single_ic), None)
+                        else:
+                            out = None
+                    else:
+                        out = None
+
+                if out is None:
+                    mutual_ics = []
+                    for i in range(int(getattr(self, "size", 0) or 0)):
+                        try:
+                            mi = float(self.calculator.calc_mutual_IC(expr, self.exprs[i]))  # type: ignore[index]
+                        except Exception:
+                            mi = float("nan")
+                        if ic_mut_threshold is not None and np.isfinite(mi) and (mi > float(ic_mut_threshold)):
+                            out = (float(single_ic), None)
+                            break
+                        mutual_ics.append(mi)
+                    if out is None:
+                        out = (float(single_ic), mutual_ics)
                 dt = _time.perf_counter() - t0
                 self._perf["calc_ics_calls"] += 1
                 self._perf["calc_ics_time_s"] += float(dt)
