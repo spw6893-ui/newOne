@@ -2036,24 +2036,10 @@ def main():
         )
     callback = CallbackList(callbacks) if len(callbacks) > 1 else callbacks[0]
 
-    try:
-        model.learn(
-            total_timesteps=TOTAL_TIMESTEPS,
-            callback=callback
-        )
-    except KeyboardInterrupt:
-        print("\n⚠ 收到中断信号（Ctrl+C），正在保存当前 checkpoint…")
-        try:
-            if ckpt_cb is not None:
-                ckpt_cb.save_now(reason="interrupt")
-            else:
-                step = int(getattr(model, "num_timesteps", 0) or 0)
-                model.save(str(OUTPUT_DIR / "model_interrupt"))
-                _dump_json_atomic(OUTPUT_DIR / "alpha_pool_interrupt.json", pool.to_json_dict())
-                _dump_json_atomic(OUTPUT_DIR / "interrupt.json", {"step": step})
-        except Exception as e:
-            print(f"⚠ 中断保存失败: {e}")
-        raise
+    model.learn(
+        total_timesteps=TOTAL_TIMESTEPS,
+        callback=callback
+    )
 
     # ==================== 保存结果 ====================
     print("\n" + "=" * 60)
