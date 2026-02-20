@@ -1717,7 +1717,12 @@ def main():
                         if ic_mut is None:
                             self._last_mutual_max = float("nan")
                         else:
-                            self._last_mutual_max = float(np.nanmax(np.asarray(ic_mut, dtype=np.float64))) if len(ic_mut) else float("nan")
+                            if not ic_mut:
+                                self._last_mutual_max = float("nan")
+                            else:
+                                arr = np.asarray(ic_mut, dtype=np.float64)
+                                m = np.nanmax(arr) if np.isfinite(arr).any() else float("nan")
+                                self._last_mutual_max = float(m)
                     except Exception:
                         pass
                     return out
@@ -1733,7 +1738,12 @@ def main():
                     if ic_mut is None:
                         self._last_mutual_max = float("nan")
                     else:
-                        self._last_mutual_max = float(np.nanmax(np.asarray(ic_mut, dtype=np.float64))) if len(ic_mut) else float("nan")
+                        if not ic_mut:
+                            self._last_mutual_max = float("nan")
+                        else:
+                            arr = np.asarray(ic_mut, dtype=np.float64)
+                            m = np.nanmax(arr) if np.isfinite(arr).any() else float("nan")
+                            self._last_mutual_max = float(m)
                 except Exception:
                     pass
                 return out
