@@ -303,6 +303,8 @@ case "$PRESET" in
         export_default ALPHAGEN_EVAL_TEST 1
         ;;
     explore20_ucblcb_cs)
+        # 开启性能打点（写入 TensorBoard：perf/*），用于定位 fps 衰减根因
+        export_default ALPHAGEN_PERF_LOG 1
         # 启用截面算子（CSRank/CSZScore）会改变 action_space，因此不兼容旧模型 resume。
         export_default ALPHAGEN_ENABLE_CS_OPS 1
         # 其他参数与 explore20_ucblcb 保持一致（便于对比）
