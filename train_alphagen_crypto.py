@@ -680,6 +680,9 @@ def main():
             opt_time = delta("optimize_time_s")
             ics_calls = delta("calc_ics_calls")
             ics_time = delta("calc_ics_time_s")
+            fg_calls = delta("fast_gate_calls")
+            fg_skips = delta("fast_gate_skips")
+            fg_time = delta("fast_gate_time_s")
 
             self.logger.record("perf/pool_try_new_expr_calls", te_calls)
             self.logger.record("perf/pool_try_new_expr_time_s", te_time)
@@ -695,6 +698,13 @@ def main():
             self.logger.record("perf/pool_calc_ics_time_s", ics_time)
             if ics_calls > 0:
                 self.logger.record("perf/pool_calc_ics_ms_per_call", 1000.0 * ics_time / ics_calls)
+
+            # FastGate
+            self.logger.record("perf/fast_gate_calls", fg_calls)
+            self.logger.record("perf/fast_gate_skips", fg_skips)
+            self.logger.record("perf/fast_gate_time_s", fg_time)
+            if fg_calls > 0:
+                self.logger.record("perf/fast_gate_ms_per_call", 1000.0 * fg_time / fg_calls)
 
             self._last = dict(st)
             return True
@@ -1240,6 +1250,19 @@ def main():
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
 
+    # 近似评估（Fast Gate）：在 pool 已满时，先用“更小的训练子集”计算 single-IC，
+    # 不达标则跳过完整评估（节省大量 mutual IC / optimize 的开销）。
+    fast_gate_raw = os.environ.get("ALPHAGEN_FAST_GATE", "0").strip().lower()
+    FAST_GATE = fast_gate_raw in {"1", "true", "yes", "y", "on"}
+    fast_gate_only_full_raw = os.environ.get("ALPHAGEN_FAST_GATE_ONLY_WHEN_FULL", "1").strip().lower()
+    FAST_GATE_ONLY_WHEN_FULL = fast_gate_only_full_raw in {"1", "true", "yes", "y", "on"}
+    FAST_GATE_SYMBOLS = int(os.environ.get("ALPHAGEN_FAST_GATE_SYMBOLS", "20").strip() or 20)
+    FAST_GATE_PERIODS = int(os.environ.get("ALPHAGEN_FAST_GATE_PERIODS", "4000").strip() or 4000)  # 1h bars
+    FAST_GATE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_FAST_GATE_MIN_ABS_IC", "0.003").strip() or 0.003)
+    FAST_GATE_SYMBOLS = max(4, FAST_GATE_SYMBOLS)
+    FAST_GATE_PERIODS = max(256, FAST_GATE_PERIODS)
+    FAST_GATE_MIN_ABS_IC = max(0.0, FAST_GATE_MIN_ABS_IC)
+
     # 周期性保存 checkpoint（默认关闭，>0 开启）
     ckpt_every_steps = int(os.environ.get("ALPHAGEN_CHECKPOINT_EVERY_STEPS", "0").strip() or 0)
     ckpt_keep_last = int(os.environ.get("ALPHAGEN_CHECKPOINT_KEEP", "3").strip() or 3)
@@ -1311,6 +1334,52 @@ def main():
 
     print(f"Target: 1-hour forward return")
 
+    # Fast Gate：构造一个更小的训练子集，仅用于 single-IC 粗筛（不改变最终 IC 口径）
+    fast_gate_calc = None
+    if FAST_GATE:
+        try:
+            class _StockDataView:
+                def __init__(self, base, data_tensor: torch.Tensor):
+                    self.data = data_tensor
+                    self.max_backtrack_days = int(getattr(base, "max_backtrack_days"))
+                    self.max_future_days = int(getattr(base, "max_future_days"))
+
+                @property
+                def n_features(self) -> int:
+                    return int(self.data.shape[1])
+
+                @property
+                def n_stocks(self) -> int:
+                    return int(self.data.shape[2])
+
+                @property
+                def n_days(self) -> int:
+                    return int(self.data.shape[0] - self.max_backtrack_days - self.max_future_days)
+
+            total_symbols = int(getattr(train_data, "n_stocks", 0))
+            take_symbols = min(int(FAST_GATE_SYMBOLS), max(1, total_symbols))
+            rng = np.random.default_rng(SEED)
+            idx = np.array(sorted(rng.choice(total_symbols, size=take_symbols, replace=False).tolist()), dtype=np.int64)
+
+            base_tensor = train_data.data
+            need_len = int(FAST_GATE_PERIODS + train_data.max_backtrack_days + train_data.max_future_days + 1)
+            start = max(0, int(base_tensor.shape[0]) - need_len)
+            fast_tensor = base_tensor[start:, :, :].index_select(2, torch.tensor(idx, device=base_tensor.device))
+            fast_view = _StockDataView(train_data, fast_tensor)
+
+            # 注意：这里用的是“同口径 calculator”，但数据更小，速度更快
+            if POOL_TYPE == "meanstd":
+                fast_gate_calc = TensorQLibStockDataCalculator(fast_view, target)
+            else:
+                fast_gate_calc = QLibStockDataCalculator(fast_view, target)
+            print(
+                f"✓ FastGate 已启用：symbols={take_symbols}/{total_symbols}, periods≈{FAST_GATE_PERIODS}, "
+                f"min_abs_ic={FAST_GATE_MIN_ABS_IC}, only_when_full={FAST_GATE_ONLY_WHEN_FULL}"
+            )
+        except Exception as e:
+            print(f"⚠ FastGate 初始化失败（将禁用）：{e}")
+            fast_gate_calc = None
+
     # ==================== 创建Calculator ====================
     print("\nInitializing calculator...")
     if POOL_TYPE == "meanstd":
@@ -1378,10 +1447,16 @@ def main():
                     "calc_ics_time_s": 0.0,
                     "optimize_calls": 0,
                     "optimize_time_s": 0.0,
+                    "fast_gate_calls": 0,
+                    "fast_gate_skips": 0,
+                    "fast_gate_time_s": 0.0,
                 }
                 self._optimize_every_updates = int(POOL_OPT_EVERY_UPDATES_START)
                 self._lazy_updates_since_opt = 0
                 self._did_first_full_optimize = False
+                self._fast_gate_calc = fast_gate_calc
+                self._fast_gate_only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
+                self._fast_gate_min_abs_ic = float(FAST_GATE_MIN_ABS_IC)
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -1452,6 +1527,27 @@ def main():
                 return new_obj
 
             def try_new_expr(self, expr):  # type: ignore[override]
+                # Fast Gate：pool 满时先用小样本估计 single-IC，不达标直接跳过完整评估
+                fg_calc = getattr(self, "_fast_gate_calc", None)
+                if fg_calc is not None:
+                    only_full = bool(getattr(self, "_fast_gate_only_full", True))
+                    if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                        import time as _time
+                        t0g = _time.perf_counter()
+                        try:
+                            ic_fast = float(fg_calc.calc_single_IC_ret(expr))
+                        except Exception:
+                            ic_fast = float("nan")
+                        dtg = _time.perf_counter() - t0g
+                        if getattr(self, "_perf_enabled", False):
+                            self._perf["fast_gate_calls"] += 1
+                            self._perf["fast_gate_time_s"] += float(dtg)
+                        thr = float(getattr(self, "_fast_gate_min_abs_ic", 0.0))
+                        if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["fast_gate_skips"] += 1
+                            return 0.0
+
                 # 默认（every_updates=1）：保持 LinearAlphaPool 原始行为（每次入池都 optimize）
                 every = int(getattr(self, "_optimize_every_updates", 1) or 1)
                 if every <= 1:
@@ -1523,10 +1619,16 @@ def main():
                     "calc_ics_time_s": 0.0,
                     "optimize_calls": 0,
                     "optimize_time_s": 0.0,
+                    "fast_gate_calls": 0,
+                    "fast_gate_skips": 0,
+                    "fast_gate_time_s": 0.0,
                 }
                 self._optimize_every_updates = int(POOL_OPT_EVERY_UPDATES_START)
                 self._lazy_updates_since_opt = 0
                 self._did_first_full_optimize = False
+                self._fast_gate_calc = fast_gate_calc
+                self._fast_gate_only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
+                self._fast_gate_min_abs_ic = float(FAST_GATE_MIN_ABS_IC)
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -1590,6 +1692,26 @@ def main():
                 return new_obj
 
             def try_new_expr(self, expr):  # type: ignore[override]
+                fg_calc = getattr(self, "_fast_gate_calc", None)
+                if fg_calc is not None:
+                    only_full = bool(getattr(self, "_fast_gate_only_full", True))
+                    if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                        import time as _time
+                        t0g = _time.perf_counter()
+                        try:
+                            ic_fast = float(fg_calc.calc_single_IC_ret(expr))
+                        except Exception:
+                            ic_fast = float("nan")
+                        dtg = _time.perf_counter() - t0g
+                        if getattr(self, "_perf_enabled", False):
+                            self._perf["fast_gate_calls"] += 1
+                            self._perf["fast_gate_time_s"] += float(dtg)
+                        thr = float(getattr(self, "_fast_gate_min_abs_ic", 0.0))
+                        if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["fast_gate_skips"] += 1
+                            return 0.0
+
                 every = int(getattr(self, "_optimize_every_updates", 1) or 1)
                 if every <= 1:
                     if not getattr(self, "_perf_enabled", False):

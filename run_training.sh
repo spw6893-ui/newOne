@@ -358,6 +358,12 @@ case "$PRESET" in
         export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
 
         export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
+        # 近似评估（FastGate）：pool 满后先用小样本 single-IC 粗筛，不达标跳过完整评估
+        export_default ALPHAGEN_FAST_GATE 1
+        export_default ALPHAGEN_FAST_GATE_ONLY_WHEN_FULL 1
+        export_default ALPHAGEN_FAST_GATE_SYMBOLS 20
+        export_default ALPHAGEN_FAST_GATE_PERIODS 4000
+        export_default ALPHAGEN_FAST_GATE_MIN_ABS_IC 0.003
         # 周期评估（更频繁便于观测曲线；如需更快可外部覆盖成 100000/200000）
         export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
         export_default ALPHAGEN_EVAL_TEST 0
