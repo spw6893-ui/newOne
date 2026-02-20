@@ -327,26 +327,96 @@ def main():
     subexprs_max = int(os.environ.get("ALPHAGEN_SUBEXPRS_MAX", "0").strip() or 0)
     if subexprs_max < 0:
         subexprs_max = 0
-    # alphagen wrapper 的 state dtype 默认是 uint8，因此 action_space 不能超过 255
-    # action_space 大小约等于 len(features) + 常量/算子开销（约 42）+ subexprs
-    if len(feature_space.feature_cols) + 42 + subexprs_max > 255:
-        raise RuntimeError(
-            f"action_space 过大：features={len(feature_space.feature_cols)}, subexprs_max={subexprs_max}。"
-            f"这会导致 AlphaGen action_space>255（uint8 溢出）。请减少特征列/子表达式，或改造 alphagen wrapper dtype。"
-        )
 
     # 现在再 import alphagen（确保 action space 读到的是动态 FeatureType）
     # 注意：当前 alphagen 版本没有 Close()/Open() 这类快捷构造器，使用 Feature(FeatureType.X) 即可。
-    from alphagen.data.expression import Delta, EMA, Feature, Mean, Ref, Std, WMA
+    #
     # 兼容：alphagen 上游 rolling Std/Var 在窗口=1 时会触发 dof<=0 警告并产生 NaN（unbiased=True 的默认行为）。
     # 这里做一次运行时 monkey patch，避免需要修改 submodule 指针（否则会导致他人无法拉取特定 commit）。
+    #
+    # 架构提升（可选，默认关闭）：
+    # - 增加“截面算子”到 action space：CSRank / CSZScore
+    # - 这会改变 action_space 大小：旧模型无法 resume（必须从头训练）
+    enable_cs_ops_raw = os.environ.get("ALPHAGEN_ENABLE_CS_OPS", "0").strip().lower()
+    ENABLE_CS_OPS = enable_cs_ops_raw in {"1", "true", "yes", "y", "on"}
+
     import alphagen.data.expression as _expr_mod
+
     def _std_apply_unbiased_false(self, operand):  # type: ignore[no-redef]
         return operand.std(dim=-1, unbiased=False)
+
     def _var_apply_unbiased_false(self, operand):  # type: ignore[no-redef]
         return operand.var(dim=-1, unbiased=False)
+
     _expr_mod.Std._apply = _std_apply_unbiased_false  # type: ignore[assignment]
     _expr_mod.Var._apply = _var_apply_unbiased_false  # type: ignore[assignment]
+
+    # 注册 CSZScore（用于 parse_expression + 可选 action space）
+    if not hasattr(_expr_mod, "CSZScore"):
+
+        class CSZScore(_expr_mod.UnaryOperator):
+            """
+            截面 ZScore：对每个时点在“币种维度”做标准化（忽略 NaN/inf）。
+            输出保留 NaN 语义：该时点该币种输入不可用 => 输出为 NaN。
+            """
+
+            def _apply(self, operand: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+                x = operand
+                mask = (~torch.isfinite(x)) | torch.isnan(x)
+                n = (~mask).sum(dim=1, keepdim=True).clamp(min=1)
+                x0 = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+                x0 = x0 * (~mask)
+                mean = x0.sum(dim=1, keepdim=True) / n
+                xc = (x0 - mean) * (~mask)
+                var = (xc * xc).sum(dim=1, keepdim=True) / n
+                std = torch.sqrt(var)
+                std_safe = torch.where(std > 1e-6, std, torch.ones_like(std))
+                out = (torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) - mean) / std_safe
+                out[mask] = torch.nan
+                return out
+
+        _expr_mod.CSZScore = CSZScore  # type: ignore[attr-defined]
+
+    # 让 parser 认识 CSZScore（不改变 action space）
+    try:
+        ops_list = getattr(_expr_mod, "Operators", None)
+        if isinstance(ops_list, list) and _expr_mod.CSZScore not in ops_list:  # type: ignore[attr-defined]
+            ops_list.insert(0, _expr_mod.CSZScore)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # 可选：把截面算子加入 action space（会改变 action_space => 不兼容旧模型 resume）
+    import alphagen.config as _cfg
+    if ENABLE_CS_OPS:
+        resume_raw = os.environ.get("ALPHAGEN_RESUME", "0").strip().lower()
+        if resume_raw in {"1", "true", "yes", "y", "on"}:
+            print("⚠ 已开启 ALPHAGEN_ENABLE_CS_OPS=1：这会改变 action_space，旧模型无法 resume，请从头训练。")
+
+        # 让 RL 能直接生成截面算子（默认 alphagen.config.OPERATORS 不包含它们）
+        extra_ops = []
+        if hasattr(_expr_mod, "CSRank"):
+            extra_ops.append(_expr_mod.CSRank)  # type: ignore[attr-defined]
+        extra_ops.append(_expr_mod.CSZScore)  # type: ignore[attr-defined]
+
+        # 插到 Unary 区域（Abs/Log 后），保持 token 语义相对稳定
+        insert_pos = 2 if len(_cfg.OPERATORS) >= 2 else len(_cfg.OPERATORS)
+        for op in extra_ops:
+            if op in _cfg.OPERATORS:
+                continue
+            _cfg.OPERATORS.insert(insert_pos, op)
+            insert_pos += 1
+
+    # alphagen wrapper 的 state dtype 默认是 uint8，因此 action_space 不能超过 255（否则会溢出）
+    import alphagen_qlib.stock_data as sd
+    base_action = len(_cfg.OPERATORS) + len(sd.FeatureType) + len(_cfg.DELTA_TIMES) + len(_cfg.CONSTANTS) + 1
+    total_action = base_action + subexprs_max
+    if total_action > 255:
+        raise RuntimeError(
+            f"action_space 过大：base={base_action}, subexprs_max={subexprs_max}, total={total_action}。"
+            "这会导致 AlphaGen action_space>255（uint8 溢出）。请减少特征列/子表达式，或关闭 ALPHAGEN_ENABLE_CS_OPS。"
+        )
+
+    from alphagen.data.expression import Delta, EMA, Feature, Mean, Ref, Std, WMA
     from alphagen.data.pool_update import AddRemoveAlphas
     from alphagen.models.linear_alpha_pool import MeanStdAlphaPool, MseAlphaPool
     from alphagen.rl.env.wrapper import AlphaEnv
@@ -359,8 +429,6 @@ def main():
 
     from AlphaQCM.alphagen_qlib.crypto_data import CryptoData
     from AlphaQCM.alphagen_qlib.calculator import QLibStockDataCalculator, TensorQLibStockDataCalculator
-    import alphagen_qlib.stock_data as sd
-
     import alphagen as alphagen_pkg
     alphagen_file = getattr(alphagen_pkg, "__file__", None)
     alphagen_path = list(getattr(alphagen_pkg, "__path__", []))
