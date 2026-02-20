@@ -329,14 +329,23 @@ case "$PRESET" in
         export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
         export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
 
+        # 关键提速：MeanStd pool 的 optimize 很重，后期会把 fps 拖到 50 左右甚至更低。
+        # 这里让 optimize 从“每次入池都做”逐步变为“每 8 次入池/替换做一次”。
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000
+
         export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
         export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
         export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 10000
 
         export_default ALPHAGEN_STACK_GUARD 1
         export_default ALPHAGEN_MIN_EXPR_LEN_START 1
-        export_default ALPHAGEN_MIN_EXPR_LEN_END 10
+        # 关键提速：更快抬高 min_expr_len，减少“每几步就评估一次表达式”的频率
+        export_default ALPHAGEN_MIN_EXPR_LEN_END 12
         export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
+        # 把长度课程压缩到 150k steps 内完成（更早进入“长表达式/少评估”的阶段）
+        export_default ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS 150000
         export_default ALPHAGEN_REWARD_PER_STEP 0
 
         export_default ALPHAGEN_SUBEXPRS_MAX 80
@@ -345,8 +354,9 @@ case "$PRESET" in
         export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
 
         export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
-        export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
-        export_default ALPHAGEN_EVAL_TEST 1
+        # 周期评估会额外加载 val/test 数据，开得太频繁会明显拖慢；默认改为更疏 + 不评 test
+        export_default ALPHAGEN_EVAL_EVERY_STEPS 100000
+        export_default ALPHAGEN_EVAL_TEST 0
         ;;
     *)
         echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast / explore20_ucblcb_cs）"
