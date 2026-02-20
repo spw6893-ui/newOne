@@ -1212,6 +1212,71 @@ def main():
             device=device_obj,
         )
 
+    # 可选：恢复历史 alpha_pool（重要：ALPHAGEN_RESUME 默认只恢复 PPO 模型，不会恢复 pool）
+    # 用法：
+    #   ALPHAGEN_POOL_RESUME=1 \
+    #   ALPHAGEN_POOL_RESUME_PATH=alphagen_output/alpha_pool.json \
+    #   ALPHAGEN_POOL_RESUME_WEIGHTS=1 \
+    #   ./run_training.sh ...
+    pool_resume_raw = os.environ.get("ALPHAGEN_POOL_RESUME", "0").strip().lower()
+    POOL_RESUME = pool_resume_raw in {"1", "true", "yes", "y", "on"}
+    pool_resume_path = Path(
+        os.environ.get("ALPHAGEN_POOL_RESUME_PATH", str(OUTPUT_DIR / "alpha_pool.json")).strip()
+        or str(OUTPUT_DIR / "alpha_pool.json")
+    )
+    pool_resume_weights_raw = os.environ.get("ALPHAGEN_POOL_RESUME_WEIGHTS", "1").strip().lower()
+    POOL_RESUME_WEIGHTS = pool_resume_weights_raw in {"1", "true", "yes", "y", "on"}
+    if POOL_RESUME and pool_resume_path.exists():
+        try:
+            from alphagen.data.parser import parse_expression
+
+            obj = json.loads(pool_resume_path.read_text(encoding="utf-8"))
+            raw_exprs = obj.get("exprs", [])
+            raw_weights = obj.get("weights", None)
+            expr_pairs = []
+            if isinstance(raw_exprs, list):
+                if isinstance(raw_weights, list) and POOL_RESUME_WEIGHTS:
+                    for s, w in zip(raw_exprs, raw_weights):
+                        expr_pairs.append((s, w))
+                else:
+                    for s in raw_exprs:
+                        expr_pairs.append((s, None))
+
+            parsed_exprs = []
+            parsed_weights = []
+            for s, w in expr_pairs:
+                if not isinstance(s, str) or not s.strip():
+                    continue
+                try:
+                    e = parse_expression(s.strip())
+                except Exception:
+                    continue
+                parsed_exprs.append(e)
+                if w is not None:
+                    try:
+                        parsed_weights.append(float(w))
+                    except Exception:
+                        parsed_weights.append(0.0)
+
+            # force_load_exprs 会用 _calc_ics 重新构建 mutual IC 等信息；
+            # 为了确保能完整复现历史 pool，不让 ic_lower_bound 影响加载，加载时临时关闭阈值。
+            if parsed_exprs:
+                orig_lb = getattr(pool, "_ic_lower_bound", None)
+                try:
+                    if orig_lb is not None:
+                        setattr(pool, "_ic_lower_bound", -1.0)
+                    if parsed_weights and len(parsed_weights) == len(parsed_exprs):
+                        pool.force_load_exprs(parsed_exprs, weights=parsed_weights)
+                        print(f"✓ 恢复 alpha_pool（含 weights）: {pool_resume_path}（loaded={pool.size}）")
+                    else:
+                        pool.force_load_exprs(parsed_exprs, weights=None)
+                        print(f"✓ 恢复 alpha_pool（重算 weights）: {pool_resume_path}（loaded={pool.size}）")
+                finally:
+                    if orig_lb is not None:
+                        setattr(pool, "_ic_lower_bound", orig_lb)
+        except Exception as e:
+            print(f"⚠ alpha_pool 恢复失败（将忽略）：{e}")
+
     # 可选：限制最小表达式长度/启用 stack guard（通过 monkey patch core 的 stop 有效性）
     # - MIN_EXPR_LEN：控制 SEP 何时可用（减少评估频率 => 提速）
     # - STACK_GUARD：避免栈过深导致最终表达式无效（reward=-1），提升冷启动可训练性
