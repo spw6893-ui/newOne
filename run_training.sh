@@ -356,8 +356,8 @@ case "$PRESET" in
         export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
 
         export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
-        # 周期评估会额外加载 val/test 数据，开得太频繁会明显拖慢；默认改为更疏 + 不评 test
-        export_default ALPHAGEN_EVAL_EVERY_STEPS 100000
+        # 周期评估（更频繁便于观测曲线；如需更快可外部覆盖成 100000/200000）
+        export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
         export_default ALPHAGEN_EVAL_TEST 0
         ;;
     *)
