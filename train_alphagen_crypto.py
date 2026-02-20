@@ -12,7 +12,10 @@ AlphaGen（子模块 alphagen/）加密货币因子挖掘训练入口。
 import csv
 import json
 import os
+import random
+import re
 import sys
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -651,6 +654,11 @@ def main():
         def _on_step(self) -> bool:
             if (self.num_timesteps % self._every) != 0:
                 return True
+            # 让 pool 知道当前训练步数（用于 trial log / 代理 gate 的可追溯标注）
+            try:
+                setattr(self._pool, "_current_step", int(self.num_timesteps))
+            except Exception:
+                pass
             try:
                 self.logger.record("pool/size", float(getattr(self._pool, "size", 0)))
                 self.logger.record("pool/eval_cnt", float(getattr(self._pool, "eval_cnt", 0)))
@@ -683,6 +691,9 @@ def main():
             fg_calls = delta("fast_gate_calls")
             fg_skips = delta("fast_gate_skips")
             fg_time = delta("fast_gate_time_s")
+            sg_calls = delta("surrogate_calls")
+            sg_skips = delta("surrogate_skips")
+            sg_time = delta("surrogate_time_s")
 
             self.logger.record("perf/pool_try_new_expr_calls", te_calls)
             self.logger.record("perf/pool_try_new_expr_time_s", te_time)
@@ -705,6 +716,13 @@ def main():
             self.logger.record("perf/fast_gate_time_s", fg_time)
             if fg_calls > 0:
                 self.logger.record("perf/fast_gate_ms_per_call", 1000.0 * fg_time / fg_calls)
+
+            # Surrogate Gate
+            self.logger.record("perf/surrogate_calls", sg_calls)
+            self.logger.record("perf/surrogate_skips", sg_skips)
+            self.logger.record("perf/surrogate_time_s", sg_time)
+            if sg_calls > 0:
+                self.logger.record("perf/surrogate_ms_per_call", 1000.0 * sg_time / sg_calls)
 
             self._last = dict(st)
             return True
@@ -1130,6 +1148,114 @@ def main():
     OUTPUT_DIR = Path('./alphagen_output')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ==================== Trial Log / Surrogate Gate（可选） ====================
+    # 目标：
+    # - 采集 expr -> single_ic 的训练样本（JSONL），用于训练代理模型
+    # - （可选）在 pool 满后用代理模型做候选 gate，减少无效评估，把搜索预算用在更有希望的表达式上
+    trial_log_raw = os.environ.get("ALPHAGEN_TRIAL_LOG", "0").strip().lower()
+    TRIAL_LOG = trial_log_raw in {"1", "true", "yes", "y", "on"}
+    TRIAL_LOG_PATH = os.environ.get("ALPHAGEN_TRIAL_LOG_PATH", str(OUTPUT_DIR / "expr_trials.jsonl")).strip()
+    TRIAL_LOG_FLUSH_EVERY = int(os.environ.get("ALPHAGEN_TRIAL_LOG_FLUSH_EVERY", "256").strip() or 256)
+
+    surrogate_gate_raw = os.environ.get("ALPHAGEN_SURROGATE_GATE", "0").strip().lower()
+    SURROGATE_GATE = surrogate_gate_raw in {"1", "true", "yes", "y", "on"}
+    SURROGATE_MODEL_PATH = os.environ.get("ALPHAGEN_SURROGATE_MODEL_PATH", str(OUTPUT_DIR / "surrogate_model.npz")).strip()
+    SURROGATE_SCORE_THRESHOLD = float(os.environ.get("ALPHAGEN_SURROGATE_SCORE_THRESHOLD", "0.0").strip() or 0.0)
+    SURROGATE_RANDOM_ACCEPT_PROB = float(os.environ.get("ALPHAGEN_SURROGATE_RANDOM_ACCEPT_PROB", "0.05").strip() or 0.05)
+    surrogate_only_full_raw = os.environ.get("ALPHAGEN_SURROGATE_ONLY_WHEN_FULL", "1").strip().lower()
+    SURROGATE_ONLY_WHEN_FULL = surrogate_only_full_raw in {"1", "true", "yes", "y", "on"}
+
+    class TrialLogger:
+        def __init__(self, path: str, flush_every: int = 256):
+            self._path = Path(path)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._buf: List[dict] = []
+            self._flush_every = max(1, int(flush_every))
+
+        def log(self, row: dict) -> None:
+            self._buf.append(row)
+            if len(self._buf) >= self._flush_every:
+                self.flush()
+
+        def flush(self) -> None:
+            if not self._buf:
+                return
+            try:
+                with self._path.open("a", encoding="utf-8") as f:
+                    for r in self._buf:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            except Exception:
+                # 采集失败不应中断训练
+                pass
+            finally:
+                self._buf.clear()
+
+    _RE_OP = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\\(")
+    _RE_FEAT = re.compile(r"\\$([A-Za-z_][A-Za-z0-9_]*)")
+    _RE_INT = re.compile(r"(?:,|\\()\\s*(\\d{1,5})\\s*(?:\\)|,)")
+
+    def _stable_hash(s: str) -> int:
+        return zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF
+
+    def _expr_to_ids(expr: str, dim: int) -> List[int]:
+        ops = _RE_OP.findall(expr)
+        feats = _RE_FEAT.findall(expr)
+        ints = _RE_INT.findall(expr)
+        f: List[str] = []
+        f.append(f"len:{min(64, max(1, len(expr)//8))}")
+        f.append(f"ops_cnt:{min(32, len(ops))}")
+        f.append(f"feats_cnt:{min(32, len(feats))}")
+        for op in ops[:64]:
+            f.append(f"op:{op}")
+        for ft in feats[:64]:
+            f.append(f"feat:{ft}")
+        for x in ints[:64]:
+            f.append(f"int:{x}")
+        for op in ops[:8]:
+            for ft in feats[:8]:
+                f.append(f"x:{op}|{ft}")
+        idx = [int(_stable_hash(s) % dim) for s in f]
+        return sorted(set(idx))
+
+    class SurrogateScorer:
+        def __init__(self, model_path: str):
+            self._path = Path(model_path)
+            self._dim = 0
+            self._w = None
+            self._bias = 0.0
+            self._ok = False
+            self._load()
+
+        def _load(self) -> None:
+            try:
+                if not self._path.exists():
+                    return
+                d = np.load(self._path, allow_pickle=False)
+                self._dim = int(d["dim"][0])
+                self._w = d["w"].astype(np.float32, copy=False)
+                self._bias = float(d["bias"][0])
+                self._ok = bool(self._dim > 0 and self._w is not None)
+            except Exception:
+                self._ok = False
+
+        def score(self, expr: str) -> float:
+            if not self._ok or self._w is None:
+                return float("nan")
+            ids = _expr_to_ids(expr, int(self._dim))
+            if not ids:
+                return float(self._bias)
+            return float(self._bias + float(self._w[ids].sum()))
+
+        @property
+        def enabled(self) -> bool:
+            return bool(self._ok)
+
+    trial_logger = TrialLogger(TRIAL_LOG_PATH, flush_every=TRIAL_LOG_FLUSH_EVERY) if TRIAL_LOG else None
+    surrogate = SurrogateScorer(SURROGATE_MODEL_PATH) if SURROGATE_GATE else None
+    if surrogate is not None and not surrogate.enabled:
+        print(f"⚠ Surrogate gate 已请求开启，但未找到/无法加载模型：{SURROGATE_MODEL_PATH}（将忽略）")
+        surrogate = None
+
     # Alpha Pool配置 - 针对高维特征优化
     POOL_CAPACITY = int(os.environ.get("ALPHAGEN_POOL_CAPACITY", "10"))
     IC_LOWER_BOUND = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND", "0.01"))
@@ -1450,6 +1576,9 @@ def main():
                     "fast_gate_calls": 0,
                     "fast_gate_skips": 0,
                     "fast_gate_time_s": 0.0,
+                    "surrogate_calls": 0,
+                    "surrogate_skips": 0,
+                    "surrogate_time_s": 0.0,
                 }
                 self._optimize_every_updates = int(POOL_OPT_EVERY_UPDATES_START)
                 self._lazy_updates_since_opt = 0
@@ -1457,6 +1586,13 @@ def main():
                 self._fast_gate_calc = fast_gate_calc
                 self._fast_gate_only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
                 self._fast_gate_min_abs_ic = float(FAST_GATE_MIN_ABS_IC)
+                self._trial_logger = trial_logger
+                self._surrogate = surrogate
+                self._surrogate_thr = float(SURROGATE_SCORE_THRESHOLD)
+                self._surrogate_rand = float(SURROGATE_RANDOM_ACCEPT_PROB)
+                self._surrogate_only_full = bool(SURROGATE_ONLY_WHEN_FULL)
+                self._last_single_ic = float("nan")
+                self._last_mutual_max = float("nan")
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -1574,13 +1710,32 @@ def main():
 
             def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
                 if not getattr(self, "_perf_enabled", False):
-                    return super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
+                    out = super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
+                    try:
+                        single_ic, ic_mut = out
+                        self._last_single_ic = float(single_ic)
+                        if ic_mut is None:
+                            self._last_mutual_max = float("nan")
+                        else:
+                            self._last_mutual_max = float(np.nanmax(np.asarray(ic_mut, dtype=np.float64))) if len(ic_mut) else float("nan")
+                    except Exception:
+                        pass
+                    return out
                 import time as _time
                 t0 = _time.perf_counter()
                 out = super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
                 dt = _time.perf_counter() - t0
                 self._perf["calc_ics_calls"] += 1
                 self._perf["calc_ics_time_s"] += float(dt)
+                try:
+                    single_ic, ic_mut = out
+                    self._last_single_ic = float(single_ic)
+                    if ic_mut is None:
+                        self._last_mutual_max = float("nan")
+                    else:
+                        self._last_mutual_max = float(np.nanmax(np.asarray(ic_mut, dtype=np.float64))) if len(ic_mut) else float("nan")
+                except Exception:
+                    pass
                 return out
 
             def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:  # type: ignore[override]
@@ -1692,6 +1847,47 @@ def main():
                 return new_obj
 
             def try_new_expr(self, expr):  # type: ignore[override]
+                expr_str = str(expr)
+                step = int(getattr(self, "_current_step", 0) or 0)
+                # 重置上一次 _calc_ics 记录（避免串台）
+                self._last_single_ic = float("nan")
+                self._last_mutual_max = float("nan")
+
+                # 代理 Gate：在 pool 满后先用 surrogate 预测 abs(single_ic)，低于阈值则跳过完整评估
+                sg = getattr(self, "_surrogate", None)
+                if sg is not None:
+                    only_full = bool(getattr(self, "_surrogate_only_full", True))
+                    if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                        import time as _time
+                        t0s = _time.perf_counter()
+                        try:
+                            s = float(sg.score(expr_str))
+                        except Exception:
+                            s = float("nan")
+                        dts = _time.perf_counter() - t0s
+                        if getattr(self, "_perf_enabled", False):
+                            self._perf["surrogate_calls"] += 1
+                            self._perf["surrogate_time_s"] += float(dts)
+                        thr = float(getattr(self, "_surrogate_thr", 0.0))
+                        rand_p = float(getattr(self, "_surrogate_rand", 0.05))
+                        # 若模型可用且预测明显低于阈值，并且未被随机放行，则跳过
+                        if (np.isfinite(s) and (s < thr)) and (random.random() > rand_p):
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["surrogate_skips"] += 1
+                            tl = getattr(self, "_trial_logger", None)
+                            if tl is not None:
+                                tl.log(
+                                    {
+                                        "step": step,
+                                        "expr": expr_str,
+                                        "gate": "surrogate",
+                                        "surrogate_score": float(s),
+                                        "surrogate_thr": float(thr),
+                                        "surrogate_rand": float(rand_p),
+                                    }
+                                )
+                            return 0.0
+
                 fg_calc = getattr(self, "_fast_gate_calc", None)
                 if fg_calc is not None:
                     only_full = bool(getattr(self, "_fast_gate_only_full", True))
@@ -1710,28 +1906,98 @@ def main():
                         if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
                             if getattr(self, "_perf_enabled", False):
                                 self._perf["fast_gate_skips"] += 1
+                            tl = getattr(self, "_trial_logger", None)
+                            if tl is not None:
+                                tl.log(
+                                    {
+                                        "step": step,
+                                        "expr": expr_str,
+                                        "gate": "fast_gate",
+                                        "ic_fast": float(ic_fast) if np.isfinite(ic_fast) else None,
+                                        "fast_gate_thr": float(thr),
+                                    }
+                                )
                             return 0.0
 
+                pre_hist = len(getattr(self, "update_history", []) or [])
                 every = int(getattr(self, "_optimize_every_updates", 1) or 1)
                 if every <= 1:
                     if not getattr(self, "_perf_enabled", False):
-                        return super().try_new_expr(expr)
+                        out = super().try_new_expr(expr)
+                        post_hist = len(getattr(self, "update_history", []) or [])
+                        tl = getattr(self, "_trial_logger", None)
+                        if tl is not None:
+                            tl.log(
+                                {
+                                    "step": step,
+                                    "expr": expr_str,
+                                    "gate": "none",
+                                    "single_ic": float(self._last_single_ic) if np.isfinite(self._last_single_ic) else None,
+                                    "mutual_max": float(self._last_mutual_max) if np.isfinite(self._last_mutual_max) else None,
+                                    "accepted": bool(post_hist > pre_hist),
+                                    "pool_size": int(getattr(self, "size", 0) or 0),
+                                }
+                            )
+                        return out
                     import time as _time
                     t0 = _time.perf_counter()
                     out = super().try_new_expr(expr)
                     dt = _time.perf_counter() - t0
                     self._perf["try_new_expr_calls"] += 1
                     self._perf["try_new_expr_time_s"] += float(dt)
+                    post_hist = len(getattr(self, "update_history", []) or [])
+                    tl = getattr(self, "_trial_logger", None)
+                    if tl is not None:
+                        tl.log(
+                            {
+                                "step": step,
+                                "expr": expr_str,
+                                "gate": "none",
+                                "single_ic": float(self._last_single_ic) if np.isfinite(self._last_single_ic) else None,
+                                "mutual_max": float(self._last_mutual_max) if np.isfinite(self._last_mutual_max) else None,
+                                "accepted": bool(post_hist > pre_hist),
+                                "pool_size": int(getattr(self, "size", 0) or 0),
+                            }
+                        )
                     return out
 
                 if not getattr(self, "_perf_enabled", False):
-                    return self._try_new_expr_lazy(expr)
+                    out = self._try_new_expr_lazy(expr)
+                    post_hist = len(getattr(self, "update_history", []) or [])
+                    tl = getattr(self, "_trial_logger", None)
+                    if tl is not None:
+                        tl.log(
+                            {
+                                "step": step,
+                                "expr": expr_str,
+                                "gate": "none",
+                                "single_ic": float(self._last_single_ic) if np.isfinite(self._last_single_ic) else None,
+                                "mutual_max": float(self._last_mutual_max) if np.isfinite(self._last_mutual_max) else None,
+                                "accepted": bool(post_hist > pre_hist),
+                                "pool_size": int(getattr(self, "size", 0) or 0),
+                            }
+                        )
+                    return out
                 import time as _time
                 t0 = _time.perf_counter()
                 out = self._try_new_expr_lazy(expr)
                 dt = _time.perf_counter() - t0
                 self._perf["try_new_expr_calls"] += 1
                 self._perf["try_new_expr_time_s"] += float(dt)
+                post_hist = len(getattr(self, "update_history", []) or [])
+                tl = getattr(self, "_trial_logger", None)
+                if tl is not None:
+                    tl.log(
+                        {
+                            "step": step,
+                            "expr": expr_str,
+                            "gate": "none",
+                            "single_ic": float(self._last_single_ic) if np.isfinite(self._last_single_ic) else None,
+                            "mutual_max": float(self._last_mutual_max) if np.isfinite(self._last_mutual_max) else None,
+                            "accepted": bool(post_hist > pre_hist),
+                            "pool_size": int(getattr(self, "size", 0) or 0),
+                        }
+                    )
                 return out
 
             def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
@@ -2045,6 +2311,13 @@ def main():
     print("\n" + "=" * 60)
     print("Training complete! Saving results...")
     print("=" * 60)
+
+    # 采集落盘（不影响主流程）
+    try:
+        if trial_logger is not None:
+            trial_logger.flush()
+    except Exception:
+        pass
 
     model_path = OUTPUT_DIR / 'model_final'
     pool_path = OUTPUT_DIR / 'alpha_pool.json'
