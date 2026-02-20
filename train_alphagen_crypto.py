@@ -1714,7 +1714,11 @@ def main():
                         if remaining < 0:
                             remaining = 0
                         # 只有当当前确实存在可选 Operator 时才收紧（避免把 action mask 收到全 False）
-                        if bool(ret["select"][0]) and (stack_size > (remaining + 1)):
+                        # 更激进一点的阈值：
+                        # - 当 stack_size >= remaining + 1 时，如果继续 push（特征/常量/dt），
+                        #   很容易在“最后一个 token”后仍无法收栈到 1，从而以 -1 结束 episode。
+                        # - 这能显著减少冷启动阶段的 -1/15 卡死（reward-sparsity）。
+                        if bool(ret["select"][0]) and (stack_size >= (remaining + 1)):
                             ret["select"][1] = False  # Features / Sub-expressions
                             ret["select"][2] = False  # Constants
                             ret["select"][3] = False  # Delta time
