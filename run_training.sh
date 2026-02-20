@@ -135,6 +135,8 @@ case "$PRESET" in
         # - 训练中后期逐步抬高最小长度（降低评估频率，显著缓解越跑越慢）
         export_default ALPHAGEN_MIN_EXPR_LEN_START 1
         export_default ALPHAGEN_MIN_EXPR_LEN_END 8
+        # 在前 200k step 内完成从 1->8 的抬升（更早降低评估频率，避免 fps 过早衰减）
+        export_default ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS 200000
         export_default ALPHAGEN_REWARD_PER_STEP 0
 
         # 子表达式库（突破平台期的关键手段之一）：让 agent 直接选择常用子结构再组合
@@ -187,6 +189,8 @@ case "$PRESET" in
         export_default ALPHAGEN_MIN_EXPR_LEN_START 1
         export_default ALPHAGEN_MIN_EXPR_LEN_END 10
         export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
+        # 更快抬高 min_expr_len，控制评估次数，避免 fps 过早衰减
+        export_default ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS 200000
         export_default ALPHAGEN_REWARD_PER_STEP 0
 
         # 子表达式库：配合“结构优先”构建策略，突破平台期
@@ -237,6 +241,8 @@ case "$PRESET" in
         export_default ALPHAGEN_MIN_EXPR_LEN_START 1
         export_default ALPHAGEN_MIN_EXPR_LEN_END 10
         export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
+        # 更快抬高 min_expr_len，控制评估次数，避免 fps 过早衰减
+        export_default ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS 200000
         export_default ALPHAGEN_REWARD_PER_STEP 0
 
         export_default ALPHAGEN_SUBEXPRS_MAX 80

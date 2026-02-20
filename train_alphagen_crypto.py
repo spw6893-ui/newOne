@@ -875,6 +875,12 @@ def main():
     MIN_EXPR_LEN_UPDATE_EVERY = int(os.environ.get("ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY", "2048").strip() or 2048)
     MIN_EXPR_LEN_UPDATE_EVERY = max(256, MIN_EXPR_LEN_UPDATE_EVERY)
     min_expr_len_holder = {"value": int(MIN_EXPR_LEN_START)}
+    # schedule_steps 控制“多久从 start ramp 到 end”（默认=TOTAL_TIMESTEPS）。
+    # 设小一点会更快抬高 min_expr_len，从而减少评估次数，显著缓解 fps 衰减。
+    MIN_EXPR_LEN_SCHEDULE_STEPS = int(
+        os.environ.get("ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS", str(TOTAL_TIMESTEPS)).strip() or TOTAL_TIMESTEPS
+    )
+    MIN_EXPR_LEN_SCHEDULE_STEPS = max(1, MIN_EXPR_LEN_SCHEDULE_STEPS)
     stack_guard_raw = os.environ.get("ALPHAGEN_STACK_GUARD", "1").strip().lower()
     STACK_GUARD = stack_guard_raw in {"1", "true", "yes", "y", "on"}
 
@@ -901,7 +907,7 @@ def main():
     if MIN_EXPR_LEN_START != MIN_EXPR_LEN_END:
         print(
             f"Min expr len schedule: {MIN_EXPR_LEN_START}->{MIN_EXPR_LEN_END} "
-            f"(every {MIN_EXPR_LEN_UPDATE_EVERY} steps)"
+            f"(every {MIN_EXPR_LEN_UPDATE_EVERY} steps, schedule_steps={MIN_EXPR_LEN_SCHEDULE_STEPS})"
         )
     elif MIN_EXPR_LEN > 1:
         print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
@@ -1141,7 +1147,7 @@ def main():
     if (MIN_EXPR_LEN_START != MIN_EXPR_LEN_END) or (MIN_EXPR_LEN_START > 1):
         callbacks.append(
             MinExprLenScheduleCallback(
-                total_timesteps=TOTAL_TIMESTEPS,
+                total_timesteps=MIN_EXPR_LEN_SCHEDULE_STEPS,
                 start_len=MIN_EXPR_LEN_START,
                 end_len=MIN_EXPR_LEN_END,
                 update_every=MIN_EXPR_LEN_UPDATE_EVERY,
