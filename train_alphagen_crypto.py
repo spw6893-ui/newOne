@@ -264,6 +264,17 @@ def _dump_json(path: Path, obj: dict) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+
+def _dump_json_atomic(path: Path, obj: dict) -> None:
+    """
+    原子写入 JSON（先写临时文件再 replace），用于 checkpoint 场景避免中断产生半文件。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
 def main():
     # ==================== 配置参数 ====================
 
@@ -814,6 +825,92 @@ def main():
 
             return True
 
+    class PeriodicCheckpointCallback(BaseCallback):
+        """
+        周期性保存 checkpoint（模型 + alpha_pool）。
+
+        用法：
+        - ALPHAGEN_CHECKPOINT_EVERY_STEPS=100000  # 每 N step 保存一次（>0 开启）
+        - ALPHAGEN_CHECKPOINT_KEEP=3             # 只保留最近 N 个
+        - ALPHAGEN_CHECKPOINT_DIR=...            # 可选，自定义输出目录
+        """
+
+        def __init__(
+            self,
+            pool,
+            ckpt_dir: Path,
+            every_steps: int,
+            keep_last: int = 3,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self._pool = pool
+            self._dir = Path(ckpt_dir)
+            self._dir.mkdir(parents=True, exist_ok=True)
+            self._every = max(1, int(every_steps))
+            self._keep = max(1, int(keep_last))
+            self._last_saved_step = -1
+
+        @staticmethod
+        def _step_from_model_zip(p: Path) -> int:
+            # model_step_123456.zip
+            stem = p.stem
+            try:
+                return int(stem.split("_")[-1])
+            except Exception:
+                return -1
+
+        def _cleanup(self) -> None:
+            zips = list(self._dir.glob("model_step_*.zip"))
+            if len(zips) <= self._keep:
+                return
+            zips.sort(key=self._step_from_model_zip)
+            for zp in zips[: max(0, len(zips) - self._keep)]:
+                st = self._step_from_model_zip(zp)
+                try:
+                    zp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    (self._dir / f"alpha_pool_step_{st}.json").unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        def _save(self, step: int, reason: str) -> None:
+            if step <= 0 or step == self._last_saved_step:
+                return
+            try:
+                model_base = self._dir / f"model_step_{step}"
+                # SB3 会写成 model_step_{step}.zip
+                self.model.save(str(model_base))  # type: ignore[attr-defined]
+                _dump_json_atomic(self._dir / f"alpha_pool_step_{step}.json", self._pool.to_json_dict())
+                _dump_json_atomic(
+                    self._dir / "latest.json",
+                    {
+                        "step": int(step),
+                        "reason": str(reason),
+                        "model": f"model_step_{step}.zip",
+                        "pool": f"alpha_pool_step_{step}.json",
+                    },
+                )
+                self._cleanup()
+                self._last_saved_step = int(step)
+                self.logger.record("checkpoint/last_step", float(step))
+            except Exception as e:
+                # checkpoint 失败不应中断训练
+                if self.verbose:
+                    print(f"⚠ checkpoint 保存失败: step={step}, reason={reason}, err={e}")
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self._every) != 0:
+                return True
+            self._save(int(self.num_timesteps), reason="periodic")
+            return True
+
+        def save_now(self, reason: str = "manual") -> None:
+            step = int(getattr(self.model, "num_timesteps", 0) or self.num_timesteps)  # type: ignore[attr-defined]
+            self._save(step, reason=reason)
+
     class IcLowerBoundScheduleCallback(BaseCallback):
         """
         动态 IC lower bound：
@@ -1122,6 +1219,12 @@ def main():
     # 周期性评估（默认关闭，>0 开启）
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
+
+    # 周期性保存 checkpoint（默认关闭，>0 开启）
+    ckpt_every_steps = int(os.environ.get("ALPHAGEN_CHECKPOINT_EVERY_STEPS", "0").strip() or 0)
+    ckpt_keep_last = int(os.environ.get("ALPHAGEN_CHECKPOINT_KEEP", "3").strip() or 3)
+    ckpt_dir_raw = os.environ.get("ALPHAGEN_CHECKPOINT_DIR", str(OUTPUT_DIR / "checkpoints")).strip()
+    ckpt_dir = Path(ckpt_dir_raw) if ckpt_dir_raw else (OUTPUT_DIR / "checkpoints")
 
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
@@ -1698,6 +1801,16 @@ def main():
     callbacks = [TensorboardCallback()]
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
     callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
+    ckpt_cb = None
+    if ckpt_every_steps > 0:
+        ckpt_cb = PeriodicCheckpointCallback(
+            pool=pool,
+            ckpt_dir=ckpt_dir,
+            every_steps=ckpt_every_steps,
+            keep_last=ckpt_keep_last,
+            verbose=0,
+        )
+        callbacks.append(ckpt_cb)
     # pool.optimize 频率 schedule（默认关闭：start=end=1 时等价于原行为）
     if POOL_OPT_EVERY_UPDATES_START != POOL_OPT_EVERY_UPDATES_END:
         callbacks.append(
@@ -1764,10 +1877,24 @@ def main():
         )
     callback = CallbackList(callbacks) if len(callbacks) > 1 else callbacks[0]
 
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        callback=callback
-    )
+    try:
+        model.learn(
+            total_timesteps=TOTAL_TIMESTEPS,
+            callback=callback
+        )
+    except KeyboardInterrupt:
+        print("\n⚠ 收到中断信号（Ctrl+C），正在保存当前 checkpoint…")
+        try:
+            if ckpt_cb is not None:
+                ckpt_cb.save_now(reason="interrupt")
+            else:
+                step = int(getattr(model, "num_timesteps", 0) or 0)
+                model.save(str(OUTPUT_DIR / "model_interrupt"))
+                _dump_json_atomic(OUTPUT_DIR / "alpha_pool_interrupt.json", pool.to_json_dict())
+                _dump_json_atomic(OUTPUT_DIR / "interrupt.json", {"step": step})
+        except Exception as e:
+            print(f"⚠ 中断保存失败: {e}")
+        raise
 
     # ==================== 保存结果 ====================
     print("\n" + "=" * 60)
