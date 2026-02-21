@@ -13,7 +13,7 @@ echo ""
 # - explore20_faststable: 在 explore20 基础上，偏“更快 + 更稳 + 更好泛化”的组合（推荐日常跑）
 # - explore20_lcb: 走“思路2”：Pool 目标改为 LCB(mean - beta*std)，更偏泛化稳定性（冲更高 OOS IC）
 # - explore20_ucblcb: 参考 AlphaQCM 的“方差引导探索”直觉：beta 从负到正（先 UCB 探索，后 LCB 稳健）
-# - explore20_ucblcb_fg: 在 explore20_ucblcb 基础上启用 FastGate（pool 满后用小样本 single-IC 粗筛提速）
+# - explore20_ucblcb_fg: 在 explore20_ucblcb 基础上启用 FastGate（pool 满后用小样本 single-IC 粗筛提速）+ perf 指标
 PRESET="${ALPHAGEN_PRESET:-baseline}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "用法:"
@@ -310,6 +310,8 @@ case "$PRESET" in
         export_default ALPHAGEN_FAST_GATE_SYMBOLS 20
         export_default ALPHAGEN_FAST_GATE_PERIODS 4000
         export_default ALPHAGEN_FAST_GATE_MIN_ABS_IC 0.001
+        # 额外性能日志（用于定位 fps 衰减：pool.try_new_expr / optimize / _calc_ics）
+        export_default ALPHAGEN_PERF_LOG 1
 
         export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
         export_default ALPHAGEN_EVAL_TEST 1

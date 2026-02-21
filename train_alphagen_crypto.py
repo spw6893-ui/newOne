@@ -419,7 +419,7 @@ def main():
 
     # 现在再 import alphagen（确保 action space 读到的是动态 FeatureType）
     # 注意：当前 alphagen 版本没有 Close()/Open() 这类快捷构造器，使用 Feature(FeatureType.X) 即可。
-    from alphagen.data.expression import Delta, EMA, Feature, Mean, Ref, Std, WMA
+    from alphagen.data.expression import Corr, Cov, Delta, EMA, Feature, Mean, Rank, Ref, Std, WMA
     # 兼容：alphagen 上游 rolling Std/Var 在窗口=1 时会触发 dof<=0 警告并产生 NaN（unbiased=True 的默认行为）。
     # 这里做一次运行时 monkey patch，避免需要修改 submodule 指针（否则会导致他人无法拉取特定 commit）。
     import alphagen.data.expression as _expr_mod
@@ -476,6 +476,12 @@ def main():
         dts = _parse_int_list(os.environ.get("ALPHAGEN_SUBEXPRS_DTS", "1,2,4,8"), [1, 2, 4, 8])
         windows = [w for w in windows if w > 1]
         dts = [d for d in dts if d > 0]
+        enable_rank_raw = os.environ.get("ALPHAGEN_SUBEXPRS_ENABLE_RANK", "1").strip().lower()
+        enable_rank = enable_rank_raw in {"1", "true", "yes", "y", "on"}
+        enable_pair_raw = os.environ.get("ALPHAGEN_SUBEXPRS_ENABLE_PAIRROLL", "1").strip().lower()
+        enable_pair = enable_pair_raw in {"1", "true", "yes", "y", "on"}
+        pair_max = int(os.environ.get("ALPHAGEN_SUBEXPRS_PAIR_MAX", "3").strip() or 3)
+        pair_max = max(2, pair_max)
 
         # 子表达式库的“构成”非常关键：
         # 之前如果简单按顺序 add(Feature(...)) 再 add(Mean/Std/...)，
@@ -533,6 +539,21 @@ def main():
                 add(Std(base, w))
                 add(EMA(base, w))
                 add(WMA(base, w))
+                if enable_rank:
+                    add(Rank(base, w))
+
+        # 3.5) 结构增强：少量 PairRolling（Corr/Cov）子表达式（对突破平台期很关键）
+        # 控制规模：只取前 pair_max 个 core feature，两两组合，并且只用前 2 个 window（避免爆炸）
+        if enable_pair and (len(core_indices) >= 2) and windows:
+            use_core = core_indices[: min(len(core_indices), int(pair_max))]
+            use_windows = windows[:2]
+            for ai in range(len(use_core)):
+                for bi in range(ai + 1, len(use_core)):
+                    lhs = Feature(sd.FeatureType(use_core[ai]))
+                    rhs = Feature(sd.FeatureType(use_core[bi]))
+                    for w in use_windows:
+                        add(Corr(lhs, rhs, w))
+                        add(Cov(lhs, rhs, w))
 
         # 4) 若还有预算，再补其它 feature 的少量 rolling（提升表达力，但避免爆炸）
         if len(exprs) < max_n:
@@ -587,10 +608,12 @@ def main():
             super().__init__(verbose=verbose)
             self._calc = calculator_obj
             self._update_every = max(1, int(update_every))
+            self._last_step = 0
 
         def _on_step(self) -> bool:
-            if (self.num_timesteps % self._update_every) != 0:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._update_every):
                 return True
+            self._last_step = int(self.num_timesteps)
             fn = getattr(self._calc, "alpha_cache_stats", None)
             if fn is None:
                 return True
@@ -635,6 +658,7 @@ def main():
             self._subexpr_texts = list(subexpr_texts) if subexpr_texts else None
             self._ckpt_dir = self._output_dir / "checkpoints"
             self._ckpt_dir.mkdir(parents=True, exist_ok=True)
+            self._last_step = 0
 
         @staticmethod
         def _parse_step_from_name(name: str) -> Optional[int]:
@@ -680,8 +704,12 @@ def main():
                         pass
 
         def _on_step(self) -> bool:
-            if (self.num_timesteps % self._every) != 0:
+            # 注意：SB3 的 num_timesteps 通常按 n_steps 的倍数递增，
+            # 如果用 `% every == 0`，当 every 不是 n_steps 的倍数时可能“永远不触发”。
+            # 这里改成“跨过阈值就保存一次”，保证近似每 every_steps 保存。
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._every):
                 return True
+            self._last_step = int(self.num_timesteps)
             step = int(self.num_timesteps)
             model_base = self._ckpt_dir / f"model_step_{step}"
             pool_fp = self._ckpt_dir / f"alpha_pool_step_{step}.json"
@@ -712,10 +740,12 @@ def main():
             self._pool = pool_obj
             self._update_every = max(1, int(update_every))
             self._last = {"calls": 0, "skips": 0, "time_s": 0.0}
+            self._last_step = 0
 
         def _on_step(self) -> bool:
-            if (self.num_timesteps % self._update_every) != 0:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._update_every):
                 return True
+            self._last_step = int(self.num_timesteps)
             st = getattr(self._pool, "_fast_gate_stats", None)
             if not isinstance(st, dict):
                 return True
@@ -735,6 +765,168 @@ def main():
                 self.logger.record("perf/fast_gate_skip_rate", float(ds) / float(dc))
 
             self._last = {"calls": calls, "skips": skips, "time_s": time_s}
+            return True
+
+    class FastGateThresholdScheduleCallback(BaseCallback):
+        """
+        动态调整 FastGate 的粗筛阈值（min_abs_ic）：
+        - 只影响“是否跳过完整评估”，不改变真实训练目标/IC 口径；
+        - 常用做法：前期阈值低（保证探索），后期阈值升高（提升 skip_rate，缓解 fps 衰减）。
+        """
+
+        def __init__(
+            self,
+            total_timesteps: int,
+            start_thr: float,
+            end_thr: float,
+            update_every: int,
+            holder: dict,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self.total_timesteps = max(1, int(total_timesteps))
+            self.start_thr = float(max(0.0, float(start_thr)))
+            self.end_thr = float(max(0.0, float(end_thr)))
+            self.update_every = max(1, int(update_every))
+            self.holder = holder
+            self._last_step = 0
+
+        def _compute_thr(self) -> float:
+            frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
+            return self.start_thr + frac * (self.end_thr - self.start_thr)
+
+        def _on_step(self) -> bool:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self.update_every):
+                return True
+            self._last_step = int(self.num_timesteps)
+            v = float(self._compute_thr())
+            self.holder["value"] = float(v)
+            self.logger.record("perf/fast_gate_min_abs_ic", float(v))
+            return True
+
+    class FastGateAutoTuneCallback(BaseCallback):
+        """
+        FastGate 自动调阈值：让粗筛 skip_rate 收敛到一个目标区间，从而“稳定” full-eval 频率。
+        这通常比手工调阈值更稳，特别是当训练分布随时间变化时。
+        """
+
+        def __init__(
+            self,
+            pool_obj,
+            holder: dict,
+            target_skip_rate: float,
+            adjust_mul: float,
+            min_thr: float,
+            max_thr: float,
+            update_every: int = 2048,
+            warmup_calls: int = 50,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self._pool = pool_obj
+            self._holder = holder
+            self._target = float(max(0.0, min(0.95, target_skip_rate)))
+            self._mul = float(max(1.01, adjust_mul))
+            self._min_thr = float(max(0.0, min_thr))
+            self._max_thr = float(max(self._min_thr, max_thr))
+            self._update_every = max(1, int(update_every))
+            self._warmup_calls = max(10, int(warmup_calls))
+            self._last = {"calls": 0, "skips": 0}
+            self._last_step = 0
+
+        def _on_step(self) -> bool:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._update_every):
+                return True
+            self._last_step = int(self.num_timesteps)
+            st = getattr(self._pool, "_fast_gate_stats", None)
+            if not isinstance(st, dict):
+                return True
+            calls = int(st.get("calls", 0))
+            skips = int(st.get("skips", 0))
+            dc = calls - int(self._last.get("calls", 0))
+            ds = skips - int(self._last.get("skips", 0))
+            self._last = {"calls": calls, "skips": skips}
+            if dc < int(self._warmup_calls):
+                return True
+
+            skip_rate = float(ds) / float(dc) if dc > 0 else 0.0
+            thr = float(self._holder.get("value", 0.0))
+
+            # 简单比例控制：低于目标 => 提高阈值；明显高于目标 => 降低阈值
+            if skip_rate < self._target:
+                thr = thr * self._mul if thr > 0 else max(self._min_thr, 1e-4)
+            elif skip_rate > (self._target * 1.6):
+                thr = thr / self._mul if thr > 0 else 0.0
+
+            thr = float(max(self._min_thr, min(self._max_thr, thr)))
+            self._holder["value"] = thr
+            self.logger.record("perf/fast_gate_autotune_skip_rate", float(skip_rate))
+            self.logger.record("perf/fast_gate_autotune_thr", float(thr))
+            return True
+
+    class PoolPerfStatsCallback(BaseCallback):
+        """
+        记录 pool 关键函数耗时（用于定位 fps 衰减热点）：
+        - pool.try_new_expr 总耗时（包含 mutual/optimize）
+        - pool.optimize 耗时
+        - pool._calc_ics 耗时（单 IC + mutual IC）
+        """
+
+        def __init__(self, pool_obj, update_every: int = 2048, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._pool = pool_obj
+            self._update_every = max(1, int(update_every))
+            self._last_step = 0
+            self._last = {
+                "try_calls": 0,
+                "try_time_s": 0.0,
+                "opt_calls": 0,
+                "opt_time_s": 0.0,
+                "ics_calls": 0,
+                "ics_time_s": 0.0,
+            }
+
+        def _on_step(self) -> bool:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._update_every):
+                return True
+            self._last_step = int(self.num_timesteps)
+            st = getattr(self._pool, "_perf_stats", None)
+            if not isinstance(st, dict):
+                return True
+
+            def _delta_int(key: str) -> int:
+                v = int(st.get(key, 0))
+                dv = v - int(self._last.get(key, 0))
+                self._last[key] = v
+                return dv
+
+            def _delta_float(key: str) -> float:
+                v = float(st.get(key, 0.0))
+                dv = v - float(self._last.get(key, 0.0))
+                self._last[key] = v
+                return dv
+
+            try_calls = _delta_int("try_calls")
+            try_time_s = _delta_float("try_time_s")
+            self.logger.record("perf/pool_try_new_expr_calls", float(try_calls))
+            self.logger.record("perf/pool_try_new_expr_time_s", float(try_time_s))
+            if try_calls > 0:
+                self.logger.record("perf/pool_try_new_expr_ms_per_call", 1000.0 * float(try_time_s) / float(try_calls))
+
+            opt_calls = _delta_int("opt_calls")
+            opt_time_s = _delta_float("opt_time_s")
+            self.logger.record("perf/pool_optimize_calls", float(opt_calls))
+            self.logger.record("perf/pool_optimize_time_s", float(opt_time_s))
+            if opt_calls > 0:
+                self.logger.record("perf/pool_optimize_ms_per_call", 1000.0 * float(opt_time_s) / float(opt_calls))
+
+            ics_calls = _delta_int("ics_calls")
+            ics_time_s = _delta_float("ics_time_s")
+            self.logger.record("perf/pool_calc_ics_calls", float(ics_calls))
+            self.logger.record("perf/pool_calc_ics_time_s", float(ics_time_s))
+            if ics_calls > 0:
+                self.logger.record("perf/pool_calc_ics_ms_per_call", 1000.0 * float(ics_time_s) / float(ics_calls))
+
             return True
 
     class PeriodicValTestEvalCallback(BaseCallback):
@@ -761,6 +953,7 @@ def main():
             self._test_calc = test_calculator_obj
             self._every = max(1, int(eval_every_steps))
             self._eval_test = bool(eval_test)
+            self._last_step = 0
 
         @staticmethod
         def _get_target_tensor(calc_obj):
@@ -825,8 +1018,11 @@ def main():
             return out
 
         def _on_step(self) -> bool:
-            if (self.num_timesteps % self._every) != 0:
+            # 注意：SB3 的 num_timesteps 往往按 n_steps 的倍数跳变；
+            # 用 `% every == 0` 会导致当 every 不是 n_steps 的倍数时“永远不触发”。
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._every):
                 return True
+            self._last_step = int(self.num_timesteps)
 
             # pool 基本信息（便于在 TB 里看 pool 是否在增长）
             self.logger.record("pool/size", float(getattr(self._pool, "size", 0)))
@@ -886,14 +1082,16 @@ def main():
             self.end_lb = float(end_lb)
             self.update_every = max(1, int(update_every))
             self._last_lb: Optional[float] = None
+            self._last_step = 0
 
         def _compute_lb(self) -> float:
             frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
             return self.start_lb + frac * (self.end_lb - self.start_lb)
 
         def _on_step(self) -> bool:
-            if (self.num_timesteps % self.update_every) != 0:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self.update_every):
                 return True
+            self._last_step = int(self.num_timesteps)
             lb = float(self._compute_lb())
             # LinearAlphaPool 内部用的是 `_ic_lower_bound`（float），这里直接更新即可。
             setattr(self.pool, "_ic_lower_bound", lb)
@@ -928,14 +1126,16 @@ def main():
             self.end_beta = float(end_beta)
             self.update_every = max(1, int(update_every))
             self._last: Optional[float] = None
+            self._last_step = 0
 
         def _compute_beta(self) -> float:
             frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
             return self.start_beta + frac * (self.end_beta - self.start_beta)
 
         def _on_step(self) -> bool:
-            if (self.num_timesteps % self.update_every) != 0:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self.update_every):
                 return True
+            self._last_step = int(self.num_timesteps)
             beta = float(self._compute_beta())
             setattr(self.pool, "_lcb_beta", beta)
             self.logger.record("pool/lcb_beta", beta)
@@ -969,6 +1169,7 @@ def main():
             self.update_every = max(1, int(update_every))
             self.holder = holder
             self._last: Optional[int] = None
+            self._last_step = 0
 
         def _compute_len(self) -> int:
             frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
@@ -976,8 +1177,9 @@ def main():
             return max(1, int(round(v)))
 
         def _on_step(self) -> bool:
-            if (self.num_timesteps % self.update_every) != 0:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self.update_every):
                 return True
+            self._last_step = int(self.num_timesteps)
             v = int(self._compute_len())
             self.holder["value"] = v
             self.logger.record("env/min_expr_len", float(v))
@@ -1106,6 +1308,18 @@ def main():
     POOL_OPT_MAX_STEPS = max(50, POOL_OPT_MAX_STEPS)
     POOL_OPT_TOLERANCE = max(10, POOL_OPT_TOLERANCE)
 
+    # 性能/多样性控制：mutual IC 的“相似度早退”阈值
+    # - 越小越严格（更早拒绝高相似表达式，提速+增强多样性，但也可能让学习信号变稀疏）
+    # - 默认 0.99：基本等价于“不启用”（只过滤几乎完全重复）
+    POOL_IC_MUT_THRESHOLD = float(os.environ.get("ALPHAGEN_POOL_IC_MUT_THRESHOLD", "0.99").strip() or 0.99)
+    if not np.isfinite(POOL_IC_MUT_THRESHOLD):
+        POOL_IC_MUT_THRESHOLD = 0.99
+    POOL_IC_MUT_THRESHOLD = float(max(0.0, min(0.9999, POOL_IC_MUT_THRESHOLD)))
+
+    # 可选：额外性能日志（写入 TensorBoard），用于定位 fps 衰减热点
+    perf_log_raw = os.environ.get("ALPHAGEN_PERF_LOG", "0").strip().lower()
+    PERF_LOG = perf_log_raw in {"1", "true", "yes", "y", "on"}
+
     # 周期性评估（默认关闭，>0 开启）
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
@@ -1132,6 +1346,46 @@ def main():
     FAST_GATE_SYMBOLS = max(4, FAST_GATE_SYMBOLS)
     FAST_GATE_PERIODS = max(256, FAST_GATE_PERIODS)
     FAST_GATE_MIN_ABS_IC = max(0.0, FAST_GATE_MIN_ABS_IC)
+    # FastGate 阈值也支持“先松后紧”的 schedule（只影响粗筛，不改变真实 pool 目标）
+    FAST_GATE_MIN_ABS_IC_START = float(
+        os.environ.get("ALPHAGEN_FAST_GATE_MIN_ABS_IC_START", str(FAST_GATE_MIN_ABS_IC)).strip() or FAST_GATE_MIN_ABS_IC
+    )
+    FAST_GATE_MIN_ABS_IC_END = float(
+        os.environ.get("ALPHAGEN_FAST_GATE_MIN_ABS_IC_END", str(FAST_GATE_MIN_ABS_IC)).strip() or FAST_GATE_MIN_ABS_IC
+    )
+    FAST_GATE_MIN_ABS_IC_UPDATE_EVERY = int(os.environ.get("ALPHAGEN_FAST_GATE_MIN_ABS_IC_UPDATE_EVERY", "2048").strip() or 2048)
+    FAST_GATE_MIN_ABS_IC_SCHEDULE_STEPS = int(
+        os.environ.get("ALPHAGEN_FAST_GATE_MIN_ABS_IC_SCHEDULE_STEPS", str(TOTAL_TIMESTEPS)).strip() or TOTAL_TIMESTEPS
+    )
+    FAST_GATE_MIN_ABS_IC_START = max(0.0, float(FAST_GATE_MIN_ABS_IC_START))
+    FAST_GATE_MIN_ABS_IC_END = max(0.0, float(FAST_GATE_MIN_ABS_IC_END))
+    FAST_GATE_MIN_ABS_IC_UPDATE_EVERY = max(256, int(FAST_GATE_MIN_ABS_IC_UPDATE_EVERY))
+    FAST_GATE_MIN_ABS_IC_SCHEDULE_STEPS = max(1, int(FAST_GATE_MIN_ABS_IC_SCHEDULE_STEPS))
+    fast_gate_thr_holder = {"value": float(FAST_GATE_MIN_ABS_IC_START)}
+    # 可选：FastGate 阈值至少为 ic_lower_bound 的一部分（在后期能显著提升 skip_rate）
+    FAST_GATE_THR_LB_RATIO = float(os.environ.get("ALPHAGEN_FAST_GATE_THR_LB_RATIO", "0").strip() or 0.0)
+    if not np.isfinite(FAST_GATE_THR_LB_RATIO):
+        FAST_GATE_THR_LB_RATIO = 0.0
+    FAST_GATE_THR_LB_RATIO = float(max(0.0, FAST_GATE_THR_LB_RATIO))
+
+    # 可选：FastGate 自动调阈值（目标：把 skip_rate 拉到一个区间，从而维持可接受的 fps）
+    fast_gate_autotune_raw = os.environ.get("ALPHAGEN_FAST_GATE_AUTOTUNE", "0").strip().lower()
+    FAST_GATE_AUTOTUNE = fast_gate_autotune_raw in {"1", "true", "yes", "y", "on"}
+    FAST_GATE_AUTOTUNE_TARGET_SKIP = float(os.environ.get("ALPHAGEN_FAST_GATE_AUTOTUNE_TARGET_SKIP", "0.3").strip() or 0.3)
+    FAST_GATE_AUTOTUNE_ADJUST_MUL = float(os.environ.get("ALPHAGEN_FAST_GATE_AUTOTUNE_ADJUST_MUL", "1.15").strip() or 1.15)
+    FAST_GATE_AUTOTUNE_MIN_THR = float(os.environ.get("ALPHAGEN_FAST_GATE_AUTOTUNE_MIN_THR", "0.0").strip() or 0.0)
+    FAST_GATE_AUTOTUNE_MAX_THR = float(os.environ.get("ALPHAGEN_FAST_GATE_AUTOTUNE_MAX_THR", "0.02").strip() or 0.02)
+    if not np.isfinite(FAST_GATE_AUTOTUNE_TARGET_SKIP):
+        FAST_GATE_AUTOTUNE_TARGET_SKIP = 0.3
+    if not np.isfinite(FAST_GATE_AUTOTUNE_ADJUST_MUL) or FAST_GATE_AUTOTUNE_ADJUST_MUL <= 1.0:
+        FAST_GATE_AUTOTUNE_ADJUST_MUL = 1.15
+    if not np.isfinite(FAST_GATE_AUTOTUNE_MIN_THR):
+        FAST_GATE_AUTOTUNE_MIN_THR = 0.0
+    if not np.isfinite(FAST_GATE_AUTOTUNE_MAX_THR):
+        FAST_GATE_AUTOTUNE_MAX_THR = 0.02
+    FAST_GATE_AUTOTUNE_TARGET_SKIP = float(max(0.0, min(0.95, FAST_GATE_AUTOTUNE_TARGET_SKIP)))
+    FAST_GATE_AUTOTUNE_MIN_THR = float(max(0.0, FAST_GATE_AUTOTUNE_MIN_THR))
+    FAST_GATE_AUTOTUNE_MAX_THR = float(max(FAST_GATE_AUTOTUNE_MIN_THR, FAST_GATE_AUTOTUNE_MAX_THR))
 
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
@@ -1314,6 +1568,69 @@ def main():
             device=device_obj,
         )
 
+    # mutual IC “相似度早退”阈值（用于提速/增强多样性；见 LinearAlphaPool.try_new_expr）
+    try:
+        setattr(pool, "_ic_mut_threshold", float(POOL_IC_MUT_THRESHOLD))
+        print(f"Pool mutual IC early-exit threshold: {float(POOL_IC_MUT_THRESHOLD):.4f}")
+    except Exception:
+        pass
+
+    # 互相关计算加速：把 mutual IC 比对顺序改为“按权重绝对值从大到小”，并允许用更严格阈值早退。
+    # 设计目标：
+    # - 后期 pool 满时，mutual IC 计算是 fps 衰减最大来源；
+    # - 越早与“重要 alpha”比对，越容易触发 early-exit，从而减少无意义 mutual 计算；
+    # - 不改变最终 mutual IC 数值（只改变计算顺序），因此不会引入指标口径偏差。
+    mutual_order_raw = os.environ.get("ALPHAGEN_POOL_MUTUAL_ORDER", "1").strip().lower()
+    MUTUAL_ORDER = mutual_order_raw in {"1", "true", "yes", "y", "on"}
+    if MUTUAL_ORDER:
+        try:
+            import types
+
+            _orig_calc_ics_impl = getattr(pool, "_calc_ics", None)
+
+            def _calc_ics_weight_order(self, expr, ic_mut_threshold=None):  # type: ignore[no-redef]
+                # 兼容上游：try_new_expr 固定传 ic_mut_threshold=0.99；
+                # 这里允许外部通过 `_ic_mut_threshold` 把阈值收紧（取 min），以便更早 early-exit。
+                thr = ic_mut_threshold
+                cfg_thr = getattr(self, "_ic_mut_threshold", None)
+                try:
+                    if cfg_thr is not None and np.isfinite(float(cfg_thr)):
+                        thr = float(cfg_thr) if thr is None else min(float(thr), float(cfg_thr))
+                except Exception:
+                    pass
+
+                single_ic = self.calculator.calc_single_IC_ret(expr)
+                try:
+                    under = bool(getattr(self, "_under_thres_alpha"))
+                except Exception:
+                    under = False
+                lb = getattr(self, "_ic_lower_bound", None)
+                if (lb is not None) and (not under) and (single_ic < float(lb)):
+                    return single_ic, None
+                if getattr(self, "size", 0) <= 0:
+                    return single_ic, []
+
+                order = list(range(int(self.size)))
+                if thr is not None:
+                    try:
+                        order.sort(key=lambda i: -float(abs(getattr(self, "_weights")[i])))
+                    except Exception:
+                        pass
+
+                mutual_ics = [0.0] * int(self.size)
+                for i in order:
+                    mutual_ic = self.calculator.calc_mutual_IC(expr, self.exprs[i])  # type: ignore[index]
+                    if thr is not None and mutual_ic > thr:
+                        return single_ic, None
+                    mutual_ics[i] = mutual_ic
+                return single_ic, mutual_ics
+
+            # 仅在 LinearAlphaPool 场景下替换；否则回退原实现
+            if _orig_calc_ics_impl is not None:
+                pool._calc_ics = types.MethodType(_calc_ics_weight_order, pool)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     # 可选：恢复历史 alpha_pool（重要：ALPHAGEN_RESUME 默认只恢复 PPO 模型，不会恢复 pool）
     # 用法示例：
     #   ALPHAGEN_POOL_RESUME=1 \
@@ -1404,7 +1721,14 @@ def main():
                     st["calls"] = int(st.get("calls", 0)) + 1
                     st["time_s"] = float(st.get("time_s", 0.0)) + float(dtg)
 
-                thr = float(FAST_GATE_MIN_ABS_IC)
+                thr = float(fast_gate_thr_holder.get("value", FAST_GATE_MIN_ABS_IC))
+                if FAST_GATE_THR_LB_RATIO > 0:
+                    try:
+                        lb = getattr(self, "_ic_lower_bound", None)
+                        if lb is not None:
+                            thr = max(thr, float(FAST_GATE_THR_LB_RATIO) * float(lb))
+                    except Exception:
+                        pass
                 if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
                     if isinstance(st, dict):
                         st["skips"] = int(st.get("skips", 0)) + 1
@@ -1413,6 +1737,71 @@ def main():
             return _orig_try_new_expr(self, expr)
 
         pool.try_new_expr = types.MethodType(_try_new_expr_fast_gate, pool)  # type: ignore[assignment]
+
+    # 可选：额外性能日志（用于解释“为什么后面 fps 会掉到 80/50”）
+    # 通过 monkey patch 统计 pool 关键函数耗时，再由 PoolPerfStatsCallback 写入 TensorBoard。
+    if PERF_LOG:
+        try:
+            import time as _time
+
+            setattr(
+                pool,
+                "_perf_stats",
+                {
+                    "try_calls": 0,
+                    "try_time_s": 0.0,
+                    "opt_calls": 0,
+                    "opt_time_s": 0.0,
+                    "ics_calls": 0,
+                    "ics_time_s": 0.0,
+                },
+            )
+
+            _orig_optimize = getattr(pool, "optimize")
+
+            def _optimize_perf(self, *args, **kwargs):  # type: ignore[no-redef]
+                t0 = _time.perf_counter()
+                out = _orig_optimize(*args, **kwargs)
+                dt = _time.perf_counter() - t0
+                st = getattr(self, "_perf_stats", None)
+                if isinstance(st, dict):
+                    st["opt_calls"] = int(st.get("opt_calls", 0)) + 1
+                    st["opt_time_s"] = float(st.get("opt_time_s", 0.0)) + float(dt)
+                return out
+
+            pool.optimize = types.MethodType(_optimize_perf, pool)  # type: ignore[assignment]
+
+            _orig_calc_ics = getattr(pool, "_calc_ics", None)
+            if _orig_calc_ics is not None:
+
+                def _calc_ics_perf(self, *args, **kwargs):  # type: ignore[no-redef]
+                    t0 = _time.perf_counter()
+                    out = _orig_calc_ics(*args, **kwargs)
+                    dt = _time.perf_counter() - t0
+                    st = getattr(self, "_perf_stats", None)
+                    if isinstance(st, dict):
+                        st["ics_calls"] = int(st.get("ics_calls", 0)) + 1
+                        st["ics_time_s"] = float(st.get("ics_time_s", 0.0)) + float(dt)
+                    return out
+
+                pool._calc_ics = types.MethodType(_calc_ics_perf, pool)  # type: ignore[attr-defined]
+
+            _orig_try = getattr(pool, "try_new_expr")
+
+            def _try_new_expr_perf(self, expr):  # type: ignore[no-redef]
+                t0 = _time.perf_counter()
+                out = _orig_try(expr)
+                dt = _time.perf_counter() - t0
+                st = getattr(self, "_perf_stats", None)
+                if isinstance(st, dict):
+                    st["try_calls"] = int(st.get("try_calls", 0)) + 1
+                    st["try_time_s"] = float(st.get("try_time_s", 0.0)) + float(dt)
+                return out
+
+            pool.try_new_expr = types.MethodType(_try_new_expr_perf, pool)  # type: ignore[assignment]
+            print("✓ PERF_LOG 已启用：将记录 pool.try_new_expr/optimize/_calc_ics 耗时到 TensorBoard")
+        except Exception as e:
+            print(f"⚠ PERF_LOG 初始化失败（将忽略）：{e}")
 
     # 可选：限制最小表达式长度/启用 stack guard（通过 monkey patch core 的 stop 有效性）
     # - MIN_EXPR_LEN：控制 SEP 何时可用（减少评估频率 => 提速）
@@ -1562,6 +1951,33 @@ def main():
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
     if fast_gate_calc is not None:
         callbacks.append(FastGateStatsCallback(pool_obj=pool, update_every=2048))
+        if float(FAST_GATE_MIN_ABS_IC_START) != float(FAST_GATE_MIN_ABS_IC_END):
+            callbacks.append(
+                FastGateThresholdScheduleCallback(
+                    total_timesteps=FAST_GATE_MIN_ABS_IC_SCHEDULE_STEPS,
+                    start_thr=float(FAST_GATE_MIN_ABS_IC_START),
+                    end_thr=float(FAST_GATE_MIN_ABS_IC_END),
+                    update_every=int(FAST_GATE_MIN_ABS_IC_UPDATE_EVERY),
+                    holder=fast_gate_thr_holder,
+                    verbose=0,
+                )
+            )
+        if FAST_GATE_AUTOTUNE:
+            callbacks.append(
+                FastGateAutoTuneCallback(
+                    pool_obj=pool,
+                    holder=fast_gate_thr_holder,
+                    target_skip_rate=float(FAST_GATE_AUTOTUNE_TARGET_SKIP),
+                    adjust_mul=float(FAST_GATE_AUTOTUNE_ADJUST_MUL),
+                    min_thr=float(FAST_GATE_AUTOTUNE_MIN_THR),
+                    max_thr=float(FAST_GATE_AUTOTUNE_MAX_THR),
+                    update_every=2048,
+                    warmup_calls=50,
+                    verbose=0,
+                )
+            )
+    if PERF_LOG:
+        callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
     if ckpt_every_steps > 0:
         callbacks.append(
             PeriodicCheckpointCallback(
