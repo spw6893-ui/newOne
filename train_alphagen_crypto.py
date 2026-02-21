@@ -1426,6 +1426,18 @@ def main():
     FAST_GATE_AUTOTUNE_MIN_THR = float(max(0.0, FAST_GATE_AUTOTUNE_MIN_THR))
     FAST_GATE_AUTOTUNE_MAX_THR = float(max(FAST_GATE_AUTOTUNE_MIN_THR, FAST_GATE_AUTOTUNE_MAX_THR))
 
+    # schedule_steps：用于避免 resume 时各种 schedule “直接跳到终值”
+    # 默认等于当前 run 的 TOTAL_TIMESTEPS；如从 400k resume 并希望延续原 800k 的 schedule，
+    # 可以显式设置为 800000（示例：ALPHAGEN_POOL_LCB_BETA_SCHEDULE_STEPS=800000）。
+    POOL_LCB_BETA_SCHEDULE_STEPS = int(
+        os.environ.get("ALPHAGEN_POOL_LCB_BETA_SCHEDULE_STEPS", str(TOTAL_TIMESTEPS)).strip() or TOTAL_TIMESTEPS
+    )
+    POOL_LCB_BETA_SCHEDULE_STEPS = max(1, int(POOL_LCB_BETA_SCHEDULE_STEPS))
+    IC_LOWER_BOUND_SCHEDULE_STEPS = int(
+        os.environ.get("ALPHAGEN_IC_LOWER_BOUND_SCHEDULE_STEPS", str(TOTAL_TIMESTEPS)).strip() or TOTAL_TIMESTEPS
+    )
+    IC_LOWER_BOUND_SCHEDULE_STEPS = max(1, int(IC_LOWER_BOUND_SCHEDULE_STEPS))
+
     # 近似评估（ValGate）：用“验证集小样本 single-IC”做二次门控，目标是提升 OOS（val）质量，
     # 同时减少会触发昂贵 pool.optimize 的候选数量（帮助稳定 fps）。
     val_gate_raw = os.environ.get("ALPHAGEN_VAL_GATE", "0").strip().lower()
@@ -2162,7 +2174,7 @@ def main():
             callbacks.append(
                 PoolLcbBetaScheduleCallback(
                     pool=pool,
-                    total_timesteps=TOTAL_TIMESTEPS,
+                    total_timesteps=POOL_LCB_BETA_SCHEDULE_STEPS,
                     start_beta=float(POOL_LCB_BETA_START),
                     end_beta=float(POOL_LCB_BETA_END),
                     update_every=int(max(256, pool_lcb_beta_update_every)),
@@ -2173,7 +2185,7 @@ def main():
         callbacks.append(
             IcLowerBoundScheduleCallback(
                 pool=pool,
-                total_timesteps=TOTAL_TIMESTEPS,
+                total_timesteps=IC_LOWER_BOUND_SCHEDULE_STEPS,
                 start_lb=ic_lb_start,
                 end_lb=ic_lb_end,
                 update_every=ic_lb_update_every,
