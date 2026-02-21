@@ -306,6 +306,10 @@ case "$PRESET" in
     explore20_ucblcb_cs)
         # 开启性能打点（写入 TensorBoard：perf/*），用于定位 fps 衰减根因
         export_default ALPHAGEN_PERF_LOG 1
+        # 可选：更对齐的回报信号（平台期推荐尝试）
+        #   ALPHAGEN_REWARD_MODE=delta_best  # 只在 best_obj 提升时给正回报（更稀疏但更“有效”）
+        # 可选：SB3 logger key 截断冲突保护（如遇 ValueError: truncated key already exists）
+        #   ALPHAGEN_SB3_LOGGER_MAX_LENGTH=120
         # 启用截面算子（CSRank/CSZScore）会改变 action_space，因此不兼容旧模型 resume。
         export_default ALPHAGEN_ENABLE_CS_OPS 1
         # 其他参数与 explore20_ucblcb 保持一致（便于对比）

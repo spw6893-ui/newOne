@@ -728,6 +728,32 @@ def main():
         def _on_step(self) -> bool:
             return True
 
+    class Sb3LoggerMaxLengthCallback(BaseCallback):
+        """
+        规避 SB3 logger 的 key 截断冲突导致训练中断。
+
+        背景：HumanOutputFormat 会把过长 key 截断到 max_length；
+        截断后若发生重名，SB3 会抛 ValueError 并终止训练。
+        """
+
+        def __init__(self, max_length: int = 120, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._max_length = int(max(36, max_length))
+
+        def _on_training_start(self) -> None:
+            try:
+                fmts = getattr(self.logger, "output_formats", None)
+                if not fmts:
+                    return
+                for fmt in fmts:
+                    if hasattr(fmt, "max_length"):
+                        try:
+                            setattr(fmt, "max_length", self._max_length)
+                        except Exception:
+                            pass
+            except Exception:
+                return
+
     class AlphaCacheStatsCallback(BaseCallback):
         """
         把 alpha 评估缓存命中率写入 TensorBoard（用于定位“越跑越慢”）。
@@ -1423,6 +1449,26 @@ def main():
     surrogate_only_full_raw = os.environ.get("ALPHAGEN_SURROGATE_ONLY_WHEN_FULL", "1").strip().lower()
     SURROGATE_ONLY_WHEN_FULL = surrogate_only_full_raw in {"1", "true", "yes", "y", "on"}
 
+    # ==================== Reward shaping（可选） ====================
+    # 目标：把“新表达式对 pool 目标的边际贡献”对齐为 RL 回报信号，
+    # 避免出现“pool 很快满，但 best 不再提升”的平台期。
+    # - abs：保持历史行为（返回 new_obj）
+    # - delta_best：返回 best_obj 的边际增量（<=0 记为 0；信号更稀疏但更对齐）
+    REWARD_MODE = os.environ.get("ALPHAGEN_REWARD_MODE", "abs").strip().lower()
+    if REWARD_MODE not in {"abs", "delta_best"}:
+        print(f"⚠ 未知 ALPHAGEN_REWARD_MODE={REWARD_MODE}（将回退到 abs）")
+        REWARD_MODE = "abs"
+    try:
+        REWARD_SCALE = float(os.environ.get("ALPHAGEN_REWARD_SCALE", "1.0").strip() or 1.0)
+    except Exception:
+        REWARD_SCALE = 1.0
+
+    # SB3 logger key 最大长度（避免截断冲突导致训练中断）
+    try:
+        SB3_LOGGER_MAX_LENGTH = int(os.environ.get("ALPHAGEN_SB3_LOGGER_MAX_LENGTH", "120").strip() or 120)
+    except Exception:
+        SB3_LOGGER_MAX_LENGTH = 120
+
     class TrialLogger:
         def __init__(self, path: str, flush_every: int = 256):
             self._path = Path(path)
@@ -2035,9 +2081,27 @@ def main():
                 self._last_single_ic = float("nan")
                 self._last_mutual_max = float("nan")
                 self._last_val_gate_ic = float("nan")
+                self._reward_mode = str(REWARD_MODE)
+                self._reward_scale = float(REWARD_SCALE)
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
+
+            def _shape_reward(self, old_best_obj: float, out_obj: float) -> float:
+                mode = str(getattr(self, "_reward_mode", "abs"))
+                scale = float(getattr(self, "_reward_scale", 1.0) or 1.0)
+                if mode == "delta_best":
+                    new_best_obj = float(getattr(self, "best_obj", old_best_obj))
+                    d = new_best_obj - float(old_best_obj)
+                    if not np.isfinite(d) or d <= 0:
+                        return 0.0
+                    r = d
+                else:
+                    r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                r *= scale
+                if not np.isfinite(r):
+                    return 0.0
+                return float(r)
 
             @staticmethod
             def _safe_abs_min_idx(x: np.ndarray) -> int:
@@ -2105,6 +2169,7 @@ def main():
                 return new_obj
 
             def try_new_expr(self, expr):  # type: ignore[override]
+                old_best_obj = float(getattr(self, "best_obj", -1.0))
                 # Val Gate：pool 满时先在 val 子集估计 single-IC，不达标直接跳过
                 vg_calc = getattr(self, "_val_gate_calc", None)
                 if vg_calc is not None:
@@ -2187,25 +2252,27 @@ def main():
                 every = int(getattr(self, "_optimize_every_updates", 1) or 1)
                 if every <= 1:
                     if not getattr(self, "_perf_enabled", False):
-                        return super().try_new_expr(expr)
+                        out = super().try_new_expr(expr)
+                        return self._shape_reward(old_best_obj, out)
                     import time as _time
                     t0 = _time.perf_counter()
                     out = super().try_new_expr(expr)
                     dt = _time.perf_counter() - t0
                     self._perf["try_new_expr_calls"] += 1
                     self._perf["try_new_expr_time_s"] += float(dt)
-                    return out
+                    return self._shape_reward(old_best_obj, out)
 
                 # Lazy（every_updates>1）：减少 optimize 调用，避免后期 fps 崩
                 if not getattr(self, "_perf_enabled", False):
-                    return self._try_new_expr_lazy(expr)
+                    out = self._try_new_expr_lazy(expr)
+                    return self._shape_reward(old_best_obj, out)
                 import time as _time
                 t0 = _time.perf_counter()
                 out = self._try_new_expr_lazy(expr)
                 dt = _time.perf_counter() - t0
                 self._perf["try_new_expr_calls"] += 1
                 self._perf["try_new_expr_time_s"] += float(dt)
-                return out
+                return self._shape_reward(old_best_obj, out)
 
             def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
                 # 使用 env 配置的 mutual 阈值（覆盖 super().try_new_expr 传入的默认值 0.99）
@@ -2356,9 +2423,27 @@ def main():
                 self._fast_gate_calc = fast_gate_calc
                 self._fast_gate_only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
                 self._fast_gate_min_abs_ic = float(FAST_GATE_MIN_ABS_IC)
+                self._reward_mode = str(REWARD_MODE)
+                self._reward_scale = float(REWARD_SCALE)
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
+
+            def _shape_reward(self, old_best_obj: float, out_obj: float) -> float:
+                mode = str(getattr(self, "_reward_mode", "abs"))
+                scale = float(getattr(self, "_reward_scale", 1.0) or 1.0)
+                if mode == "delta_best":
+                    new_best_obj = float(getattr(self, "best_obj", old_best_obj))
+                    d = new_best_obj - float(old_best_obj)
+                    if not np.isfinite(d) or d <= 0:
+                        return 0.0
+                    r = d
+                else:
+                    r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                r *= scale
+                if not np.isfinite(r):
+                    return 0.0
+                return float(r)
 
             @staticmethod
             def _safe_abs_min_idx(x: np.ndarray) -> int:
@@ -2419,6 +2504,7 @@ def main():
                 return new_obj
 
             def try_new_expr(self, expr):  # type: ignore[override]
+                old_best_obj = float(getattr(self, "best_obj", -1.0))
                 expr_str = str(expr)
                 step = int(getattr(self, "_current_step", 0) or 0)
                 # 重置上一次 _calc_ics 记录（避免串台）
@@ -2510,7 +2596,7 @@ def main():
                                     "pool_size": int(getattr(self, "size", 0) or 0),
                                 }
                             )
-                        return out
+                        return self._shape_reward(old_best_obj, out)
                     import time as _time
                     t0 = _time.perf_counter()
                     out = super().try_new_expr(expr)
@@ -2531,7 +2617,7 @@ def main():
                                 "pool_size": int(getattr(self, "size", 0) or 0),
                             }
                         )
-                    return out
+                    return self._shape_reward(old_best_obj, out)
 
                 if not getattr(self, "_perf_enabled", False):
                     out = self._try_new_expr_lazy(expr)
@@ -2549,7 +2635,7 @@ def main():
                                 "pool_size": int(getattr(self, "size", 0) or 0),
                             }
                         )
-                    return out
+                    return self._shape_reward(old_best_obj, out)
                 import time as _time
                 t0 = _time.perf_counter()
                 out = self._try_new_expr_lazy(expr)
@@ -2570,7 +2656,7 @@ def main():
                             "pool_size": int(getattr(self, "size", 0) or 0),
                         }
                     )
-                return out
+                return self._shape_reward(old_best_obj, out)
 
             def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
                 if not getattr(self, "_perf_enabled", False):
@@ -2814,6 +2900,7 @@ def main():
     print()
 
     callbacks = [TensorboardCallback()]
+    callbacks.append(Sb3LoggerMaxLengthCallback(max_length=SB3_LOGGER_MAX_LENGTH, verbose=0))
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
     callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
     ckpt_cb = None
