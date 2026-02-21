@@ -754,6 +754,9 @@ def main():
             except Exception:
                 return
 
+        def _on_step(self) -> bool:
+            return True
+
     class AlphaCacheStatsCallback(BaseCallback):
         """
         把 alpha 评估缓存命中率写入 TensorBoard（用于定位“越跑越慢”）。
