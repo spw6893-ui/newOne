@@ -264,6 +264,37 @@ def _dump_json(path: Path, obj: dict) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+def _pick_latest_step_snapshot_leq(ckpt_dir: Path, prefix: str, step: int) -> Optional[Path]:
+    """
+    从 checkpoints 目录选择 `prefix_step_*.json` 中 step<=目标step 的“最近一份”快照。
+
+    背景：早期版本 checkpoint 可能只保存了 model_step_xxx.zip / alpha_pool_step_xxx.json，
+    但 features/subexprs 的快照是后面才补上的，导致 resume 时找不到精确 step 的 json，
+    从而出现 action/observation space 不一致（例如 144 vs 142）。
+    """
+    try:
+        step = int(step)
+    except Exception:
+        return None
+    if step <= 0:
+        return None
+    best_fp: Optional[Path] = None
+    best_step = -1
+    pat = f"{prefix}_step_*.json"
+    for fp in ckpt_dir.glob(pat):
+        name = fp.name
+        # features_step_123.json / subexprs_step_123.json
+        mid = name[len(prefix) + len("_step_") :]
+        mid = mid.split(".", 1)[0]
+        try:
+            s = int(mid)
+        except Exception:
+            continue
+        if s <= step and s > best_step:
+            best_step = s
+            best_fp = fp
+    return best_fp
+
 def main():
     # ==================== 配置参数 ====================
 
@@ -302,11 +333,17 @@ def main():
     force_load_feat = force_load_feat_raw in {"1", "true", "yes", "y", "on"}
     auto_load_feat = force_load_feat_raw in {"auto", ""}
     default_feat_path = Path("./alphagen_output") / "selected_features.json"
-    # 优先：如果 resume 且当前 checkpoint 目录下存在 features_step_{step}.json，则用它确保严格一致
+    # 优先：如果 resume 且 checkpoints 目录下存在 features_step_{step}.json，则用它确保严格一致；
+    # 若精确 step 不存在，则退化到“<=step 的最近快照”（兼容早期没保存 features_step 的 checkpoint）。
     if resume_step_early is not None:
-        cand = Path("./alphagen_output") / "checkpoints" / f"features_step_{resume_step_early}.json"
+        ckpt_dir = Path("./alphagen_output") / "checkpoints"
+        cand = ckpt_dir / f"features_step_{resume_step_early}.json"
         if cand.exists():
             default_feat_path = cand
+        else:
+            best = _pick_latest_step_snapshot_leq(ckpt_dir, "features", resume_step_early)
+            if best is not None and best.exists():
+                default_feat_path = best
     feat_list_path = Path(os.environ.get("ALPHAGEN_FEATURE_LIST_PATH", str(default_feat_path)).strip() or str(default_feat_path))
     if (force_load_feat or (auto_load_feat and resume_flag_early)) and feat_list_path.exists():
         try:
@@ -380,9 +417,14 @@ def main():
     auto_load_subexpr = force_load_subexpr_raw in {"auto", ""}
     default_subexprs_path = Path("./alphagen_output") / "subexprs.json"
     if resume_step_early is not None:
-        cand = Path("./alphagen_output") / "checkpoints" / f"subexprs_step_{resume_step_early}.json"
+        ckpt_dir = Path("./alphagen_output") / "checkpoints"
+        cand = ckpt_dir / f"subexprs_step_{resume_step_early}.json"
         if cand.exists():
             default_subexprs_path = cand
+        else:
+            best = _pick_latest_step_snapshot_leq(ckpt_dir, "subexprs", resume_step_early)
+            if best is not None and best.exists():
+                default_subexprs_path = best
     subexprs_path = Path(os.environ.get("ALPHAGEN_SUBEXPRS_PATH", str(default_subexprs_path)).strip() or str(default_subexprs_path))
     if (force_load_subexpr or (auto_load_subexpr and resume_flag_early)) and subexprs_path.exists():
         try:
@@ -804,6 +846,44 @@ def main():
                 self.logger.record("perf/val_gate_skip_rate", float(ds) / float(dc))
 
             self._last = {"calls": calls, "skips": skips, "time_s": time_s}
+            return True
+
+    class RewardComponentStatsCallback(BaseCallback):
+        """
+        记录（可选）多目标 reward 的组成部分到 TensorBoard，便于判断：
+        - 稳定性惩罚/换手惩罚是否过强（导致 reward 变稀疏或变成负反馈）
+        - ICIR bonus 是否在后期主导（导致偏离“以 IC 为主”）
+        """
+
+        def __init__(self, pool_obj, update_every: int = 2048, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._pool = pool_obj
+            self._update_every = max(1, int(update_every))
+            self._last_step = 0
+
+        def _on_step(self) -> bool:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._update_every):
+                return True
+            self._last_step = int(self.num_timesteps)
+            p = self._pool
+            try:
+                mode = str(getattr(p, "_reward_mode", "legacy")).strip().lower()
+            except Exception:
+                mode = "legacy"
+            self.logger.record("reward/mode_multi", 1.0 if mode == "multi" else 0.0)
+            for k in ("_last_ic_mean", "_last_ic_std", "_last_icir", "_last_rolling_ic_std", "_last_turnover"):
+                try:
+                    v = float(getattr(p, k, 0.0) or 0.0)
+                except Exception:
+                    v = 0.0
+                name = {
+                    "_last_ic_mean": "reward/ic_mean",
+                    "_last_ic_std": "reward/ic_std",
+                    "_last_icir": "reward/icir",
+                    "_last_rolling_ic_std": "reward/rolling_ic_std",
+                    "_last_turnover": "reward/turnover",
+                }[k]
+                self.logger.record(name, v)
             return True
 
     class FastGateThresholdScheduleCallback(BaseCallback):
@@ -1565,6 +1645,12 @@ def main():
     POOL_OPT_MAX_STEPS = max(50, POOL_OPT_MAX_STEPS)
     POOL_OPT_TOLERANCE = max(10, POOL_OPT_TOLERANCE)
 
+    # commit 阶段（TWO_STAGE full commit）可选：使用更小的优化预算，避免一次 commit 把 fps 拖垮
+    POOL_OPT_MAX_STEPS_COMMIT = int(os.environ.get("ALPHAGEN_POOL_OPT_MAX_STEPS_COMMIT", "0").strip() or 0)
+    POOL_OPT_TOLERANCE_COMMIT = int(os.environ.get("ALPHAGEN_POOL_OPT_TOLERANCE_COMMIT", "0").strip() or 0)
+    POOL_OPT_MAX_STEPS_COMMIT = max(0, int(POOL_OPT_MAX_STEPS_COMMIT))
+    POOL_OPT_TOLERANCE_COMMIT = max(0, int(POOL_OPT_TOLERANCE_COMMIT))
+
     # 性能/多样性控制：mutual IC 的“相似度早退”阈值
     # - 越小越严格（更早拒绝高相似表达式，提速+增强多样性，但也可能让学习信号变稀疏）
     # - 默认 0.99：基本等价于“不启用”（只过滤几乎完全重复）
@@ -1922,7 +2008,13 @@ def main():
             def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:  # type: ignore[override]
                 # MeanStdAlphaPool 默认 optimize(max_steps=10000) 在 days*stocks 很大时非常慢。
                 # 这里复用 ALPHAGEN_POOL_OPT_* 作为统一的“优化预算阀门”，方便在脚本里提速/稳住。
-                return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                ms = int(getattr(self, "_opt_max_steps_override", 0) or 0)
+                tol = int(getattr(self, "_opt_tolerance_override", 0) or 0)
+                if ms > 0:
+                    max_steps = ms
+                if tol > 0:
+                    tolerance = tol
+                return super().optimize(lr=POOL_OPT_LR, max_steps=max_steps if ms > 0 else POOL_OPT_MAX_STEPS, tolerance=tolerance if tol > 0 else POOL_OPT_TOLERANCE)
 
         pool = TunableNaNFriendlyMeanStdAlphaPool(
             capacity=POOL_CAPACITY,
@@ -1935,7 +2027,13 @@ def main():
     else:
         class TunableMseAlphaPool(MseAlphaPool):
             def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:  # type: ignore[override]
-                return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                ms = int(getattr(self, "_opt_max_steps_override", 0) or 0)
+                tol = int(getattr(self, "_opt_tolerance_override", 0) or 0)
+                if ms > 0:
+                    max_steps = ms
+                if tol > 0:
+                    tolerance = tol
+                return super().optimize(lr=POOL_OPT_LR, max_steps=max_steps if ms > 0 else POOL_OPT_MAX_STEPS, tolerance=tolerance if tol > 0 else POOL_OPT_TOLERANCE)
 
         pool = TunableMseAlphaPool(
             capacity=POOL_CAPACITY,
@@ -1951,6 +2049,179 @@ def main():
         print(f"Pool mutual IC early-exit threshold: {float(POOL_IC_MUT_THRESHOLD):.4f}")
     except Exception:
         pass
+
+    # ==================== 可选：多目标 reward（方案1） ====================
+    # 默认不启用：保持历史行为（reward=pool main objective）。
+    reward_mode = os.environ.get("ALPHAGEN_REWARD_MODE", "legacy").strip().lower()
+    if reward_mode in {"multi", "m"}:
+        def _get_float_env(keys, default: float) -> float:
+            for key in keys:
+                raw = os.environ.get(key, "").strip()
+                if not raw:
+                    continue
+                try:
+                    v = float(raw)
+                    if np.isfinite(v):
+                        return float(v)
+                except Exception:
+                    continue
+            return float(default)
+
+        def _get_int_env(keys, default: int) -> int:
+            for key in keys:
+                raw = os.environ.get(key, "").strip()
+                if not raw:
+                    continue
+                try:
+                    return max(1, int(raw))
+                except Exception:
+                    continue
+            return int(default)
+
+        w_ic = _get_float_env(["ALPHAGEN_REWARD_W_IC", "ALPHAGEN_REWARD_W1"], 1.0)
+        w_ic_std = _get_float_env(["ALPHAGEN_REWARD_W_IC_STD", "ALPHAGEN_REWARD_W2"], 0.0)
+        w_turn = _get_float_env(["ALPHAGEN_REWARD_W_TURNOVER", "ALPHAGEN_REWARD_W3"], 0.0)
+        w_icir = _get_float_env(["ALPHAGEN_REWARD_W_ICIR", "ALPHAGEN_REWARD_W4"], 0.0)
+        ic_std_window = _get_int_env(["ALPHAGEN_REWARD_IC_STD_WINDOW"], 720)
+        turnover_window = _get_int_env(["ALPHAGEN_REWARD_TURNOVER_WINDOW"], 720)
+
+        try:
+            setattr(pool, "_reward_mode", "multi")
+            setattr(pool, "_reward_w_ic", float(w_ic))
+            setattr(pool, "_reward_w_ic_std", float(w_ic_std))
+            setattr(pool, "_reward_w_turnover", float(w_turn))
+            setattr(pool, "_reward_w_icir", float(w_icir))
+            setattr(pool, "_reward_ic_std_window", int(ic_std_window))
+            setattr(pool, "_reward_turnover_window", int(turnover_window))
+            # 初始化 stats 字段（便于 TensorBoard callback 读取）
+            setattr(pool, "_last_ic_mean", 0.0)
+            setattr(pool, "_last_ic_std", 0.0)
+            setattr(pool, "_last_icir", 0.0)
+            setattr(pool, "_last_rolling_ic_std", 0.0)
+            setattr(pool, "_last_turnover", 0.0)
+            print(
+                "✓ 多目标 reward 已启用："
+                f"w_ic={w_ic:g}, w_ic_std={w_ic_std:g}, w_turnover={w_turn:g}, w_icir={w_icir:g}, "
+                f"ic_std_window={ic_std_window}, turnover_window={turnover_window}"
+            )
+
+            # 用哪个 calculator 来计算 reward 组件（越小越快；auto 推荐 val > fast > train）
+            reward_calc_mode = os.environ.get("ALPHAGEN_REWARD_CALC", "auto").strip().lower()
+            if reward_calc_mode not in {"auto", "train", "fast", "val"}:
+                reward_calc_mode = "auto"
+            reward_calc = calculator
+            if reward_calc_mode == "val":
+                reward_calc = val_gate_calc if val_gate_calc is not None else calculator
+            elif reward_calc_mode == "fast":
+                reward_calc = fast_gate_calc if fast_gate_calc is not None else calculator
+            elif reward_calc_mode == "auto":
+                if val_gate_calc is not None:
+                    reward_calc = val_gate_calc
+                elif fast_gate_calc is not None:
+                    reward_calc = fast_gate_calc
+
+            # monkey patch：只改“step reward”，不改变 pool 的入池/优化逻辑
+            import types
+            from alphagen.utils.correlation import batch_pearsonr
+
+            _orig_try_new_expr = getattr(pool, "try_new_expr", None)
+
+            def _safe_float(x, default=0.0):
+                try:
+                    v = float(x)
+                    return v if np.isfinite(v) else float(default)
+                except Exception:
+                    return float(default)
+
+            def _calc_reward_components(p) -> tuple[float, float, float, float, float]:
+                """
+                返回：ic_mean, ic_std, icir, rolling_ic_std, turnover
+                注：这里的 IC 口径来自 reward_calc（可能是 val/fast 的小样本），用于塑形训练信号以提泛化/提速。
+                """
+                try:
+                    size = int(getattr(p, "size", 0))
+                except Exception:
+                    size = 0
+                if size <= 0:
+                    return 0.0, 0.0, 0.0, 0.0, 0.0
+
+                exprs = [e for e in getattr(p, "exprs")[:size] if e is not None]
+                if not exprs:
+                    return 0.0, 0.0, 0.0, 0.0, 0.0
+                weights = [float(w) for w in list(getattr(p, "weights"))]
+
+                target = getattr(reward_calc, "target_value", None)
+                if target is None:
+                    try:
+                        target = getattr(reward_calc, "target")
+                    except Exception:
+                        target = None
+                if target is None:
+                    return 0.0, 0.0, 0.0, 0.0, 0.0
+
+                with torch.no_grad():
+                    ens = reward_calc.make_ensemble_alpha(exprs, weights)  # type: ignore[attr-defined]
+                    ics = batch_pearsonr(ens, target)
+                    ic_mean = float(ics.mean().item())
+                    ic_std = float(ics.std().item())
+                    icir = float((ic_mean / ic_std) if ic_std > 0 else 0.0)
+
+                    win = int(getattr(p, "_reward_ic_std_window", 720) or 720)
+                    win = max(2, win)
+                    tail = ics[-win:] if int(ics.numel()) > win else ics
+                    rolling_ic_std = float(tail.std().item()) if int(tail.numel()) >= 2 else 0.0
+
+                    tw = int(getattr(p, "_reward_turnover_window", 720) or 720)
+                    tw = max(1, tw)
+                    k = min(int(ens.shape[0]), int(tw) + 1)
+                    if k >= 2:
+                        wt = ens[-k:]
+                        d = (wt[1:] - wt[:-1]).abs()
+                        m = torch.isfinite(d)
+                        turnover = float(d[m].mean().item()) if bool(m.any().item()) else 0.0
+                    else:
+                        turnover = 0.0
+                return ic_mean, ic_std, icir, rolling_ic_std, turnover
+
+            def _try_new_expr_multi(self, expr):  # type: ignore[no-redef]
+                # 先按原逻辑更新 pool（入池/优化/失败缓存等），然后再用 reward_calc 做 reward 塑形
+                if callable(_orig_try_new_expr):
+                    obj = _orig_try_new_expr(expr)
+                else:
+                    obj = 0.0
+
+                w1 = _safe_float(getattr(self, "_reward_w_ic", 1.0), 1.0)
+                w2 = _safe_float(getattr(self, "_reward_w_ic_std", 0.0), 0.0)
+                w3 = _safe_float(getattr(self, "_reward_w_turnover", 0.0), 0.0)
+                w4 = _safe_float(getattr(self, "_reward_w_icir", 0.0), 0.0)
+
+                try:
+                    ic_mean, ic_std, icir, rolling_ic_std, turnover = _calc_reward_components(self)
+                except Exception:
+                    ic_mean, ic_std, icir, rolling_ic_std, turnover = 0.0, 0.0, 0.0, 0.0, 0.0
+
+                # 记录 stats（TensorBoard）
+                setattr(self, "_last_ic_mean", float(ic_mean))
+                setattr(self, "_last_ic_std", float(ic_std))
+                setattr(self, "_last_icir", float(icir))
+                setattr(self, "_last_rolling_ic_std", float(rolling_ic_std))
+                setattr(self, "_last_turnover", float(turnover))
+
+                # reward shaping（以 IC 为主）
+                reward = float(w1) * float(ic_mean) + float(w2) * (-float(rolling_ic_std)) + float(w3) * (-float(turnover)) + float(w4) * float(icir)
+                # 防御：极端情况下回退到原 objective（避免 NaN 把训练搞崩）
+                if not np.isfinite(reward):
+                    try:
+                        return float(obj)
+                    except Exception:
+                        return 0.0
+                return float(reward)
+
+            pool.try_new_expr = types.MethodType(_try_new_expr_multi, pool)  # type: ignore[assignment]
+            print(f"✓ 已注入 multi reward（calc={reward_calc_mode}, 实际={type(reward_calc).__name__}）")
+        except Exception as e:
+            print(f"⚠ 启用多目标 reward 失败（将回退 legacy）：{e}")
+            reward_mode = "legacy"
 
     # 互相关计算加速：把 mutual IC 比对顺序改为“按权重绝对值从大到小”，并允许用更严格阈值早退。
     # 设计目标：
@@ -2478,6 +2749,8 @@ def main():
 
     callbacks = [TensorboardCallback()]
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
+    if reward_mode in {"multi", "m"}:
+        callbacks.append(RewardComponentStatsCallback(pool_obj=pool, update_every=2048))
     if fast_gate_calc is not None:
         callbacks.append(FastGateStatsCallback(pool_obj=pool, update_every=2048))
         if float(FAST_GATE_MIN_ABS_IC_START) != float(FAST_GATE_MIN_ABS_IC_END):
