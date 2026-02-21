@@ -282,6 +282,32 @@ def main():
     # 可选：用训练集的单变量 IC 做预筛选，从而缩小 action space（更容易探索/更快收敛）
     feature_space = _detect_feature_space(Path(DATA_DIR))
 
+    # 重要：为保证 resume 时 action_space 完全一致，优先从上一次输出的 selected_features.json 恢复特征列表。
+    # 否则哪怕只差 1~2 个特征/子表达式，SB3 也会因为 observation_space 不一致而拒绝加载。
+    resume_flag_early = os.environ.get("ALPHAGEN_RESUME", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+    force_load_feat_raw = os.environ.get("ALPHAGEN_FEATURE_LIST_LOAD", "auto").strip().lower()
+    force_load_feat = force_load_feat_raw in {"1", "true", "yes", "y", "on"}
+    auto_load_feat = force_load_feat_raw in {"auto", ""}
+    feat_list_path = Path(
+        os.environ.get("ALPHAGEN_FEATURE_LIST_PATH", str(Path("./alphagen_output") / "selected_features.json")).strip()
+        or str(Path("./alphagen_output") / "selected_features.json")
+    )
+    if (force_load_feat or (auto_load_feat and resume_flag_early)) and feat_list_path.exists():
+        try:
+            obj = json.loads(feat_list_path.read_text(encoding="utf-8"))
+            feats = obj.get("features", obj.get("feature_cols", obj.get("cols", [])))
+            if isinstance(feats, list):
+                feats = [str(x).strip() for x in feats if str(x).strip()]
+                # 只保留当前数据中存在的列，避免旧文件污染
+                feats = [c for c in feats if c in feature_space.feature_cols]
+                if "close" in feature_space.feature_cols and "close" not in feats:
+                    feats = ["close"] + feats
+                if feats:
+                    feature_space = FeatureSpace(feature_cols=feats)
+                    print(f"✓ 已从文件恢复特征列表: {feat_list_path}（n={len(feature_space.feature_cols)}）")
+        except Exception as e:
+            print(f"⚠ 读取特征列表失败（将忽略）：{feat_list_path} err={e}")
+
     features_max = int(os.environ.get("ALPHAGEN_FEATURES_MAX", "0").strip() or 0)
     prune_corr = float(os.environ.get("ALPHAGEN_FEATURES_PRUNE_CORR", "0.95").strip() or 0.95)
     if features_max > 0:
@@ -327,6 +353,31 @@ def main():
     subexprs_max = int(os.environ.get("ALPHAGEN_SUBEXPRS_MAX", "0").strip() or 0)
     if subexprs_max < 0:
         subexprs_max = 0
+
+    # resume 时同样需要固定 subexpr 映射：优先加载 alphagen_output/subexprs.json 以保证动作索引一致。
+    # 这里先读取“原始字符串列表”，真正 parse 在完成动态 FeatureType 安装之后进行（见后文）。
+    subexprs_loaded_texts = None
+    force_load_subexpr_raw = os.environ.get("ALPHAGEN_SUBEXPRS_LOAD", "auto").strip().lower()
+    force_load_subexpr = force_load_subexpr_raw in {"1", "true", "yes", "y", "on"}
+    auto_load_subexpr = force_load_subexpr_raw in {"auto", ""}
+    subexprs_path = Path(
+        os.environ.get("ALPHAGEN_SUBEXPRS_PATH", str(Path("./alphagen_output") / "subexprs.json")).strip()
+        or str(Path("./alphagen_output") / "subexprs.json")
+    )
+    if (force_load_subexpr or (auto_load_subexpr and resume_flag_early)) and subexprs_path.exists():
+        try:
+            obj = json.loads(subexprs_path.read_text(encoding="utf-8"))
+            raw = obj.get("subexprs", [])
+            if isinstance(raw, list):
+                raw = [str(x).strip() for x in raw if str(x).strip()]
+                if raw:
+                    subexprs_loaded_texts = raw
+                    # 若外部没显式指定 subexprs_max，则以文件长度为准（保证 space 一致）
+                    if int(os.environ.get("ALPHAGEN_SUBEXPRS_MAX", "0").strip() or 0) <= 0:
+                        subexprs_max = len(raw)
+                    print(f"✓ 已从文件恢复子表达式列表: {subexprs_path}（n={len(raw)}）")
+        except Exception as e:
+            print(f"⚠ 读取子表达式列表失败（将忽略）：{subexprs_path} err={e}")
     # alphagen wrapper 的 state dtype 默认是 uint8，因此 action_space 不能超过 255
     # action_space 大小约等于 len(features) + 常量/算子开销（约 42）+ subexprs
     if len(feature_space.feature_cols) + 42 + subexprs_max > 255:
@@ -1362,7 +1413,25 @@ def main():
 
     # ==================== 创建RL环境 ====================
     print("Setting up RL environment...")
-    subexprs = _build_subexpr_library(subexprs_max)
+    subexprs = None
+    if subexprs_loaded_texts:
+        # 解析文件中的 subexpr（保证动作映射与 checkpoint 一致）
+        try:
+            from alphagen.data.parser import parse_expression
+
+            parsed = []
+            for s in subexprs_loaded_texts:
+                try:
+                    parsed.append(parse_expression(s))
+                except Exception:
+                    continue
+            subexprs = parsed[: int(subexprs_max)] if int(subexprs_max) > 0 else parsed
+            print(f"✓ 子表达式库已从文件加载并解析: n={len(subexprs)}")
+        except Exception as e:
+            print(f"⚠ 解析子表达式列表失败（将回退为自动构建）：{e}")
+            subexprs = None
+    if subexprs is None:
+        subexprs = _build_subexpr_library(subexprs_max)
     if subexprs:
         try:
             out_dir = Path("./alphagen_output")
