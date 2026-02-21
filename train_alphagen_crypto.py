@@ -1466,6 +1466,21 @@ def main():
     except Exception:
         REWARD_SCALE = 1.0
 
+    # delta_best 的“延迟启用”条件（默认：pool 满后再启用；避免前期回报过稀疏导致训歪）
+    try:
+        DELTA_BEST_MIN_POOL_SIZE = int(os.environ.get("ALPHAGEN_DELTA_BEST_MIN_POOL_SIZE", "-1").strip() or -1)
+    except Exception:
+        DELTA_BEST_MIN_POOL_SIZE = -1
+    try:
+        DELTA_BEST_WARMUP_STEPS = int(os.environ.get("ALPHAGEN_DELTA_BEST_WARMUP_STEPS", "0").strip() or 0)
+    except Exception:
+        DELTA_BEST_WARMUP_STEPS = 0
+    raw_beta = os.environ.get("ALPHAGEN_DELTA_BEST_MIN_LCB_BETA", "").strip()
+    try:
+        DELTA_BEST_MIN_LCB_BETA = float(raw_beta) if raw_beta else None
+    except Exception:
+        DELTA_BEST_MIN_LCB_BETA = None
+
     # SB3 logger key 最大长度（避免截断冲突导致训练中断）
     try:
         SB3_LOGGER_MAX_LENGTH = int(os.environ.get("ALPHAGEN_SB3_LOGGER_MAX_LENGTH", "120").strip() or 120)
@@ -2086,6 +2101,9 @@ def main():
                 self._last_val_gate_ic = float("nan")
                 self._reward_mode = str(REWARD_MODE)
                 self._reward_scale = float(REWARD_SCALE)
+                self._delta_best_min_pool_size = int(DELTA_BEST_MIN_POOL_SIZE)
+                self._delta_best_warmup_steps = int(DELTA_BEST_WARMUP_STEPS)
+                self._delta_best_min_lcb_beta = DELTA_BEST_MIN_LCB_BETA
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -2094,6 +2112,31 @@ def main():
                 mode = str(getattr(self, "_reward_mode", "abs"))
                 scale = float(getattr(self, "_reward_scale", 1.0) or 1.0)
                 if mode == "delta_best":
+                    # 前期保留稠密回报，避免 delta 信号过稀疏导致训歪
+                    min_pool = int(getattr(self, "_delta_best_min_pool_size", -1))
+                    if min_pool < 0:
+                        min_pool = int(getattr(self, "capacity", 0) or 0)
+                    if int(getattr(self, "size", 0) or 0) < min_pool:
+                        r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                        r *= scale
+                        return float(r) if np.isfinite(r) else 0.0
+                    warm = int(getattr(self, "_delta_best_warmup_steps", 0) or 0)
+                    if warm > 0:
+                        step = int(getattr(self, "_current_step", 0) or 0)
+                        if step < warm:
+                            r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                            r *= scale
+                            return float(r) if np.isfinite(r) else 0.0
+                    min_beta = getattr(self, "_delta_best_min_lcb_beta", None)
+                    if min_beta is not None:
+                        try:
+                            beta = float(getattr(self, "_lcb_beta"))
+                        except Exception:
+                            beta = 0.0
+                        if beta < float(min_beta):
+                            r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                            r *= scale
+                            return float(r) if np.isfinite(r) else 0.0
                     new_best_obj = float(getattr(self, "best_obj", old_best_obj))
                     d = new_best_obj - float(old_best_obj)
                     if not np.isfinite(d) or d <= 0:
@@ -2428,6 +2471,9 @@ def main():
                 self._fast_gate_min_abs_ic = float(FAST_GATE_MIN_ABS_IC)
                 self._reward_mode = str(REWARD_MODE)
                 self._reward_scale = float(REWARD_SCALE)
+                self._delta_best_min_pool_size = int(DELTA_BEST_MIN_POOL_SIZE)
+                self._delta_best_warmup_steps = int(DELTA_BEST_WARMUP_STEPS)
+                self._delta_best_min_lcb_beta = DELTA_BEST_MIN_LCB_BETA
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -2436,6 +2482,20 @@ def main():
                 mode = str(getattr(self, "_reward_mode", "abs"))
                 scale = float(getattr(self, "_reward_scale", 1.0) or 1.0)
                 if mode == "delta_best":
+                    min_pool = int(getattr(self, "_delta_best_min_pool_size", -1))
+                    if min_pool < 0:
+                        min_pool = int(getattr(self, "capacity", 0) or 0)
+                    if int(getattr(self, "size", 0) or 0) < min_pool:
+                        r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                        r *= scale
+                        return float(r) if np.isfinite(r) else 0.0
+                    warm = int(getattr(self, "_delta_best_warmup_steps", 0) or 0)
+                    if warm > 0:
+                        step = int(getattr(self, "_current_step", 0) or 0)
+                        if step < warm:
+                            r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                            r *= scale
+                            return float(r) if np.isfinite(r) else 0.0
                     new_best_obj = float(getattr(self, "best_obj", old_best_obj))
                     d = new_best_obj - float(old_best_obj)
                     if not np.isfinite(d) or d <= 0:
