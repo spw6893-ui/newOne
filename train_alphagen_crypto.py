@@ -968,6 +968,80 @@ def main():
 
             return True
 
+    class TwoStageCommitCallback(BaseCallback):
+        """
+        两阶段训练的“低频 commit”：
+        - 从候选缓存里取 top-K
+        - 调用 full try_new_expr 真正更新 pool（mutual + optimize）
+        - 把统计写入 TensorBoard，帮助你判断是否在“提 val_ic + 稳 fps”
+        """
+
+        def __init__(self, pool_obj, buf_obj, commit_every_steps: int, topk: int, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._pool = pool_obj
+            self._buf = buf_obj
+            self._every = max(1, int(commit_every_steps))
+            self._topk = max(1, int(topk))
+            self._last_step = 0
+
+        def _on_step(self) -> bool:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._every):
+                return True
+            self._last_step = int(self.num_timesteps)
+
+            st = getattr(self._buf, "stats", None)
+            if callable(st):
+                try:
+                    s = st()
+                    self.logger.record("perf/two_stage_buffer_len", float(s.get("len", 0)))
+                    self.logger.record("perf/two_stage_buffer_dropped", float(s.get("dropped", 0)))
+                except Exception:
+                    pass
+
+            commit = getattr(self._buf, "pop_topk", None)
+            if not callable(commit):
+                return True
+
+            import time as _time
+
+            t0 = _time.perf_counter()
+            items = []
+            try:
+                items = commit(self._topk)
+            except Exception:
+                items = []
+            if not items:
+                self.logger.record("perf/two_stage_commit_tried", 0.0)
+                self.logger.record("perf/two_stage_commit_improved_best", 0.0)
+                return True
+
+            full_try = getattr(self._pool, "_two_stage_full_try", None)
+            if full_try is None:
+                # 没有 full try，就不 commit（但也不让训练挂）
+                return True
+
+            old_best_ic = float(getattr(self._pool, "best_ic_ret", 0.0))
+            tried = 0
+            improved = 0
+            for expr in items:
+                tried += 1
+                try:
+                    full_try(expr)
+                except Exception:
+                    continue
+                new_best_ic = float(getattr(self._pool, "best_ic_ret", 0.0))
+                if new_best_ic > old_best_ic + 1e-12:
+                    improved += 1
+                    old_best_ic = new_best_ic
+
+            dt = _time.perf_counter() - t0
+            self.logger.record("perf/two_stage_commit_tried", float(tried))
+            self.logger.record("perf/two_stage_commit_improved_best", float(improved))
+            self.logger.record("perf/two_stage_commit_time_s", float(dt))
+            if tried > 0:
+                self.logger.record("perf/two_stage_commit_ms_per_expr", 1000.0 * float(dt) / float(tried))
+            return True
+
     class PeriodicValTestEvalCallback(BaseCallback):
         """
         周期性在验证/测试集评估当前因子池（IC/RankIC），并写入 TensorBoard 标量。
@@ -1451,6 +1525,29 @@ def main():
     VAL_GATE_PERIODS = max(256, VAL_GATE_PERIODS)
     VAL_GATE_MIN_ABS_IC = max(0.0, VAL_GATE_MIN_ABS_IC)
 
+    # 两阶段训练（候选缓存 + 低频 full commit）：
+    # - Step 1（高吞吐）：每个 episode 只计算一个“廉价 reward”（fast/val 小样本 single-IC），并把候选表达式缓存起来；
+    # - Step 2（低频）：每隔一段 steps，把缓存中 top-K（按 val/fast reward 排序）拿去做 full-eval 并真正更新 pool。
+    # 目标：在不牺牲探索吞吐的前提下，把“昂贵的 pool.optimize”从“每轮多次”降到“很少触发”，同时更对齐 val_ic。
+    two_stage_raw = os.environ.get("ALPHAGEN_TWO_STAGE", "0").strip().lower()
+    TWO_STAGE = two_stage_raw in {"1", "true", "yes", "y", "on"}
+    TWO_STAGE_WARMUP_POOL_SIZE = int(os.environ.get("ALPHAGEN_TWO_STAGE_WARMUP_POOL_SIZE", "6").strip() or 6)
+    TWO_STAGE_WARMUP_POOL_SIZE = max(0, int(TWO_STAGE_WARMUP_POOL_SIZE))
+    TWO_STAGE_BUFFER_MAX = int(os.environ.get("ALPHAGEN_TWO_STAGE_BUFFER_MAX", "20000").strip() or 20000)
+    TWO_STAGE_BUFFER_MAX = max(100, int(TWO_STAGE_BUFFER_MAX))
+    TWO_STAGE_COMMIT_EVERY_STEPS = int(os.environ.get("ALPHAGEN_TWO_STAGE_COMMIT_EVERY_STEPS", "20000").strip() or 20000)
+    TWO_STAGE_COMMIT_EVERY_STEPS = max(2048, int(TWO_STAGE_COMMIT_EVERY_STEPS))
+    TWO_STAGE_COMMIT_TOPK = int(os.environ.get("ALPHAGEN_TWO_STAGE_COMMIT_TOPK", "40").strip() or 40)
+    TWO_STAGE_COMMIT_TOPK = max(1, int(TWO_STAGE_COMMIT_TOPK))
+    TWO_STAGE_SCORE = os.environ.get("ALPHAGEN_TWO_STAGE_SCORE", "val").strip().lower()  # val / fast / train
+    if TWO_STAGE_SCORE not in {"val", "fast", "train"}:
+        TWO_STAGE_SCORE = "val"
+    TWO_STAGE_RANK_BY_ABS = os.environ.get("ALPHAGEN_TWO_STAGE_RANK_BY_ABS", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+    TWO_STAGE_MIN_ABS_SCORE = float(os.environ.get("ALPHAGEN_TWO_STAGE_MIN_ABS_SCORE", "0.0").strip() or 0.0)
+    if not np.isfinite(TWO_STAGE_MIN_ABS_SCORE):
+        TWO_STAGE_MIN_ABS_SCORE = 0.0
+    TWO_STAGE_MIN_ABS_SCORE = float(max(0.0, TWO_STAGE_MIN_ABS_SCORE))
+
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
     print("=" * 60)
@@ -1834,6 +1931,11 @@ def main():
             pool._val_gate_stats = {"calls": 0, "skips": 0, "time_s": 0.0}  # type: ignore[attr-defined]
 
         _orig_try_new_expr = pool.__class__.try_new_expr
+        # 暴露给 TwoStageCommitCallback 使用
+        try:
+            pool._two_stage_full_try = types.MethodType(_orig_try_new_expr, pool)  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
         def _try_new_expr_gates(self, expr):  # type: ignore[no-redef]
             # 1) FastGate：训练集小样本 single-IC 粗筛（主要为了省 mutual/optimize）
@@ -1890,6 +1992,106 @@ def main():
             return _orig_try_new_expr(self, expr)
 
         pool.try_new_expr = types.MethodType(_try_new_expr_gates, pool)  # type: ignore[assignment]
+
+    # 可选：两阶段训练（候选缓存 + 低频 full commit）
+    if TWO_STAGE:
+        try:
+            import types
+
+            class _TwoStageBuffer:
+                def __init__(self, max_len: int, rank_by_abs: bool, min_abs_score: float):
+                    self.max_len = int(max_len)
+                    self.rank_by_abs = bool(rank_by_abs)
+                    self.min_abs_score = float(min_abs_score)
+                    self._items = {}  # key(str(expr)) -> (score, expr)
+                    self._dropped = 0
+
+                def add(self, expr, score: float) -> None:
+                    if not (np.isfinite(score) and (abs(float(score)) >= float(self.min_abs_score))):
+                        return
+                    k = str(expr)
+                    if k in self._items:
+                        # 保留更高分的版本（避免被低质量覆盖）
+                        old = self._items.get(k)
+                        if old is not None and abs(float(old[0])) >= abs(float(score)):
+                            return
+                    self._items[k] = (float(score), expr)
+                    # 过长时做一次粗裁剪（O(n)）
+                    if len(self._items) > int(self.max_len):
+                        self._shrink()
+
+                def _shrink(self) -> None:
+                    # 保留 top 80%
+                    keep = max(100, int(self.max_len * 0.8))
+                    items = list(self._items.values())
+                    if self.rank_by_abs:
+                        items.sort(key=lambda x: abs(float(x[0])), reverse=True)
+                    else:
+                        items.sort(key=lambda x: float(x[0]), reverse=True)
+                    kept = items[:keep]
+                    self._dropped += max(0, len(items) - len(kept))
+                    self._items = {str(e): (float(s), e) for s, e in kept}
+
+                def pop_topk(self, k: int):
+                    items = list(self._items.values())
+                    if not items:
+                        return []
+                    if self.rank_by_abs:
+                        items.sort(key=lambda x: abs(float(x[0])), reverse=True)
+                    else:
+                        items.sort(key=lambda x: float(x[0]), reverse=True)
+                    picked = items[: int(max(1, k))]
+                    # 从缓存中删除
+                    for s, e in picked:
+                        self._items.pop(str(e), None)
+                    return [e for _, e in picked]
+
+                def stats(self) -> dict:
+                    return {"len": int(len(self._items)), "dropped": int(self._dropped)}
+
+            two_buf = _TwoStageBuffer(
+                max_len=int(TWO_STAGE_BUFFER_MAX),
+                rank_by_abs=bool(TWO_STAGE_RANK_BY_ABS),
+                min_abs_score=float(TWO_STAGE_MIN_ABS_SCORE),
+            )
+
+            # 选择“廉价 reward”来源
+            def _cheap_score(expr):
+                if (TWO_STAGE_SCORE == "val") and (val_gate_calc is not None):
+                    return float(val_gate_calc.calc_single_IC_ret(expr))
+                if (TWO_STAGE_SCORE in {"val", "fast"}) and (fast_gate_calc is not None):
+                    return float(fast_gate_calc.calc_single_IC_ret(expr))
+                return float(calculator.calc_single_IC_ret(expr))
+
+            _orig_try_for_warmup = pool.try_new_expr
+
+            def _try_new_expr_two_stage(self, expr):  # type: ignore[no-redef]
+                # warmup：让 pool 先进入“可用状态”（否则全靠缓存，pool 一直不变）
+                if int(getattr(self, "size", 0)) < int(TWO_STAGE_WARMUP_POOL_SIZE):
+                    return float(_orig_try_for_warmup(expr))
+
+                # 高吞吐阶段：只算廉价 reward + 入缓存；不做 full mutual/optimize
+                try:
+                    score = float(_cheap_score(expr))
+                except Exception:
+                    score = float("nan")
+                try:
+                    two_buf.add(expr, score)
+                except Exception:
+                    pass
+                # 返回 score 作为 reward（对齐 val/fast 单因子质量）
+                return float(0.0 if (not np.isfinite(score)) else score)
+
+            pool.try_new_expr = types.MethodType(_try_new_expr_two_stage, pool)  # type: ignore[assignment]
+            pool._two_stage_buf = two_buf  # type: ignore[attr-defined]
+            print(
+                f"✓ TWO_STAGE 已启用：warmup_pool_size={TWO_STAGE_WARMUP_POOL_SIZE}, "
+                f"buffer_max={TWO_STAGE_BUFFER_MAX}, commit_every_steps={TWO_STAGE_COMMIT_EVERY_STEPS}, "
+                f"topk={TWO_STAGE_COMMIT_TOPK}, score={TWO_STAGE_SCORE}"
+            )
+        except Exception as e:
+            print(f"⚠ TWO_STAGE 初始化失败（将禁用）：{e}")
+            TWO_STAGE = False
 
     # 可选：额外性能日志（用于解释“为什么后面 fps 会掉到 80/50”）
     # 通过 monkey patch 统计 pool 关键函数耗时，再由 PoolPerfStatsCallback 写入 TensorBoard。
@@ -2133,6 +2335,21 @@ def main():
         callbacks.append(ValGateStatsCallback(pool_obj=pool, update_every=2048))
     if PERF_LOG:
         callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
+    if TWO_STAGE:
+        try:
+            buf = getattr(pool, "_two_stage_buf", None)
+            if buf is not None:
+                callbacks.append(
+                    TwoStageCommitCallback(
+                        pool_obj=pool,
+                        buf_obj=buf,
+                        commit_every_steps=int(TWO_STAGE_COMMIT_EVERY_STEPS),
+                        topk=int(TWO_STAGE_COMMIT_TOPK),
+                        verbose=0,
+                    )
+                )
+        except Exception:
+            pass
     if ckpt_every_steps > 0:
         callbacks.append(
             PeriodicCheckpointCallback(
