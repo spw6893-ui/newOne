@@ -1458,7 +1458,7 @@ def main():
     # - abs：保持历史行为（返回 new_obj）
     # - delta_best：返回 best_obj 的边际增量（<=0 记为 0；信号更稀疏但更对齐）
     REWARD_MODE = os.environ.get("ALPHAGEN_REWARD_MODE", "abs").strip().lower()
-    if REWARD_MODE not in {"abs", "delta_best"}:
+    if REWARD_MODE not in {"abs", "delta_best", "delta_obj"}:
         print(f"⚠ 未知 ALPHAGEN_REWARD_MODE={REWARD_MODE}（将回退到 abs）")
         REWARD_MODE = "abs"
     try:
@@ -1480,6 +1480,14 @@ def main():
         DELTA_BEST_MIN_LCB_BETA = float(raw_beta) if raw_beta else None
     except Exception:
         DELTA_BEST_MIN_LCB_BETA = None
+
+    # Lazy 模式超容量淘汰策略：
+    # - weight：按 |weight| 最小淘汰（更接近 LinearAlphaPool 的“边际贡献小则踢出”直觉）
+    # - single_ic：按 |single_ic| 最小淘汰（旧行为；更快但更容易留下冗余、导致平台期）
+    LAZY_REMOVE_BY = os.environ.get("ALPHAGEN_POOL_LAZY_REMOVE_BY", "weight").strip().lower()
+    if LAZY_REMOVE_BY not in {"weight", "single_ic"}:
+        print(f"⚠ 未知 ALPHAGEN_POOL_LAZY_REMOVE_BY={LAZY_REMOVE_BY}（将回退到 weight）")
+        LAZY_REMOVE_BY = "weight"
 
     # SB3 logger key 最大长度（避免截断冲突导致训练中断）
     try:
@@ -2101,9 +2109,11 @@ def main():
                 self._last_val_gate_ic = float("nan")
                 self._reward_mode = str(REWARD_MODE)
                 self._reward_scale = float(REWARD_SCALE)
+                self._reward_prev_obj: Optional[float] = None
                 self._delta_best_min_pool_size = int(DELTA_BEST_MIN_POOL_SIZE)
                 self._delta_best_warmup_steps = int(DELTA_BEST_WARMUP_STEPS)
                 self._delta_best_min_lcb_beta = DELTA_BEST_MIN_LCB_BETA
+                self._lazy_remove_by = str(LAZY_REMOVE_BY)
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -2111,20 +2121,30 @@ def main():
             def _shape_reward(self, old_best_obj: float, out_obj: float) -> float:
                 mode = str(getattr(self, "_reward_mode", "abs"))
                 scale = float(getattr(self, "_reward_scale", 1.0) or 1.0)
+                base_obj = float(out_obj) if np.isfinite(out_obj) else 0.0
+                if mode == "delta_obj":
+                    prev = getattr(self, "_reward_prev_obj", None)
+                    if prev is None or (not np.isfinite(prev)):
+                        setattr(self, "_reward_prev_obj", float(base_obj))
+                        return 0.0
+                    d = float(base_obj) - float(prev)
+                    setattr(self, "_reward_prev_obj", float(base_obj))
+                    r = d * scale
+                    return float(r) if np.isfinite(r) else 0.0
                 if mode == "delta_best":
                     # 前期保留稠密回报，避免 delta 信号过稀疏导致训歪
                     min_pool = int(getattr(self, "_delta_best_min_pool_size", -1))
                     if min_pool < 0:
                         min_pool = int(getattr(self, "capacity", 0) or 0)
                     if int(getattr(self, "size", 0) or 0) < min_pool:
-                        r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                        r = float(base_obj)
                         r *= scale
                         return float(r) if np.isfinite(r) else 0.0
                     warm = int(getattr(self, "_delta_best_warmup_steps", 0) or 0)
                     if warm > 0:
                         step = int(getattr(self, "_current_step", 0) or 0)
                         if step < warm:
-                            r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                            r = float(base_obj)
                             r *= scale
                             return float(r) if np.isfinite(r) else 0.0
                     min_beta = getattr(self, "_delta_best_min_lcb_beta", None)
@@ -2134,7 +2154,7 @@ def main():
                         except Exception:
                             beta = 0.0
                         if beta < float(min_beta):
-                            r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                            r = float(base_obj)
                             r *= scale
                             return float(r) if np.isfinite(r) else 0.0
                     new_best_obj = float(getattr(self, "best_obj", old_best_obj))
@@ -2143,7 +2163,7 @@ def main():
                         return 0.0
                     r = d
                 else:
-                    r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                    r = float(base_obj)
                 r *= scale
                 if not np.isfinite(r):
                     return 0.0
@@ -2174,7 +2194,16 @@ def main():
 
                 worst_idx = None
                 if self.size > self.capacity:
-                    worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
+                    remove_by = str(getattr(self, "_lazy_remove_by", "weight"))
+                    if remove_by == "single_ic":
+                        worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
+                    else:
+                        # 更接近 LinearAlphaPool：按 |weight| 最小淘汰
+                        try:
+                            w = np.asarray(self.weights, dtype=np.float64)
+                            worst_idx = self._safe_abs_min_idx(w[: self.size])
+                        except Exception:
+                            worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
                     if worst_idx == self.capacity:
                         self._pop(worst_idx)
                         self._failure_cache.add(str(expr))
@@ -2471,9 +2500,11 @@ def main():
                 self._fast_gate_min_abs_ic = float(FAST_GATE_MIN_ABS_IC)
                 self._reward_mode = str(REWARD_MODE)
                 self._reward_scale = float(REWARD_SCALE)
+                self._reward_prev_obj: Optional[float] = None
                 self._delta_best_min_pool_size = int(DELTA_BEST_MIN_POOL_SIZE)
                 self._delta_best_warmup_steps = int(DELTA_BEST_WARMUP_STEPS)
                 self._delta_best_min_lcb_beta = DELTA_BEST_MIN_LCB_BETA
+                self._lazy_remove_by = str(LAZY_REMOVE_BY)
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -2481,19 +2512,29 @@ def main():
             def _shape_reward(self, old_best_obj: float, out_obj: float) -> float:
                 mode = str(getattr(self, "_reward_mode", "abs"))
                 scale = float(getattr(self, "_reward_scale", 1.0) or 1.0)
+                base_obj = float(out_obj) if np.isfinite(out_obj) else 0.0
+                if mode == "delta_obj":
+                    prev = getattr(self, "_reward_prev_obj", None)
+                    if prev is None or (not np.isfinite(prev)):
+                        setattr(self, "_reward_prev_obj", float(base_obj))
+                        return 0.0
+                    d = float(base_obj) - float(prev)
+                    setattr(self, "_reward_prev_obj", float(base_obj))
+                    r = d * scale
+                    return float(r) if np.isfinite(r) else 0.0
                 if mode == "delta_best":
                     min_pool = int(getattr(self, "_delta_best_min_pool_size", -1))
                     if min_pool < 0:
                         min_pool = int(getattr(self, "capacity", 0) or 0)
                     if int(getattr(self, "size", 0) or 0) < min_pool:
-                        r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                        r = float(base_obj)
                         r *= scale
                         return float(r) if np.isfinite(r) else 0.0
                     warm = int(getattr(self, "_delta_best_warmup_steps", 0) or 0)
                     if warm > 0:
                         step = int(getattr(self, "_current_step", 0) or 0)
                         if step < warm:
-                            r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                            r = float(base_obj)
                             r *= scale
                             return float(r) if np.isfinite(r) else 0.0
                     new_best_obj = float(getattr(self, "best_obj", old_best_obj))
@@ -2502,7 +2543,7 @@ def main():
                         return 0.0
                     r = d
                 else:
-                    r = float(out_obj) if np.isfinite(out_obj) else 0.0
+                    r = float(base_obj)
                 r *= scale
                 if not np.isfinite(r):
                     return 0.0
@@ -2527,7 +2568,15 @@ def main():
 
                 worst_idx = None
                 if self.size > self.capacity:
-                    worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
+                    remove_by = str(getattr(self, "_lazy_remove_by", "weight"))
+                    if remove_by == "single_ic":
+                        worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
+                    else:
+                        try:
+                            w = np.asarray(self.weights, dtype=np.float64)
+                            worst_idx = self._safe_abs_min_idx(w[: self.size])
+                        except Exception:
+                            worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
                     if worst_idx == self.capacity:
                         self._pop(worst_idx)
                         self._failure_cache.add(str(expr))

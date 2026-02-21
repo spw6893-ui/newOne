@@ -307,7 +307,8 @@ case "$PRESET" in
         # 开启性能打点（写入 TensorBoard：perf/*），用于定位 fps 衰减根因
         export_default ALPHAGEN_PERF_LOG 1
         # 可选：更对齐的回报信号（平台期推荐尝试）
-        #   ALPHAGEN_REWARD_MODE=delta_best  # 只在 best_obj 提升时给正回报（更稀疏但更“有效”）
+        #   ALPHAGEN_REWARD_MODE=delta_obj   # 回报=本次 obj - 上次 obj（更稠密，适合长期爬升）
+        #   ALPHAGEN_REWARD_MODE=delta_best  # 回报=best_obj 的边际增量（更稀疏；建议配合延迟启用）
         # 可选：SB3 logger key 截断冲突保护（如遇 ValueError: truncated key already exists）
         #   ALPHAGEN_SB3_LOGGER_MAX_LENGTH=120
         # 启用截面算子（CSRank/CSZScore）会改变 action_space，因此不兼容旧模型 resume。
