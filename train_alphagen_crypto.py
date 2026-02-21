@@ -281,6 +281,7 @@ def main():
     # 特征：默认把 alphagen_ready 里的"全部因子列"都扔进 AlphaGen（FeatureType 动态构造）
     # 可选：用训练集的单变量 IC 做预筛选，从而缩小 action space（更容易探索/更快收敛）
     feature_space = _detect_feature_space(Path(DATA_DIR))
+    feature_list_loaded = False
 
     # 重要：为保证 resume 时 action_space 完全一致，优先从上一次输出的 selected_features.json 恢复特征列表。
     # 否则哪怕只差 1~2 个特征/子表达式，SB3 也会因为 observation_space 不一致而拒绝加载。
@@ -304,13 +305,15 @@ def main():
                     feats = ["close"] + feats
                 if feats:
                     feature_space = FeatureSpace(feature_cols=feats)
+                    feature_list_loaded = True
                     print(f"✓ 已从文件恢复特征列表: {feat_list_path}（n={len(feature_space.feature_cols)}）")
         except Exception as e:
             print(f"⚠ 读取特征列表失败（将忽略）：{feat_list_path} err={e}")
 
     features_max = int(os.environ.get("ALPHAGEN_FEATURES_MAX", "0").strip() or 0)
     prune_corr = float(os.environ.get("ALPHAGEN_FEATURES_PRUNE_CORR", "0.95").strip() or 0.95)
-    if features_max > 0:
+    # 如果已经从文件恢复特征列表，则跳过 IC 预筛选（否则会破坏 resume 的 action_space 一致性）
+    if (not feature_list_loaded) and features_max > 0:
         # 先用“全特征”构造 FeatureType，加载一次数据做打分，然后再用筛选后的特征重建 FeatureType。
         _install_dynamic_feature_type(feature_space.feature_cols)
         from AlphaQCM.alphagen_qlib.crypto_data import CryptoData
@@ -372,9 +375,20 @@ def main():
                 raw = [str(x).strip() for x in raw if str(x).strip()]
                 if raw:
                     subexprs_loaded_texts = raw
-                    # 若外部没显式指定 subexprs_max，则以文件长度为准（保证 space 一致）
-                    if int(os.environ.get("ALPHAGEN_SUBEXPRS_MAX", "0").strip() or 0) <= 0:
+                    # resume 时必须保证动作空间一致：优先使用文件长度
+                    env_subexprs_max = int(os.environ.get("ALPHAGEN_SUBEXPRS_MAX", "0").strip() or 0)
+                    if resume_flag_early:
+                        if env_subexprs_max > 0 and env_subexprs_max != len(raw):
+                            print(
+                                f"⚠ 检测到 resume + 子表达式数量不一致："
+                                f"ALPHAGEN_SUBEXPRS_MAX={env_subexprs_max} vs file={len(raw)}，"
+                                f"将强制使用 file={len(raw)} 以保证空间一致。"
+                            )
                         subexprs_max = len(raw)
+                    else:
+                        # 非 resume：若外部没显式指定 subexprs_max，则以文件长度为准
+                        if env_subexprs_max <= 0:
+                            subexprs_max = len(raw)
                     print(f"✓ 已从文件恢复子表达式列表: {subexprs_path}（n={len(raw)}）")
         except Exception as e:
             print(f"⚠ 读取子表达式列表失败（将忽略）：{subexprs_path} err={e}")
@@ -585,12 +599,23 @@ def main():
         - 同步保存 `alpha_pool_step_{step}.json`，便于同时恢复 pool（否则 reward 会非平稳）。
         """
 
-        def __init__(self, output_dir: Path, pool_obj, every_steps: int, keep_last: int = 3, verbose: int = 0):
+        def __init__(
+            self,
+            output_dir: Path,
+            pool_obj,
+            every_steps: int,
+            keep_last: int = 3,
+            feature_cols: Optional[List[str]] = None,
+            subexpr_texts: Optional[List[str]] = None,
+            verbose: int = 0,
+        ):
             super().__init__(verbose=verbose)
             self._output_dir = Path(output_dir)
             self._pool = pool_obj
             self._every = max(1, int(every_steps))
             self._keep = max(1, int(keep_last))
+            self._feature_cols = list(feature_cols) if feature_cols else None
+            self._subexpr_texts = list(subexpr_texts) if subexpr_texts else None
             self._ckpt_dir = self._output_dir / "checkpoints"
             self._ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -637,6 +662,11 @@ def main():
             try:
                 self.model.save(str(model_base))
                 _dump_json(pool_fp, self._pool.to_json_dict())
+                # 同步保存 feature/subexpr 快照，便于未来严格 resume（避免 144 vs 142 这种空间不一致）
+                if self._feature_cols is not None:
+                    _dump_json(self._ckpt_dir / f"features_step_{step}.json", {"features": self._feature_cols})
+                if self._subexpr_texts is not None:
+                    _dump_json(self._ckpt_dir / f"subexprs_step_{step}.json", {"subexprs": self._subexpr_texts})
                 self.logger.record("checkpoint/last_step", float(step))
             except Exception:
                 # checkpoint 失败不应中断训练
@@ -1513,6 +1543,8 @@ def main():
                 pool_obj=pool,
                 every_steps=ckpt_every_steps,
                 keep_last=ckpt_keep_last,
+                feature_cols=list(feature_space.feature_cols),
+                subexpr_texts=[str(e) for e in subexprs] if subexprs else None,
                 verbose=0,
             )
         )
