@@ -920,6 +920,8 @@ def main():
     MIN_EXPR_LEN_SCHEDULE_STEPS = max(1, MIN_EXPR_LEN_SCHEDULE_STEPS)
     stack_guard_raw = os.environ.get("ALPHAGEN_STACK_GUARD", "1").strip().lower()
     STACK_GUARD = stack_guard_raw in {"1", "true", "yes", "y", "on"}
+    force_sep_raw = os.environ.get("ALPHAGEN_FORCE_SEP_WHEN_VALID", "0").strip().lower()
+    FORCE_SEP_WHEN_VALID = force_sep_raw in {"1", "true", "yes", "y", "on"}
 
     # 性能控制：pool 权重优化上限（MseAlphaPool 的 Adam 优化默认 max_steps=10000 很重）
     # 仅对 POOL_TYPE=mse 生效；MeanStdAlphaPool 有自己的一套优化。
@@ -966,6 +968,7 @@ def main():
     elif MIN_EXPR_LEN > 1:
         print(f"Min expr len: {MIN_EXPR_LEN}（将延迟允许 SEP，减少评估次数以提速）")
     print(f"Stack guard: {'ON' if STACK_GUARD else 'OFF'}（避免栈过深导致最终表达式无效 => reward=-1）")
+    print(f"Force SEP when valid: {'ON' if FORCE_SEP_WHEN_VALID else 'OFF'}（一旦表达式有效，强制下一步只能 SEP，避免越生成越无效）")
     print(f"Pool optimize: lr={POOL_OPT_LR}, max_steps={POOL_OPT_MAX_STEPS}, tol={POOL_OPT_TOLERANCE}")
     print(f"PPO: n_steps={N_STEPS}, batch_size={BATCH_SIZE}, n_epochs={N_EPOCHS}")
     print(f"Features (dynamic): {len(feature_space.feature_cols)}")
@@ -1179,6 +1182,18 @@ def main():
                 min_len = int(min_expr_len_holder.get("value", 1))
                 if (len(tokens) - 1) < min_len:
                     ret["select"][4] = False  # SEP
+                else:
+                    # 关键：很多 -1/15 冷启动来自“表达式在中途一度有效，但策略继续堆 token，
+                    # 直到 MAX_EXPR_LENGTH 结束时又变无效”。这里提供可选的“强制收敛”：
+                    # 一旦表达式已经有效，就强制下一步只能 SEP，让学习信号不再稀疏。
+                    if FORCE_SEP_WHEN_VALID and bool(ret["select"][4]):
+                        # 只保留 SEP，禁用所有其它动作类型
+                        ret["select"][0] = False
+                        ret["select"][1] = False
+                        ret["select"][2] = False
+                        ret["select"][3] = False
+                        for k in list(ret.get("op", {}).keys()):
+                            ret["op"][k] = False
 
                 # Stack guard：当栈太深且剩余 token 太少时，禁止继续 push（特征/常量/dt/子表达式），
                 # 强制策略优先选择 Operator 来“收栈”，避免最终长度到顶时表达式无效 => reward=-1。

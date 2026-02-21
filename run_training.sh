@@ -288,6 +288,8 @@ case "$PRESET" in
         export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 10000
 
         export_default ALPHAGEN_STACK_GUARD 1
+        # 冷启动稳定性：表达式一旦有效就强制下一步只能 SEP，避免“中途有效但继续堆 token 导致最终无效(-1/15)”
+        export_default ALPHAGEN_FORCE_SEP_WHEN_VALID 1
         export_default ALPHAGEN_MIN_EXPR_LEN_START 1
         export_default ALPHAGEN_MIN_EXPR_LEN_END 10
         export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
