@@ -525,6 +525,74 @@ def main():
             self.logger.record("cache/alpha_cache_hit_rate", hit_rate)
             return True
 
+    class PeriodicCheckpointCallback(BaseCallback):
+        """
+        周期性保存 checkpoint（模型 + alpha_pool），用于中断后恢复训练。
+
+        注意：
+        - SB3 的 `model.save(path)` 会自动添加 `.zip` 后缀。
+        - 同步保存 `alpha_pool_step_{step}.json`，便于同时恢复 pool（否则 reward 会非平稳）。
+        """
+
+        def __init__(self, output_dir: Path, pool_obj, every_steps: int, keep_last: int = 3, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._output_dir = Path(output_dir)
+            self._pool = pool_obj
+            self._every = max(1, int(every_steps))
+            self._keep = max(1, int(keep_last))
+            self._ckpt_dir = self._output_dir / "checkpoints"
+            self._ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        @staticmethod
+        def _parse_step_from_name(name: str) -> Optional[int]:
+            # model_step_12345.zip / alpha_pool_step_12345.json
+            for prefix in ("model_step_", "alpha_pool_step_"):
+                if name.startswith(prefix):
+                    s = name[len(prefix):]
+                    s = s.split(".", 1)[0]
+                    try:
+                        return int(s)
+                    except Exception:
+                        return None
+            return None
+
+        def _gc(self) -> None:
+            items = []
+            for fp in self._ckpt_dir.glob("model_step_*.zip"):
+                step = self._parse_step_from_name(fp.name)
+                if step is not None:
+                    items.append((step, fp))
+            items.sort(key=lambda x: x[0])
+            if len(items) <= self._keep:
+                return
+            to_delete = items[:-self._keep]
+            for step, model_fp in to_delete:
+                try:
+                    model_fp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                pool_fp = self._ckpt_dir / f"alpha_pool_step_{step}.json"
+                try:
+                    pool_fp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self._every) != 0:
+                return True
+            step = int(self.num_timesteps)
+            model_base = self._ckpt_dir / f"model_step_{step}"
+            pool_fp = self._ckpt_dir / f"alpha_pool_step_{step}.json"
+            try:
+                self.model.save(str(model_base))
+                _dump_json(pool_fp, self._pool.to_json_dict())
+                self.logger.record("checkpoint/last_step", float(step))
+            except Exception:
+                # checkpoint 失败不应中断训练
+                return True
+            self._gc()
+            return True
+
     class FastGateStatsCallback(BaseCallback):
         """
         把 FastGate 的粗筛统计写入 TensorBoard，便于判断：
@@ -935,6 +1003,12 @@ def main():
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
 
+    # 周期性保存 checkpoint（默认关闭，>0 开启）
+    ckpt_every_steps = int(os.environ.get("ALPHAGEN_CHECKPOINT_EVERY_STEPS", "0").strip() or 0)
+    ckpt_keep_last = int(os.environ.get("ALPHAGEN_CHECKPOINT_KEEP", "3").strip() or 3)
+    ckpt_every_steps = max(0, ckpt_every_steps)
+    ckpt_keep_last = max(1, ckpt_keep_last)
+
     # 近似评估（FastGate）：pool 已满时先用“小样本数据”估计 single-IC，
     # 不达标则跳过完整评估（节省 mutual IC 与 pool optimize 的开销）。
     #
@@ -970,6 +1044,8 @@ def main():
     print(f"Stack guard: {'ON' if STACK_GUARD else 'OFF'}（避免栈过深导致最终表达式无效 => reward=-1）")
     print(f"Force SEP when valid: {'ON' if FORCE_SEP_WHEN_VALID else 'OFF'}（一旦表达式有效，强制下一步只能 SEP，避免越生成越无效）")
     print(f"Pool optimize: lr={POOL_OPT_LR}, max_steps={POOL_OPT_MAX_STEPS}, tol={POOL_OPT_TOLERANCE}")
+    if ckpt_every_steps > 0:
+        print(f"Checkpoint: every {ckpt_every_steps} steps, keep_last={ckpt_keep_last}")
     print(f"PPO: n_steps={N_STEPS}, batch_size={BATCH_SIZE}, n_epochs={N_EPOCHS}")
     print(f"Features (dynamic): {len(feature_space.feature_cols)}")
     print()
@@ -1131,6 +1207,71 @@ def main():
             device=device_obj,
         )
 
+    # 可选：恢复历史 alpha_pool（重要：ALPHAGEN_RESUME 默认只恢复 PPO 模型，不会恢复 pool）
+    # 用法示例：
+    #   ALPHAGEN_POOL_RESUME=1 \
+    #   ALPHAGEN_POOL_RESUME_PATH=alphagen_output/alpha_pool.json \
+    #   ALPHAGEN_POOL_RESUME_WEIGHTS=1 \
+    #   ./run_training.sh ...
+    pool_resume_raw = os.environ.get("ALPHAGEN_POOL_RESUME", "0").strip().lower()
+    POOL_RESUME = pool_resume_raw in {"1", "true", "yes", "y", "on"}
+    pool_resume_path = Path(
+        os.environ.get("ALPHAGEN_POOL_RESUME_PATH", str(OUTPUT_DIR / "alpha_pool.json")).strip()
+        or str(OUTPUT_DIR / "alpha_pool.json")
+    )
+    pool_resume_weights_raw = os.environ.get("ALPHAGEN_POOL_RESUME_WEIGHTS", "1").strip().lower()
+    POOL_RESUME_WEIGHTS = pool_resume_weights_raw in {"1", "true", "yes", "y", "on"}
+    if POOL_RESUME and pool_resume_path.exists():
+        try:
+            from alphagen.data.parser import parse_expression
+
+            obj = json.loads(pool_resume_path.read_text(encoding="utf-8"))
+            raw_exprs = obj.get("exprs", [])
+            raw_weights = obj.get("weights", None)
+            expr_pairs = []
+            if isinstance(raw_exprs, list):
+                if isinstance(raw_weights, list) and POOL_RESUME_WEIGHTS:
+                    for s, w in zip(raw_exprs, raw_weights):
+                        expr_pairs.append((s, w))
+                else:
+                    for s in raw_exprs:
+                        expr_pairs.append((s, None))
+
+            parsed_exprs = []
+            parsed_weights = []
+            for s, w in expr_pairs:
+                if not isinstance(s, str) or not s.strip():
+                    continue
+                try:
+                    e = parse_expression(s.strip())
+                except Exception:
+                    continue
+                parsed_exprs.append(e)
+                if w is not None:
+                    try:
+                        parsed_weights.append(float(w))
+                    except Exception:
+                        parsed_weights.append(0.0)
+
+            # force_load_exprs 会重新计算 mutual IC 等信息；
+            # 为了确保能完整恢复，不让 ic_lower_bound 影响加载，加载时临时关闭阈值。
+            if parsed_exprs:
+                orig_lb = getattr(pool, "_ic_lower_bound", None)
+                try:
+                    if orig_lb is not None:
+                        setattr(pool, "_ic_lower_bound", -1.0)
+                    if parsed_weights and len(parsed_weights) == len(parsed_exprs):
+                        pool.force_load_exprs(parsed_exprs, weights=parsed_weights)
+                        print(f"✓ 恢复 alpha_pool（含 weights）: {pool_resume_path}（loaded={pool.size}）")
+                    else:
+                        pool.force_load_exprs(parsed_exprs, weights=None)
+                        print(f"✓ 恢复 alpha_pool（重算 weights）: {pool_resume_path}（loaded={pool.size}）")
+                finally:
+                    if orig_lb is not None:
+                        setattr(pool, "_ic_lower_bound", orig_lb)
+        except Exception as e:
+            print(f"⚠ alpha_pool 恢复失败（将忽略）：{e}")
+
     # 可选：FastGate（近似 single-IC 粗筛）
     # 说明：返回 0.0 表示“这次不值得做完整评估”，不改变 pool 状态。
     if fast_gate_calc is not None:
@@ -1250,7 +1391,8 @@ def main():
 
     resume_flag = os.environ.get("ALPHAGEN_RESUME", "0").strip() in {"1", "true", "yes", "y"}
     resume_path = os.environ.get("ALPHAGEN_RESUME_PATH", str(OUTPUT_DIR / "model_final.zip")).strip()
-    if resume_flag and Path(resume_path).exists():
+    resumed = bool(resume_flag and Path(resume_path).exists())
+    if resumed:
         print(f"Resuming PPO model from: {resume_path}")
         model = MaskablePPO.load(
             resume_path,
@@ -1295,6 +1437,16 @@ def main():
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
     if fast_gate_calc is not None:
         callbacks.append(FastGateStatsCallback(pool_obj=pool, update_every=2048))
+    if ckpt_every_steps > 0:
+        callbacks.append(
+            PeriodicCheckpointCallback(
+                output_dir=OUTPUT_DIR,
+                pool_obj=pool,
+                every_steps=ckpt_every_steps,
+                keep_last=ckpt_keep_last,
+                verbose=0,
+            )
+        )
     # 动态最小长度（可选）：帮助解决“后期越跑越慢（评估过频）”以及“冷启动全 -1（表达式无效）”
     if (MIN_EXPR_LEN_START != MIN_EXPR_LEN_END) or (MIN_EXPR_LEN_START > 1):
         callbacks.append(
@@ -1343,9 +1495,11 @@ def main():
         )
     callback = CallbackList(callbacks) if len(callbacks) > 1 else callbacks[0]
 
+    # resume 时不要重置 timesteps（否则各种 schedule/eval 会从 0 重新计数，造成“看起来像新跑”）
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
-        callback=callback
+        callback=callback,
+        reset_num_timesteps=(not resumed),
     )
 
     # ==================== 保存结果 ====================
