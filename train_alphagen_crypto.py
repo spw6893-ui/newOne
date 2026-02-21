@@ -286,13 +286,28 @@ def main():
     # 重要：为保证 resume 时 action_space 完全一致，优先从上一次输出的 selected_features.json 恢复特征列表。
     # 否则哪怕只差 1~2 个特征/子表达式，SB3 也会因为 observation_space 不一致而拒绝加载。
     resume_flag_early = os.environ.get("ALPHAGEN_RESUME", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+    resume_path_early = os.environ.get("ALPHAGEN_RESUME_PATH", "").strip()
+    resume_step_early = None
+    if resume_flag_early and resume_path_early:
+        # 兼容：model_step_12345.zip 或 .../model_step_12345.zip
+        name = Path(resume_path_early).name
+        if name.startswith("model_step_") and name.endswith(".zip"):
+            s = name[len("model_step_") : -len(".zip")]
+            try:
+                resume_step_early = int(s)
+            except Exception:
+                resume_step_early = None
+
     force_load_feat_raw = os.environ.get("ALPHAGEN_FEATURE_LIST_LOAD", "auto").strip().lower()
     force_load_feat = force_load_feat_raw in {"1", "true", "yes", "y", "on"}
     auto_load_feat = force_load_feat_raw in {"auto", ""}
-    feat_list_path = Path(
-        os.environ.get("ALPHAGEN_FEATURE_LIST_PATH", str(Path("./alphagen_output") / "selected_features.json")).strip()
-        or str(Path("./alphagen_output") / "selected_features.json")
-    )
+    default_feat_path = Path("./alphagen_output") / "selected_features.json"
+    # 优先：如果 resume 且当前 checkpoint 目录下存在 features_step_{step}.json，则用它确保严格一致
+    if resume_step_early is not None:
+        cand = Path("./alphagen_output") / "checkpoints" / f"features_step_{resume_step_early}.json"
+        if cand.exists():
+            default_feat_path = cand
+    feat_list_path = Path(os.environ.get("ALPHAGEN_FEATURE_LIST_PATH", str(default_feat_path)).strip() or str(default_feat_path))
     if (force_load_feat or (auto_load_feat and resume_flag_early)) and feat_list_path.exists():
         try:
             obj = json.loads(feat_list_path.read_text(encoding="utf-8"))
@@ -363,10 +378,12 @@ def main():
     force_load_subexpr_raw = os.environ.get("ALPHAGEN_SUBEXPRS_LOAD", "auto").strip().lower()
     force_load_subexpr = force_load_subexpr_raw in {"1", "true", "yes", "y", "on"}
     auto_load_subexpr = force_load_subexpr_raw in {"auto", ""}
-    subexprs_path = Path(
-        os.environ.get("ALPHAGEN_SUBEXPRS_PATH", str(Path("./alphagen_output") / "subexprs.json")).strip()
-        or str(Path("./alphagen_output") / "subexprs.json")
-    )
+    default_subexprs_path = Path("./alphagen_output") / "subexprs.json"
+    if resume_step_early is not None:
+        cand = Path("./alphagen_output") / "checkpoints" / f"subexprs_step_{resume_step_early}.json"
+        if cand.exists():
+            default_subexprs_path = cand
+    subexprs_path = Path(os.environ.get("ALPHAGEN_SUBEXPRS_PATH", str(default_subexprs_path)).strip() or str(default_subexprs_path))
     if (force_load_subexpr or (auto_load_subexpr and resume_flag_early)) and subexprs_path.exists():
         try:
             obj = json.loads(subexprs_path.read_text(encoding="utf-8"))
@@ -652,6 +669,15 @@ def main():
                     pool_fp.unlink(missing_ok=True)
                 except Exception:
                     pass
+                # 附属快照一起清理（避免目录混杂导致误用）
+                for extra in (
+                    self._ckpt_dir / f"features_step_{step}.json",
+                    self._ckpt_dir / f"subexprs_step_{step}.json",
+                ):
+                    try:
+                        extra.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
         def _on_step(self) -> bool:
             if (self.num_timesteps % self._every) != 0:
