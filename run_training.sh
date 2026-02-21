@@ -366,7 +366,8 @@ case "$PRESET" in
         export_default ALPHAGEN_FAST_GATE_MIN_ABS_IC 0.003
         # 周期评估（更频繁便于观测曲线；如需更快可外部覆盖成 100000/200000）
         export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
-        export_default ALPHAGEN_EVAL_TEST 0
+        # 默认也评估 test（需要时可外部覆盖为 0，提升速度/降低内存压力）
+        export_default ALPHAGEN_EVAL_TEST 1
         ;;
     *)
         echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast / explore20_ucblcb_cs）"

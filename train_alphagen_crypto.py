@@ -893,6 +893,7 @@ def main():
             test_calculator_obj,
             eval_every_steps: int,
             eval_test: bool,
+            print_on_test_error: bool = False,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
@@ -901,6 +902,7 @@ def main():
             self._test_calc = test_calculator_obj
             self._every = max(1, int(eval_every_steps))
             self._eval_test = bool(eval_test)
+            self._print_on_test_error = bool(print_on_test_error)
 
         @staticmethod
         def _get_target_tensor(calc_obj):
@@ -997,8 +999,13 @@ def main():
                         self.logger.record("eval/test_ic_std", float(t["ic_std"]))
                     if "turnover" in t:
                         self.logger.record("eval/test_turnover", float(t["turnover"]))
+                    # 便于 TensorBoard 里判断“test 评估是否真的跑了”
+                    self.logger.record("eval/test_eval_failed", 0.0)
                 except Exception as e:
-                    if self.verbose:
+                    # 重要：test 评估若一直失败，旧实现会导致完全没有 eval/test_* tags，
+                    # 用户容易误判为“ALPHAGEN_EVAL_TEST 没生效”。这里显式记录失败标记。
+                    self.logger.record("eval/test_eval_failed", 1.0)
+                    if self.verbose or self._print_on_test_error:
                         print(f"⚠ Test 评估失败：{e}")
 
             return True
@@ -1591,6 +1598,13 @@ def main():
     # 周期性评估（默认关闭，>0 开启）
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
+    eval_test_print_err = os.environ.get("ALPHAGEN_EVAL_TEST_PRINT_ERROR", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
 
     # 近似评估（Fast Gate）：在 pool 已满时，先用“更小的训练子集”计算 single-IC，
     # 不达标则跳过完整评估（节省大量 mutual IC / optimize 的开销）。
@@ -2584,6 +2598,7 @@ def main():
                 test_calculator_obj=test_calculator_periodic,
                 eval_every_steps=eval_every_steps,
                 eval_test=eval_test_flag,
+                print_on_test_error=bool(eval_test_print_err),
                 verbose=0,
             )
         )
