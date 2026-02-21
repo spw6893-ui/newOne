@@ -1237,16 +1237,36 @@ def main():
             old_best_ic = float(getattr(self._pool, "best_ic_ret", 0.0))
             tried = 0
             improved = 0
-            for expr in selected:
-                tried += 1
+            # commit 阶段可选：用更小 optimize 预算，避免一次 commit 把 fps 拖垮
+            old_ms = getattr(self._pool, "_opt_max_steps_override", 0)
+            old_tol = getattr(self._pool, "_opt_tolerance_override", 0)
+            if int(POOL_OPT_MAX_STEPS_COMMIT) > 0:
                 try:
-                    full_try(expr)
+                    setattr(self._pool, "_opt_max_steps_override", int(POOL_OPT_MAX_STEPS_COMMIT))
                 except Exception:
-                    continue
-                new_best_ic = float(getattr(self._pool, "best_ic_ret", 0.0))
-                if new_best_ic > old_best_ic + 1e-12:
-                    improved += 1
-                    old_best_ic = new_best_ic
+                    pass
+            if int(POOL_OPT_TOLERANCE_COMMIT) > 0:
+                try:
+                    setattr(self._pool, "_opt_tolerance_override", int(POOL_OPT_TOLERANCE_COMMIT))
+                except Exception:
+                    pass
+            try:
+                for expr in selected:
+                    tried += 1
+                    try:
+                        full_try(expr)
+                    except Exception:
+                        continue
+                    new_best_ic = float(getattr(self._pool, "best_ic_ret", 0.0))
+                    if new_best_ic > old_best_ic + 1e-12:
+                        improved += 1
+                        old_best_ic = new_best_ic
+            finally:
+                try:
+                    setattr(self._pool, "_opt_max_steps_override", old_ms)
+                    setattr(self._pool, "_opt_tolerance_override", old_tol)
+                except Exception:
+                    pass
 
             dt = _time.perf_counter() - t0
             self.logger.record("perf/two_stage_commit_tried", float(tried))
