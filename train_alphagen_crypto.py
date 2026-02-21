@@ -1276,10 +1276,12 @@ def main():
             self.logger.record("perf/two_stage_commit_skip_in_pool", float(skip_in_pool))
             self.logger.record("perf/two_stage_commit_skip_train_ic", float(skip_train_ic))
             if base_list:
-                self.logger.record("perf/two_stage_commit_selected_mean_base", float(sum(base_list) / len(base_list)))
+                # 关键：SB3 控制台输出会对 key 做截断，长前缀容易发生“截断后重名”并直接抛异常终止训练。
+                # 因此这里用更短且明显区分的 key，避免与 max_mutual 那个冲突。
+                self.logger.record("perf/ts_commit_sel_base_mean", float(sum(base_list) / len(base_list)))
             if max_mutual_list:
                 self.logger.record(
-                    "perf/two_stage_commit_selected_mean_max_mutual",
+                    "perf/ts_commit_sel_max_mutual_mean",
                     float(sum(max_mutual_list) / len(max_mutual_list)),
                 )
             if tried > 0:
