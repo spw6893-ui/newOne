@@ -976,12 +976,31 @@ def main():
         - 把统计写入 TensorBoard，帮助你判断是否在“提 val_ic + 稳 fps”
         """
 
-        def __init__(self, pool_obj, buf_obj, commit_every_steps: int, topk: int, verbose: int = 0):
+        def __init__(
+            self,
+            pool_obj,
+            buf_obj,
+            commit_every_steps: int,
+            topk: int,
+            prefilter_mult: int,
+            diversity_lambda: float,
+            diversity_topm: int,
+            diversity_calc_obj,
+            train_calc_obj,
+            commit_disable_lb: bool,
+            verbose: int = 0,
+        ):
             super().__init__(verbose=verbose)
             self._pool = pool_obj
             self._buf = buf_obj
             self._every = max(1, int(commit_every_steps))
             self._topk = max(1, int(topk))
+            self._prefilter_mult = max(1, int(prefilter_mult))
+            self._div_lambda = float(max(0.0, float(diversity_lambda)))
+            self._div_topm = max(0, int(diversity_topm))
+            self._div_calc = diversity_calc_obj
+            self._train_calc = train_calc_obj
+            self._commit_disable_lb = bool(commit_disable_lb)
             self._last_step = 0
 
         def _on_step(self) -> bool:
@@ -998,19 +1017,21 @@ def main():
                 except Exception:
                     pass
 
-            commit = getattr(self._buf, "pop_topk", None)
-            if not callable(commit):
+            peek = getattr(self._buf, "peek_topn", None)
+            pop_sel = getattr(self._buf, "pop_selected", None)
+            if not callable(peek):
                 return True
 
             import time as _time
 
             t0 = _time.perf_counter()
-            items = []
+            # 1) 先从 buffer 取一个更大的候选集合（避免 topK 全是相似表达式）
+            cand_n = int(self._topk) * int(self._prefilter_mult)
             try:
-                items = commit(self._topk)
+                cands = peek(cand_n) if callable(peek) else []  # list[(base_score, expr)]
             except Exception:
-                items = []
-            if not items:
+                cands = []
+            if not cands:
                 self.logger.record("perf/two_stage_commit_tried", 0.0)
                 self.logger.record("perf/two_stage_commit_improved_best", 0.0)
                 return True
@@ -1020,10 +1041,123 @@ def main():
                 # 没有 full try，就不 commit（但也不让训练挂）
                 return True
 
+            # 2) 构建 pool 参考集合（按权重绝对值取 topM）
+            ref_exprs = []
+            ref_set = set()
+            try:
+                size = int(getattr(self._pool, "size", 0))
+                if size > 0:
+                    weights = list(getattr(self._pool, "weights"))
+                    idx = list(range(size))
+                    idx.sort(key=lambda i: abs(float(weights[i])), reverse=True)
+                    for i in idx[: max(0, int(self._div_topm))]:
+                        e = getattr(self._pool, "exprs")[i]
+                        if e is None:
+                            continue
+                        ref_exprs.append(e)
+                        ref_set.add(str(e))
+            except Exception:
+                ref_exprs = []
+                ref_set = set()
+
+            # 3) 为每个候选算“边际贡献近似分数”
+            # score = base_score - lambda * max_mutual_with_topM
+            # 其中 mutual 用较小数据（优先 fast_gate_calc）计算，显著提速且足够用于去相似。
+            selected = []
+            scored = []
+            skip_in_pool = 0
+            skip_train_ic = 0
+            max_mutual_list = []
+            base_list = []
+
+            # commit 时临时放宽 lb（避免 “ic_lower_bound 太高导致全被 _calc_ics 拒绝，optimize_calls=0”）
+            orig_lb = getattr(self._pool, "_ic_lower_bound", None)
+            if self._commit_disable_lb and (orig_lb is not None):
+                try:
+                    setattr(self._pool, "_ic_lower_bound", -1.0)
+                except Exception:
+                    pass
+
+            try:
+                pool_expr_set = set()
+                try:
+                    size = int(getattr(self._pool, "size", 0))
+                    for i in range(size):
+                        e = getattr(self._pool, "exprs")[i]
+                        if e is not None:
+                            pool_expr_set.add(str(e))
+                except Exception:
+                    pool_expr_set = set()
+
+                for base_score, expr in cands:
+                    k = str(expr)
+                    if k in pool_expr_set:
+                        skip_in_pool += 1
+                        continue
+                    # 基分（按 abs 或原值）
+                    try:
+                        b = abs(float(base_score)) if bool(TWO_STAGE_RANK_BY_ABS) else float(base_score)
+                    except Exception:
+                        continue
+                    if not np.isfinite(b):
+                        continue
+
+                    # train 侧最低质量：用 train small-sample single-IC 粗筛（避免 full_try 全被 lb 拒绝）
+                    train_ic = None
+                    try:
+                        if self._train_calc is not None:
+                            train_ic = float(self._train_calc.calc_single_IC_ret(expr))
+                    except Exception:
+                        train_ic = None
+                    if train_ic is not None:
+                        lb0 = None
+                        try:
+                            if orig_lb is not None:
+                                lb0 = float(orig_lb)
+                        except Exception:
+                            lb0 = None
+                        if lb0 is not None and lb0 > 0:
+                            if not (np.isfinite(train_ic) and abs(float(train_ic)) >= float(lb0) * 0.8):
+                                skip_train_ic += 1
+                                continue
+
+                    mm = 0.0
+                    if ref_exprs and (self._div_calc is not None) and (self._div_lambda > 0):
+                        try:
+                            # 只惩罚正相关（负相关可能有利于组合）
+                            for re in ref_exprs:
+                                m = float(self._div_calc.calc_mutual_IC(expr, re))
+                                if np.isfinite(m) and (m > mm):
+                                    mm = float(m)
+                        except Exception:
+                            mm = 0.0
+
+                    score = float(b) - float(self._div_lambda) * float(mm)
+                    scored.append((score, b, mm, expr))
+
+                scored.sort(key=lambda x: float(x[0]), reverse=True)
+                picked = scored[: int(self._topk)]
+                selected = [x[3] for x in picked]
+                base_list = [float(x[1]) for x in picked]
+                max_mutual_list = [float(x[2]) for x in picked]
+            finally:
+                if self._commit_disable_lb and (orig_lb is not None):
+                    try:
+                        setattr(self._pool, "_ic_lower_bound", orig_lb)
+                    except Exception:
+                        pass
+
+            # 从 buffer 移除选中的 expr（避免反复 commit 同一批）
+            if callable(pop_sel) and selected:
+                try:
+                    pop_sel(selected)
+                except Exception:
+                    pass
+
             old_best_ic = float(getattr(self._pool, "best_ic_ret", 0.0))
             tried = 0
             improved = 0
-            for expr in items:
+            for expr in selected:
                 tried += 1
                 try:
                     full_try(expr)
@@ -1038,6 +1172,16 @@ def main():
             self.logger.record("perf/two_stage_commit_tried", float(tried))
             self.logger.record("perf/two_stage_commit_improved_best", float(improved))
             self.logger.record("perf/two_stage_commit_time_s", float(dt))
+            self.logger.record("perf/two_stage_commit_cand_n", float(cand_n))
+            self.logger.record("perf/two_stage_commit_skip_in_pool", float(skip_in_pool))
+            self.logger.record("perf/two_stage_commit_skip_train_ic", float(skip_train_ic))
+            if base_list:
+                self.logger.record("perf/two_stage_commit_selected_mean_base", float(sum(base_list) / len(base_list)))
+            if max_mutual_list:
+                self.logger.record(
+                    "perf/two_stage_commit_selected_mean_max_mutual",
+                    float(sum(max_mutual_list) / len(max_mutual_list)),
+                )
             if tried > 0:
                 self.logger.record("perf/two_stage_commit_ms_per_expr", 1000.0 * float(dt) / float(tried))
             return True
@@ -1539,6 +1683,8 @@ def main():
     TWO_STAGE_COMMIT_EVERY_STEPS = max(2048, int(TWO_STAGE_COMMIT_EVERY_STEPS))
     TWO_STAGE_COMMIT_TOPK = int(os.environ.get("ALPHAGEN_TWO_STAGE_COMMIT_TOPK", "40").strip() or 40)
     TWO_STAGE_COMMIT_TOPK = max(1, int(TWO_STAGE_COMMIT_TOPK))
+    TWO_STAGE_COMMIT_PREFILTER_MULT = int(os.environ.get("ALPHAGEN_TWO_STAGE_COMMIT_PREFILTER_MULT", "10").strip() or 10)
+    TWO_STAGE_COMMIT_PREFILTER_MULT = max(1, int(TWO_STAGE_COMMIT_PREFILTER_MULT))
     TWO_STAGE_SCORE = os.environ.get("ALPHAGEN_TWO_STAGE_SCORE", "val").strip().lower()  # val / fast / train
     if TWO_STAGE_SCORE not in {"val", "fast", "train"}:
         TWO_STAGE_SCORE = "val"
@@ -1547,6 +1693,14 @@ def main():
     if not np.isfinite(TWO_STAGE_MIN_ABS_SCORE):
         TWO_STAGE_MIN_ABS_SCORE = 0.0
     TWO_STAGE_MIN_ABS_SCORE = float(max(0.0, TWO_STAGE_MIN_ABS_SCORE))
+    TWO_STAGE_DIVERSITY_LAMBDA = float(os.environ.get("ALPHAGEN_TWO_STAGE_DIVERSITY_LAMBDA", "0.2").strip() or 0.2)
+    TWO_STAGE_DIVERSITY_TOPM = int(os.environ.get("ALPHAGEN_TWO_STAGE_DIVERSITY_TOPM", "8").strip() or 8)
+    if not np.isfinite(TWO_STAGE_DIVERSITY_LAMBDA):
+        TWO_STAGE_DIVERSITY_LAMBDA = 0.2
+    TWO_STAGE_DIVERSITY_LAMBDA = float(max(0.0, TWO_STAGE_DIVERSITY_LAMBDA))
+    TWO_STAGE_DIVERSITY_TOPM = max(0, int(TWO_STAGE_DIVERSITY_TOPM))
+    two_stage_disable_lb_raw = os.environ.get("ALPHAGEN_TWO_STAGE_COMMIT_DISABLE_LB", "1").strip().lower()
+    TWO_STAGE_COMMIT_DISABLE_LB = two_stage_disable_lb_raw in {"1", "true", "yes", "y", "on"}
 
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
@@ -2046,6 +2200,26 @@ def main():
                         self._items.pop(str(e), None)
                     return [e for _, e in picked]
 
+                def peek_topn(self, n: int):
+                    items = list(self._items.values())
+                    if not items:
+                        return []
+                    if self.rank_by_abs:
+                        items.sort(key=lambda x: abs(float(x[0])), reverse=True)
+                    else:
+                        items.sort(key=lambda x: float(x[0]), reverse=True)
+                    picked = items[: int(max(1, n))]
+                    return [(float(s), e) for s, e in picked]
+
+                def pop_selected(self, exprs):
+                    if not exprs:
+                        return
+                    for e in exprs:
+                        try:
+                            self._items.pop(str(e), None)
+                        except Exception:
+                            continue
+
                 def stats(self) -> dict:
                     return {"len": int(len(self._items)), "dropped": int(self._dropped)}
 
@@ -2345,6 +2519,12 @@ def main():
                         buf_obj=buf,
                         commit_every_steps=int(TWO_STAGE_COMMIT_EVERY_STEPS),
                         topk=int(TWO_STAGE_COMMIT_TOPK),
+                        prefilter_mult=int(TWO_STAGE_COMMIT_PREFILTER_MULT),
+                        diversity_lambda=float(TWO_STAGE_DIVERSITY_LAMBDA),
+                        diversity_topm=int(TWO_STAGE_DIVERSITY_TOPM),
+                        diversity_calc_obj=(fast_gate_calc if fast_gate_calc is not None else calculator),
+                        train_calc_obj=(fast_gate_calc if fast_gate_calc is not None else calculator),
+                        commit_disable_lb=bool(TWO_STAGE_COMMIT_DISABLE_LB),
                         verbose=0,
                     )
                 )
