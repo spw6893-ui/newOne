@@ -1218,6 +1218,54 @@ def main():
             self._last = beta
             return True
 
+    class MutualIcThresholdScheduleCallback(BaseCallback):
+        """
+        动态 mutual IC 阈值（越小越严格）：
+        - 早期更宽松：更容易把 pool 填起来
+        - 后期更严格：增强多样性，缓解 best_ic_ret/val_ic 平台期
+        """
+
+        def __init__(
+            self,
+            pool,
+            start_thr: float,
+            end_thr: float,
+            update_every: int,
+            schedule_steps: int,
+            warmup_steps: int = 0,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self.pool = pool
+            self.start_thr = float(start_thr)
+            self.end_thr = float(end_thr)
+            self.update_every = max(256, int(update_every))
+            self.schedule_steps = max(1, int(schedule_steps))
+            self.warmup_steps = max(0, int(warmup_steps))
+            self._last: Optional[float] = None
+
+        def _compute_thr(self) -> float:
+            if self.num_timesteps <= self.warmup_steps:
+                frac = 0.0
+            else:
+                frac = min(1.0, float(self.num_timesteps - self.warmup_steps) / float(self.schedule_steps))
+            v = self.start_thr + frac * (self.end_thr - self.start_thr)
+            if not np.isfinite(v):
+                v = self.start_thr
+            return float(max(0.0, min(0.9999, v)))
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self.update_every) != 0:
+                return True
+            thr = float(self._compute_thr())
+            try:
+                setattr(self.pool, "_mutual_ic_threshold", thr)
+            except Exception:
+                pass
+            self.logger.record("pool/mutual_ic_threshold", thr)
+            self._last = thr
+            return True
+
     class MinExprLenScheduleCallback(BaseCallback):
         """
         动态最小表达式长度（MIN_EXPR_LEN）：
@@ -1465,6 +1513,19 @@ def main():
     IC_LOWER_BOUND_ABS = ic_lb_abs_raw in {"1", "true", "yes", "y", "on"}
     # mutual IC 阈值：越大越“宽松”（更不容易因为相似被拒），但会让 mutual 计算更常走完（略慢）
     MUTUAL_IC_THRESHOLD = float(os.environ.get("ALPHAGEN_MUTUAL_IC_THRESHOLD", "0.99").strip() or 0.99)
+    # 可选：mutual 阈值课程（早期宽松，后期收紧以增强多样性与泛化）
+    mutual_thr_start = float(os.environ.get("ALPHAGEN_MUTUAL_IC_THRESHOLD_START", str(MUTUAL_IC_THRESHOLD)).strip() or MUTUAL_IC_THRESHOLD)
+    mutual_thr_end = float(os.environ.get("ALPHAGEN_MUTUAL_IC_THRESHOLD_END", str(MUTUAL_IC_THRESHOLD)).strip() or MUTUAL_IC_THRESHOLD)
+    mutual_thr_update_every = int(os.environ.get("ALPHAGEN_MUTUAL_IC_THRESHOLD_UPDATE_EVERY", "20000").strip() or 20000)
+    mutual_thr_schedule_steps = int(
+        os.environ.get("ALPHAGEN_MUTUAL_IC_THRESHOLD_SCHEDULE_STEPS", str(TOTAL_TIMESTEPS)).strip() or TOTAL_TIMESTEPS
+    )
+    mutual_thr_warmup_steps = int(os.environ.get("ALPHAGEN_MUTUAL_IC_THRESHOLD_WARMUP_STEPS", "0").strip() or 0)
+    mutual_thr_update_every = max(256, int(mutual_thr_update_every))
+    mutual_thr_schedule_steps = max(1, int(mutual_thr_schedule_steps))
+    mutual_thr_warmup_steps = max(0, int(mutual_thr_warmup_steps))
+    mutual_thr_start = float(max(0.0, min(0.9999, mutual_thr_start)))
+    mutual_thr_end = float(max(0.0, min(0.9999, mutual_thr_end)))
     L1_ALPHA = float(os.environ.get("ALPHAGEN_POOL_L1_ALPHA", "0.005"))
     POOL_TYPE = os.environ.get("ALPHAGEN_POOL_TYPE", "mse").strip().lower()  # mse / meanstd
     pool_lcb_beta_raw = os.environ.get("ALPHAGEN_POOL_LCB_BETA", "none").strip().lower()
@@ -1531,6 +1592,11 @@ def main():
                 "ic_lower_bound_warmup_steps": int(ic_lb_warmup_steps),
                 "ic_lower_bound_abs": bool(IC_LOWER_BOUND_ABS),
                 "mutual_ic_threshold": float(MUTUAL_IC_THRESHOLD),
+                "mutual_ic_threshold_start": float(mutual_thr_start),
+                "mutual_ic_threshold_end": float(mutual_thr_end),
+                "mutual_ic_threshold_update_every": int(mutual_thr_update_every),
+                "mutual_ic_threshold_schedule_steps": int(mutual_thr_schedule_steps),
+                "mutual_ic_threshold_warmup_steps": int(mutual_thr_warmup_steps),
                 "lcb_beta": POOL_LCB_BETA,
                 "lcb_beta_start": POOL_LCB_BETA_START,
                 "lcb_beta_end": POOL_LCB_BETA_END,
@@ -1984,7 +2050,7 @@ def main():
 
             def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
                 # 使用 env 配置的 mutual 阈值（覆盖 super().try_new_expr 传入的默认值 0.99）
-                ic_mut_threshold = float(MUTUAL_IC_THRESHOLD)
+                ic_mut_threshold = float(getattr(self, "_mutual_ic_threshold", MUTUAL_IC_THRESHOLD))
                 if not getattr(self, "_perf_enabled", False):
                     try:
                         single_ic = float(self.calculator.calc_single_IC_ret(expr))
@@ -2661,6 +2727,19 @@ def main():
                     verbose=0,
                 )
             )
+    # mutual IC 阈值课程：用来增强后期多样性，缓解平台期
+    if float(mutual_thr_start) != float(mutual_thr_end):
+        callbacks.append(
+            MutualIcThresholdScheduleCallback(
+                pool=pool,
+                start_thr=float(mutual_thr_start),
+                end_thr=float(mutual_thr_end),
+                update_every=int(mutual_thr_update_every),
+                schedule_steps=int(mutual_thr_schedule_steps),
+                warmup_steps=int(mutual_thr_warmup_steps),
+                verbose=0,
+            )
+        )
     if ic_lb_start != ic_lb_end:
         callbacks.append(
             IcLowerBoundScheduleCallback(
