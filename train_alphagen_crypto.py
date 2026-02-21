@@ -767,6 +767,45 @@ def main():
             self._last = {"calls": calls, "skips": skips, "time_s": time_s}
             return True
 
+    class ValGateStatsCallback(BaseCallback):
+        """
+        把 ValGate（验证集小样本门控）的统计写入 TensorBoard，便于判断：
+        - 是否真的减少了昂贵的 full-eval / optimize
+        - 阈值是否过严（skips 过多会导致学习信号变稀疏）
+        """
+
+        def __init__(self, pool_obj, update_every: int = 2048, verbose: int = 0):
+            super().__init__(verbose=verbose)
+            self._pool = pool_obj
+            self._update_every = max(1, int(update_every))
+            self._last_step = 0
+            self._last = {"calls": 0, "skips": 0, "time_s": 0.0}
+
+        def _on_step(self) -> bool:
+            if (int(self.num_timesteps) - int(self._last_step)) < int(self._update_every):
+                return True
+            self._last_step = int(self.num_timesteps)
+            st = getattr(self._pool, "_val_gate_stats", None)
+            if not isinstance(st, dict):
+                return True
+            calls = int(st.get("calls", 0))
+            skips = int(st.get("skips", 0))
+            time_s = float(st.get("time_s", 0.0))
+
+            dc = calls - int(self._last.get("calls", 0))
+            ds = skips - int(self._last.get("skips", 0))
+            dt = time_s - float(self._last.get("time_s", 0.0))
+
+            self.logger.record("perf/val_gate_calls", float(dc))
+            self.logger.record("perf/val_gate_skips", float(ds))
+            self.logger.record("perf/val_gate_time_s", float(dt))
+            if dc > 0:
+                self.logger.record("perf/val_gate_ms_per_call", 1000.0 * float(dt) / float(dc))
+                self.logger.record("perf/val_gate_skip_rate", float(ds) / float(dc))
+
+            self._last = {"calls": calls, "skips": skips, "time_s": time_s}
+            return True
+
     class FastGateThresholdScheduleCallback(BaseCallback):
         """
         动态调整 FastGate 的粗筛阈值（min_abs_ic）：
@@ -1387,6 +1426,19 @@ def main():
     FAST_GATE_AUTOTUNE_MIN_THR = float(max(0.0, FAST_GATE_AUTOTUNE_MIN_THR))
     FAST_GATE_AUTOTUNE_MAX_THR = float(max(FAST_GATE_AUTOTUNE_MIN_THR, FAST_GATE_AUTOTUNE_MAX_THR))
 
+    # 近似评估（ValGate）：用“验证集小样本 single-IC”做二次门控，目标是提升 OOS（val）质量，
+    # 同时减少会触发昂贵 pool.optimize 的候选数量（帮助稳定 fps）。
+    val_gate_raw = os.environ.get("ALPHAGEN_VAL_GATE", "0").strip().lower()
+    VAL_GATE = val_gate_raw in {"1", "true", "yes", "y", "on"}
+    val_gate_only_full_raw = os.environ.get("ALPHAGEN_VAL_GATE_ONLY_WHEN_FULL", "1").strip().lower()
+    VAL_GATE_ONLY_WHEN_FULL = val_gate_only_full_raw in {"1", "true", "yes", "y", "on"}
+    VAL_GATE_SYMBOLS = int(os.environ.get("ALPHAGEN_VAL_GATE_SYMBOLS", "20").strip() or 20)
+    VAL_GATE_PERIODS = int(os.environ.get("ALPHAGEN_VAL_GATE_PERIODS", "4000").strip() or 4000)
+    VAL_GATE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_VAL_GATE_MIN_ABS_IC", "0.0").strip() or 0.0)
+    VAL_GATE_SYMBOLS = max(4, VAL_GATE_SYMBOLS)
+    VAL_GATE_PERIODS = max(256, VAL_GATE_PERIODS)
+    VAL_GATE_MIN_ABS_IC = max(0.0, VAL_GATE_MIN_ABS_IC)
+
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
     print("=" * 60)
@@ -1532,6 +1584,68 @@ def main():
         else:
             val_calculator_periodic = QLibStockDataCalculator(val_data_periodic, target)
             test_calculator_periodic = QLibStockDataCalculator(test_data_periodic, target)
+
+    # 可选：ValGate（验证集小样本 single-IC 门控）
+    val_gate_calc = None
+    if VAL_GATE:
+        try:
+            # 复用 periodic val_data（如果有），避免额外加载
+            base_val_data = None
+            if eval_every_steps > 0:
+                base_val_data = val_data_periodic  # type: ignore[name-defined]
+            else:
+                base_val_data = CryptoData(
+                    symbols=SYMBOLS,
+                    start_time=TRAIN_END,
+                    end_time=VAL_END,
+                    timeframe="1h",
+                    data_dir=DATA_DIR,
+                    max_backtrack_periods=100,
+                    max_future_periods=30,
+                    features=None,
+                    device=device_obj,
+                )
+
+            class _StockDataView:
+                def __init__(self, base, data_tensor: torch.Tensor):
+                    self.data = data_tensor
+                    self.max_backtrack_days = int(getattr(base, "max_backtrack_days"))
+                    self.max_future_days = int(getattr(base, "max_future_days"))
+
+                @property
+                def n_features(self) -> int:
+                    return int(self.data.shape[1])
+
+                @property
+                def n_stocks(self) -> int:
+                    return int(self.data.shape[2])
+
+                @property
+                def n_days(self) -> int:
+                    return int(self.data.shape[0] - self.max_backtrack_days - self.max_future_days)
+
+            total_symbols = int(getattr(base_val_data, "n_stocks", 0))
+            take_symbols = min(int(VAL_GATE_SYMBOLS), max(1, total_symbols))
+            rng = np.random.default_rng(SEED + 7)
+            idx = np.array(sorted(rng.choice(total_symbols, size=take_symbols, replace=False).tolist()), dtype=np.int64)
+
+            base_tensor = base_val_data.data
+            need_len = int(VAL_GATE_PERIODS + base_val_data.max_backtrack_days + base_val_data.max_future_days + 1)
+            start = max(0, int(base_tensor.shape[0]) - need_len)
+            val_tensor = base_tensor[start:, :, :].index_select(2, torch.tensor(idx, device=base_tensor.device))
+            val_view = _StockDataView(base_val_data, val_tensor)
+
+            if POOL_TYPE == "meanstd":
+                val_gate_calc = TensorQLibStockDataCalculator(val_view, target)
+            else:
+                val_gate_calc = QLibStockDataCalculator(val_view, target)
+            print(
+                f"✓ ValGate 已启用：symbols={take_symbols}/{total_symbols}, periods≈{VAL_GATE_PERIODS}, "
+                f"min_abs_ic={VAL_GATE_MIN_ABS_IC}, only_when_full={VAL_GATE_ONLY_WHEN_FULL}"
+            )
+        except Exception as e:
+            print(f"⚠ ValGate 初始化失败（将禁用）：{e}")
+            val_gate_calc = None
 
     # ==================== 创建Alpha Pool ====================
     # 如果启用动态阈值，初始化用 start（避免刚开始就被“后期阈值”卡死）
@@ -1696,47 +1810,74 @@ def main():
         except Exception as e:
             print(f"⚠ alpha_pool 恢复失败（将忽略）：{e}")
 
-    # 可选：FastGate（近似 single-IC 粗筛）
+    # 可选：FastGate/ValGate（近似 single-IC 粗筛）
     # 说明：返回 0.0 表示“这次不值得做完整评估”，不改变 pool 状态。
-    if fast_gate_calc is not None:
+    if (fast_gate_calc is not None) or (val_gate_calc is not None):
         import types
         import time as _time
 
-        pool._fast_gate_stats = {"calls": 0, "skips": 0, "time_s": 0.0}  # type: ignore[attr-defined]
+        if fast_gate_calc is not None:
+            pool._fast_gate_stats = {"calls": 0, "skips": 0, "time_s": 0.0}  # type: ignore[attr-defined]
+        if val_gate_calc is not None:
+            pool._val_gate_stats = {"calls": 0, "skips": 0, "time_s": 0.0}  # type: ignore[attr-defined]
 
         _orig_try_new_expr = pool.__class__.try_new_expr
 
-        def _try_new_expr_fast_gate(self, expr):  # type: ignore[no-redef]
-            only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
-            if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
-                t0g = _time.perf_counter()
-                try:
-                    ic_fast = float(fast_gate_calc.calc_single_IC_ret(expr))
-                except Exception:
-                    ic_fast = float("nan")
-                dtg = _time.perf_counter() - t0g
-
-                st = getattr(self, "_fast_gate_stats", None)
-                if isinstance(st, dict):
-                    st["calls"] = int(st.get("calls", 0)) + 1
-                    st["time_s"] = float(st.get("time_s", 0.0)) + float(dtg)
-
-                thr = float(fast_gate_thr_holder.get("value", FAST_GATE_MIN_ABS_IC))
-                if FAST_GATE_THR_LB_RATIO > 0:
+        def _try_new_expr_gates(self, expr):  # type: ignore[no-redef]
+            # 1) FastGate：训练集小样本 single-IC 粗筛（主要为了省 mutual/optimize）
+            if fast_gate_calc is not None:
+                only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
+                if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                    t0g = _time.perf_counter()
                     try:
-                        lb = getattr(self, "_ic_lower_bound", None)
-                        if lb is not None:
-                            thr = max(thr, float(FAST_GATE_THR_LB_RATIO) * float(lb))
+                        ic_fast = float(fast_gate_calc.calc_single_IC_ret(expr))
                     except Exception:
-                        pass
-                if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
+                        ic_fast = float("nan")
+                    dtg = _time.perf_counter() - t0g
+
+                    st = getattr(self, "_fast_gate_stats", None)
                     if isinstance(st, dict):
-                        st["skips"] = int(st.get("skips", 0)) + 1
-                    return 0.0
+                        st["calls"] = int(st.get("calls", 0)) + 1
+                        st["time_s"] = float(st.get("time_s", 0.0)) + float(dtg)
+
+                    thr = float(fast_gate_thr_holder.get("value", FAST_GATE_MIN_ABS_IC))
+                    if FAST_GATE_THR_LB_RATIO > 0:
+                        try:
+                            lb = getattr(self, "_ic_lower_bound", None)
+                            if lb is not None:
+                                thr = max(thr, float(FAST_GATE_THR_LB_RATIO) * float(lb))
+                        except Exception:
+                            pass
+                    if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
+                        if isinstance(st, dict):
+                            st["skips"] = int(st.get("skips", 0)) + 1
+                        return 0.0
+
+            # 2) ValGate：验证集小样本 single-IC 二次筛（对齐 val_ic）
+            if val_gate_calc is not None:
+                only_full = bool(VAL_GATE_ONLY_WHEN_FULL)
+                if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                    t0v = _time.perf_counter()
+                    try:
+                        ic_val = float(val_gate_calc.calc_single_IC_ret(expr))
+                    except Exception:
+                        ic_val = float("nan")
+                    dtv = _time.perf_counter() - t0v
+
+                    st = getattr(self, "_val_gate_stats", None)
+                    if isinstance(st, dict):
+                        st["calls"] = int(st.get("calls", 0)) + 1
+                        st["time_s"] = float(st.get("time_s", 0.0)) + float(dtv)
+
+                    thr = float(VAL_GATE_MIN_ABS_IC)
+                    if not (np.isfinite(ic_val) and (abs(ic_val) >= thr)):
+                        if isinstance(st, dict):
+                            st["skips"] = int(st.get("skips", 0)) + 1
+                        return 0.0
 
             return _orig_try_new_expr(self, expr)
 
-        pool.try_new_expr = types.MethodType(_try_new_expr_fast_gate, pool)  # type: ignore[assignment]
+        pool.try_new_expr = types.MethodType(_try_new_expr_gates, pool)  # type: ignore[assignment]
 
     # 可选：额外性能日志（用于解释“为什么后面 fps 会掉到 80/50”）
     # 通过 monkey patch 统计 pool 关键函数耗时，再由 PoolPerfStatsCallback 写入 TensorBoard。
@@ -1976,6 +2117,8 @@ def main():
                     verbose=0,
                 )
             )
+    if val_gate_calc is not None:
+        callbacks.append(ValGateStatsCallback(pool_obj=pool, update_every=2048))
     if PERF_LOG:
         callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
     if ckpt_every_steps > 0:
