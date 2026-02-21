@@ -278,6 +278,132 @@ def _dump_json_atomic(path: Path, obj: dict) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     tmp.replace(path)
 
+
+def _infer_resume_step(resume_path: Path, ckpt_dir: Path) -> Optional[int]:
+    """
+    推断 resume 的 step（用于对齐 features/subexprs 快照，避免 observation_space mismatch）。
+    优先级：
+    1) 文件名包含 model_step_{step}.zip
+    2) checkpoints/latest.json 里的 step
+    """
+    try:
+        m = re.search(r"model_step_(\\d+)\\.zip$", str(resume_path.name))
+        if m:
+            step = int(m.group(1))
+            if step > 0:
+                return step
+    except Exception:
+        pass
+
+    try:
+        latest = ckpt_dir / "latest.json"
+        if latest.exists():
+            obj = json.loads(latest.read_text(encoding="utf-8"))
+            step = int(obj.get("step", 0) or 0)
+            if step > 0:
+                return step
+    except Exception:
+        pass
+
+    return None
+
+
+def _pick_latest_step_snapshot_leq(ckpt_dir: Path, prefix: str, step: int) -> Optional[Path]:
+    """
+    从 ckpt_dir 下选择 `prefix_{n}.json` 中 n<=step 的最近一份快照。
+
+    例：
+      - prefix=features_step, step=420000 -> features_step_400000.json（若 420000 不存在）
+    """
+    try:
+        ckpt_dir = Path(ckpt_dir)
+        if not ckpt_dir.exists():
+            return None
+        step = int(step)
+        if step <= 0:
+            return None
+    except Exception:
+        return None
+
+    best: Optional[tuple[int, Path]] = None
+    pat = re.compile(rf"^{re.escape(prefix)}_(\\d+)\\.json$")
+    for fp in ckpt_dir.glob(f"{prefix}_*.json"):
+        m = pat.match(fp.name)
+        if not m:
+            continue
+        try:
+            s = int(m.group(1))
+        except Exception:
+            continue
+        if s <= step and (best is None or s > best[0]):
+            best = (s, fp)
+    return best[1] if best else None
+
+
+def _load_resume_feature_cols(output_dir: Path, ckpt_dir: Path, resume_step: Optional[int]) -> Optional[List[str]]:
+    """
+    尝试加载“训练时实际使用的特征列顺序”，用于 resume 时保持 observation/action space 一致。
+    """
+    # 1) checkpoints/features_step_{<=step}.json
+    if resume_step is not None and resume_step > 0:
+        fp = _pick_latest_step_snapshot_leq(ckpt_dir, "features_step", int(resume_step))
+        if fp and fp.exists():
+            try:
+                obj = json.loads(fp.read_text(encoding="utf-8"))
+                feats = obj.get("features", obj.get("feature_cols", []))
+                feats = [str(x).strip() for x in (feats or []) if str(x).strip()]
+                if feats:
+                    return feats
+            except Exception:
+                pass
+
+    # 2) alphagen_output/selected_features.json（特征预筛选输出）
+    fp2 = output_dir / "selected_features.json"
+    if fp2.exists():
+        try:
+            obj = json.loads(fp2.read_text(encoding="utf-8"))
+            feats = obj.get("features", obj.get("feature_cols", []))
+            feats = [str(x).strip() for x in (feats or []) if str(x).strip()]
+            if feats:
+                return feats
+        except Exception:
+            pass
+
+    return None
+
+
+def _load_resume_subexpr_strs(output_dir: Path, ckpt_dir: Path, resume_step: Optional[int]) -> Optional[List[str]]:
+    """
+    尝试加载“训练时实际使用的子表达式库”（字符串形式），用于 resume 时保持 action space 一致。
+    """
+    # 1) checkpoints/subexprs_step_{<=step}.json
+    if resume_step is not None and resume_step > 0:
+        fp = _pick_latest_step_snapshot_leq(ckpt_dir, "subexprs_step", int(resume_step))
+        if fp and fp.exists():
+            try:
+                obj = json.loads(fp.read_text(encoding="utf-8"))
+                subs = obj.get("subexprs", [])
+                subs = [str(x).strip() for x in (subs or []) if str(x).strip()]
+                if subs:
+                    return subs
+            except Exception:
+                pass
+
+    # 2) alphagen_output/subexprs.json（当前 run 自动生成的库）
+    fp2 = output_dir / "subexprs.json"
+    if fp2.exists():
+        try:
+            obj = json.loads(fp2.read_text(encoding="utf-8"))
+            subs = obj.get("subexprs", [])
+            subs = [str(x).strip() for x in (subs or []) if str(x).strip()]
+            if subs:
+                return subs
+        except Exception:
+            pass
+
+    return None
+
+
 def main():
     # ==================== 配置参数 ====================
 
@@ -294,10 +420,34 @@ def main():
 
     # 特征：默认把 alphagen_ready 里的"全部因子列"都扔进 AlphaGen（FeatureType 动态构造）
     # 可选：用训练集的单变量 IC 做预筛选，从而缩小 action space（更容易探索/更快收敛）
+    output_dir = Path("./alphagen_output")
+    ckpt_dir_for_resume = Path(os.environ.get("ALPHAGEN_CHECKPOINT_DIR", str(output_dir / "checkpoints")).strip() or str(output_dir / "checkpoints"))
+
+    resume_flag_raw = os.environ.get("ALPHAGEN_RESUME", "0").strip().lower()
+    RESUME_FLAG = resume_flag_raw in {"1", "true", "yes", "y", "on"}
+    resume_path = Path(os.environ.get("ALPHAGEN_RESUME_PATH", str(output_dir / "model_final.zip")).strip() or str(output_dir / "model_final.zip"))
+    resume_step_env = int(os.environ.get("ALPHAGEN_RESUME_STEP", "0").strip() or 0)
+    resume_step = int(resume_step_env) if resume_step_env > 0 else None
+    if RESUME_FLAG and resume_step is None:
+        resume_step = _infer_resume_step(resume_path=resume_path, ckpt_dir=ckpt_dir_for_resume)
+
     feature_space = _detect_feature_space(Path(DATA_DIR))
+    resume_feature_cols = _load_resume_feature_cols(output_dir=output_dir, ckpt_dir=ckpt_dir_for_resume, resume_step=resume_step) if RESUME_FLAG else None
+    resume_subexpr_strs = _load_resume_subexpr_strs(output_dir=output_dir, ckpt_dir=ckpt_dir_for_resume, resume_step=resume_step) if RESUME_FLAG else None
 
     features_max = int(os.environ.get("ALPHAGEN_FEATURES_MAX", "0").strip() or 0)
     prune_corr = float(os.environ.get("ALPHAGEN_FEATURES_PRUNE_CORR", "0.95").strip() or 0.95)
+    if resume_feature_cols:
+        # resume 时优先使用历史快照，避免“同样的 features_max 但选择结果不同”导致 action/observation space 不一致。
+        if len(resume_feature_cols) != len(feature_space.feature_cols):
+            # 只做提示，不强制一致：旧 run 可能用了 intersection/union 等不同 schema
+            print(
+                f"✓ RESUME: 使用历史 features 快照（n={len(resume_feature_cols)}）以保持空间一致；"
+                f"当前数据推断 n={len(feature_space.feature_cols)}"
+            )
+        feature_space = FeatureSpace(feature_cols=list(resume_feature_cols))
+        # 关键：不要在 resume 时重新跑 IC 预筛选（否则选择顺序变化就会导致 mismatch）
+        features_max = 0
     if features_max > 0:
         # 先用“全特征”构造 FeatureType，加载一次数据做打分，然后再用筛选后的特征重建 FeatureType。
         _install_dynamic_feature_type(feature_space.feature_cols)
@@ -327,7 +477,7 @@ def main():
         print(f"预筛选特征列表: {feature_space.feature_cols}")
         # 记录到输出目录，方便复现实验
         try:
-            out_dir = Path("./alphagen_output")
+            out_dir = output_dir
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "selected_features.json").write_text(
                 json.dumps({"features": feature_space.feature_cols}, ensure_ascii=False, indent=2),
@@ -868,6 +1018,8 @@ def main():
             pool,
             ckpt_dir: Path,
             every_steps: int,
+            feature_cols: Optional[Sequence[str]] = None,
+            subexpr_strs: Optional[Sequence[str]] = None,
             keep_last: int = 3,
             verbose: int = 0,
         ):
@@ -878,6 +1030,8 @@ def main():
             self._every = max(1, int(every_steps))
             self._keep = max(1, int(keep_last))
             self._last_saved_step = -1
+            self._feature_cols = [str(x).strip() for x in (feature_cols or []) if str(x).strip()]
+            self._subexpr_strs = [str(x).strip() for x in (subexpr_strs or []) if str(x).strip()]
 
         @staticmethod
         def _step_from_model_zip(p: Path) -> int:
@@ -903,6 +1057,14 @@ def main():
                     (self._dir / f"alpha_pool_step_{st}.json").unlink(missing_ok=True)
                 except Exception:
                     pass
+                try:
+                    (self._dir / f"features_step_{st}.json").unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    (self._dir / f"subexprs_step_{st}.json").unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         def _save(self, step: int, reason: str) -> None:
             if step <= 0 or step == self._last_saved_step:
@@ -912,6 +1074,11 @@ def main():
                 # SB3 会写成 model_step_{step}.zip
                 self.model.save(str(model_base))  # type: ignore[attr-defined]
                 _dump_json_atomic(self._dir / f"alpha_pool_step_{step}.json", self._pool.to_json_dict())
+                # 关键：保存“当时的空间定义”（features/subexprs），保证后续 resume 不会因为 action/obs space 变化而失败
+                if self._feature_cols:
+                    _dump_json_atomic(self._dir / f"features_step_{step}.json", {"features": list(self._feature_cols)})
+                if self._subexpr_strs:
+                    _dump_json_atomic(self._dir / f"subexprs_step_{step}.json", {"subexprs": list(self._subexpr_strs)})
                 _dump_json_atomic(
                     self._dir / "latest.json",
                     {
@@ -2274,10 +2441,31 @@ def main():
 
     # ==================== 创建RL环境 ====================
     print("Setting up RL environment...")
-    subexprs = _build_subexpr_library(subexprs_max)
+    subexprs = None
+    if RESUME_FLAG and resume_subexpr_strs:
+        # resume 时优先使用历史 subexprs 快照，避免 action space 不一致
+        try:
+            from alphagen.data.parser import parse_expression
+
+            parsed = []
+            for s in resume_subexpr_strs:
+                if not isinstance(s, str) or not s.strip():
+                    continue
+                try:
+                    parsed.append(parse_expression(s.strip()))
+                except Exception:
+                    continue
+            if parsed:
+                subexprs = parsed
+                print(f"✓ RESUME: 使用历史 subexprs 快照（n={len(subexprs)}）以保持空间一致")
+        except Exception as e:
+            print(f"⚠ RESUME: 解析 subexprs 快照失败，将回退到重建：{e}")
+
+    if subexprs is None:
+        subexprs = _build_subexpr_library(subexprs_max)
     if subexprs:
         try:
-            out_dir = Path("./alphagen_output")
+            out_dir = output_dir
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "subexprs.json").write_text(
                 json.dumps({"subexprs": [str(e) for e in subexprs]}, ensure_ascii=False, indent=2),
@@ -2301,12 +2489,10 @@ def main():
         )
     )
 
-    resume_flag = os.environ.get("ALPHAGEN_RESUME", "0").strip() in {"1", "true", "yes", "y"}
-    resume_path = os.environ.get("ALPHAGEN_RESUME_PATH", str(OUTPUT_DIR / "model_final.zip")).strip()
-    if resume_flag and Path(resume_path).exists():
+    if RESUME_FLAG and resume_path.exists():
         print(f"Resuming PPO model from: {resume_path}")
         model = MaskablePPO.load(
-            resume_path,
+            str(resume_path),
             env=env,
             device=DEVICE,
         )
@@ -2316,7 +2502,7 @@ def main():
         model.n_epochs = N_EPOCHS
         # learning_rate 在 SB3 里可能是 schedule，这里不强行覆盖，避免产生误解
     else:
-        if resume_flag and not Path(resume_path).exists():
+        if RESUME_FLAG and not resume_path.exists():
             print(f"⚠ ALPHAGEN_RESUME=1 但未找到模型文件：{resume_path}（将从头训练）")
         model = MaskablePPO(
             'MlpPolicy',
@@ -2353,6 +2539,8 @@ def main():
             pool=pool,
             ckpt_dir=ckpt_dir,
             every_steps=ckpt_every_steps,
+            feature_cols=list(feature_space.feature_cols),
+            subexpr_strs=[str(e) for e in (subexprs or [])],
             keep_last=ckpt_keep_last,
             verbose=0,
         )
