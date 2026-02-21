@@ -18,7 +18,7 @@ echo ""
 PRESET="${ALPHAGEN_PRESET:-baseline}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "用法:"
-    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb|explore20_ucblcb|explore20_ucblcb_fast|explore20_ucblcb_cs]"
+    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb|explore20_ucblcb|explore20_ucblcb_fast|explore20_ucblcb_cs|explore20_ucblcb_cs_val]"
     echo ""
     echo "示例:"
     echo "  ./run_training.sh"
@@ -29,6 +29,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "  ./run_training.sh explore20_ucblcb"
     echo "  ./run_training.sh explore20_ucblcb_fast"
     echo "  ./run_training.sh explore20_ucblcb_cs"
+    echo "  ./run_training.sh explore20_ucblcb_cs_val"
     echo ""
     echo "说明:"
     echo "  也可以用环境变量覆盖任意 ALPHAGEN_* 参数（例如 ALPHAGEN_TOTAL_TIMESTEPS）。"
@@ -369,8 +370,79 @@ case "$PRESET" in
         # 默认也评估 test（需要时可外部覆盖为 0，提升速度/降低内存压力）
         export_default ALPHAGEN_EVAL_TEST 1
         ;;
+    explore20_ucblcb_cs_val)
+        # “换方法”：在 explore20_ucblcb_cs 基础上启用 ValGate（pool 满后用验证集小样本过滤），
+        # 目标是抬高 val_ic 上限，而不是只靠调 pool optimize。
+        export_default ALPHAGEN_PERF_LOG 1
+        export_default ALPHAGEN_ENABLE_CS_OPS 1
+
+        export_default ALPHAGEN_FEATURES_MAX 20
+        export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95
+        export_default ALPHAGEN_TOTAL_TIMESTEPS 800000
+
+        export_default ALPHAGEN_BATCH_SIZE 512
+        export_default ALPHAGEN_N_STEPS 8192
+        export_default ALPHAGEN_N_EPOCHS 10
+        export_default ALPHAGEN_LEARNING_RATE 0.0001
+        export_default ALPHAGEN_CLIP_RANGE 0.2
+        export_default ALPHAGEN_TARGET_KL none
+        export_default ALPHAGEN_ENT_COEF 0
+
+        export_default ALPHAGEN_POOL_TYPE meanstd
+        export_default ALPHAGEN_POOL_CAPACITY 30
+        export_default ALPHAGEN_POOL_L1_ALPHA 0.001
+
+        # beta schedule：UCB -> LCB（建议外部覆盖 end=1.2~2.0 以冲更高泛化）
+        export_default ALPHAGEN_POOL_LCB_BETA_START -0.2
+        export_default ALPHAGEN_POOL_LCB_BETA_END 0.5
+        export_default ALPHAGEN_POOL_LCB_BETA_UPDATE_EVERY 10000
+
+        export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
+        export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000
+
+        export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
+        export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
+        export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 10000
+
+        export_default ALPHAGEN_STACK_GUARD 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_START 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_END 12
+        export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
+        export_default ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS 150000
+        export_default ALPHAGEN_MIN_EXPR_LEN_WARMUP_STEPS 50000
+        export_default ALPHAGEN_REWARD_PER_STEP 0
+
+        export_default ALPHAGEN_SUBEXPRS_MAX 80
+        export_default ALPHAGEN_SUBEXPRS_RAW_MAX 10
+        export_default ALPHAGEN_SUBEXPRS_WINDOWS "5,10,20,40"
+        export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
+
+        export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
+
+        # FastGate（可选）+ ValGate（关键）
+        export_default ALPHAGEN_FAST_GATE 1
+        export_default ALPHAGEN_FAST_GATE_ONLY_WHEN_FULL 1
+        export_default ALPHAGEN_FAST_GATE_SYMBOLS 20
+        export_default ALPHAGEN_FAST_GATE_PERIODS 4000
+        export_default ALPHAGEN_FAST_GATE_MIN_ABS_IC 0.003
+
+        export_default ALPHAGEN_VAL_GATE 1
+        export_default ALPHAGEN_VAL_GATE_ONLY_WHEN_FULL 1
+        export_default ALPHAGEN_VAL_GATE_SYMBOLS 20
+        export_default ALPHAGEN_VAL_GATE_PERIODS 4000
+        export_default ALPHAGEN_VAL_GATE_MIN_ABS_IC 0.001
+
+        export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
+        export_default ALPHAGEN_EVAL_TEST 1
+
+        export_default ALPHAGEN_CHECKPOINT_EVERY_STEPS 50000
+        export_default ALPHAGEN_CHECKPOINT_KEEP 5
+        ;;
     *)
-        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast / explore20_ucblcb_cs）"
+        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast / explore20_ucblcb_cs / explore20_ucblcb_cs_val）"
         exit 1
         ;;
 esac

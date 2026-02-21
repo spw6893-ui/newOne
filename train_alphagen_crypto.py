@@ -867,6 +867,16 @@ def main():
             if fg_calls > 0:
                 self.logger.record("perf/fast_gate_ms_per_call", 1000.0 * fg_time / fg_calls)
 
+            # ValGate
+            vg_calls = delta("val_gate_calls")
+            vg_skips = delta("val_gate_skips")
+            vg_time = delta("val_gate_time_s")
+            self.logger.record("perf/val_gate_calls", vg_calls)
+            self.logger.record("perf/val_gate_skips", vg_skips)
+            self.logger.record("perf/val_gate_time_s", vg_time)
+            if vg_calls > 0:
+                self.logger.record("perf/val_gate_ms_per_call", 1000.0 * vg_time / vg_calls)
+
             # Surrogate Gate
             self.logger.record("perf/surrogate_calls", sg_calls)
             self.logger.record("perf/surrogate_skips", sg_skips)
@@ -1615,6 +1625,13 @@ def main():
                 "random_accept_prob": float(SURROGATE_RANDOM_ACCEPT_PROB),
                 "only_when_full": bool(SURROGATE_ONLY_WHEN_FULL),
             },
+            "val_gate": {
+                "enabled": bool(VAL_GATE and (val_gate_calc is not None)),
+                "min_abs_ic": float(VAL_GATE_MIN_ABS_IC),
+                "only_when_full": bool(VAL_GATE_ONLY_WHEN_FULL),
+                "symbols": int(VAL_GATE_SYMBOLS),
+                "periods": int(VAL_GATE_PERIODS),
+            },
         }
         (OUTPUT_DIR / "run_config.json").write_text(json.dumps(run_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"✓ 运行配置已保存: {OUTPUT_DIR / 'run_config.json'}")
@@ -1728,6 +1745,18 @@ def main():
     FAST_GATE_SYMBOLS = max(4, FAST_GATE_SYMBOLS)
     FAST_GATE_PERIODS = max(256, FAST_GATE_PERIODS)
     FAST_GATE_MIN_ABS_IC = max(0.0, FAST_GATE_MIN_ABS_IC)
+
+    # ValGate（方法替换的关键）：用“小样本验证集”估计 single-IC，引导搜索朝 val 泛化方向走
+    val_gate_raw = os.environ.get("ALPHAGEN_VAL_GATE", "0").strip().lower()
+    VAL_GATE = val_gate_raw in {"1", "true", "yes", "y", "on"}
+    val_gate_only_full_raw = os.environ.get("ALPHAGEN_VAL_GATE_ONLY_WHEN_FULL", "1").strip().lower()
+    VAL_GATE_ONLY_WHEN_FULL = val_gate_only_full_raw in {"1", "true", "yes", "y", "on"}
+    VAL_GATE_SYMBOLS = int(os.environ.get("ALPHAGEN_VAL_GATE_SYMBOLS", "20").strip() or 20)
+    VAL_GATE_PERIODS = int(os.environ.get("ALPHAGEN_VAL_GATE_PERIODS", "4000").strip() or 4000)
+    VAL_GATE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_VAL_GATE_MIN_ABS_IC", "0.0").strip() or 0.0)
+    VAL_GATE_SYMBOLS = max(4, VAL_GATE_SYMBOLS)
+    VAL_GATE_PERIODS = max(256, VAL_GATE_PERIODS)
+    VAL_GATE_MIN_ABS_IC = max(0.0, VAL_GATE_MIN_ABS_IC)
 
     # 周期性保存 checkpoint（默认关闭，>0 开启）
     ckpt_every_steps = int(os.environ.get("ALPHAGEN_CHECKPOINT_EVERY_STEPS", "0").strip() or 0)
@@ -1846,6 +1875,35 @@ def main():
             print(f"⚠ FastGate 初始化失败（将禁用）：{e}")
             fast_gate_calc = None
 
+    # ValGate：优先用 val 子集估计 single-IC，避免“train 很好但 val 很差”的过拟合候选占用计算预算
+    val_gate_calc = None
+    if VAL_GATE:
+        try:
+            # 如果用户开启了周期 eval，则 val_data_periodic 后面会创建；这里为避免双份加载，优先复用该对象。
+            # 若 eval 未开启，则此处单独加载一份 val 数据（仅用于 gate）。
+            if eval_every_steps > 0:
+                val_data_for_gate = None  # 先占位，等 val_data_periodic 初始化后再补齐
+            else:
+                val_data_for_gate = CryptoData(
+                    symbols=SYMBOLS,
+                    start_time=TRAIN_END,
+                    end_time=VAL_END,
+                    timeframe="1h",
+                    data_dir=DATA_DIR,
+                    max_backtrack_periods=100,
+                    max_future_periods=30,
+                    features=None,
+                    device=device_obj,
+                )
+            # 后续若 val_data_periodic 不为 None，会覆盖 val_data_for_gate
+            _val_gate_need_init = True
+        except Exception as e:
+            print(f"⚠ ValGate 预初始化失败（将禁用）：{e}")
+            val_gate_calc = None
+            _val_gate_need_init = False
+    else:
+        _val_gate_need_init = False
+
     # ==================== 创建Calculator ====================
     print("\nInitializing calculator...")
     if POOL_TYPE == "meanstd":
@@ -1891,6 +1949,43 @@ def main():
             val_calculator_periodic = QLibStockDataCalculator(val_data_periodic, target)
             test_calculator_periodic = QLibStockDataCalculator(test_data_periodic, target)
 
+    # 在 val 数据加载完成后，再初始化 ValGate（避免重复加载）
+    if _val_gate_need_init and val_gate_calc is None:
+        try:
+            if eval_every_steps > 0:
+                val_data_for_gate = val_data_periodic
+            if val_data_for_gate is None:
+                raise RuntimeError("ValGate 缺少 val 数据（val_data_for_gate=None）")
+
+            total_symbols = int(getattr(val_data_for_gate, "n_stocks", 0))
+            take_symbols = min(int(VAL_GATE_SYMBOLS), max(1, total_symbols))
+            rng = np.random.default_rng(SEED + 7)
+            idx = np.array(sorted(rng.choice(total_symbols, size=take_symbols, replace=False).tolist()), dtype=np.int64)
+
+            base_tensor = val_data_for_gate.data
+            need_len = int(
+                VAL_GATE_PERIODS
+                + val_data_for_gate.max_backtrack_days
+                + val_data_for_gate.max_future_days
+                + 1
+            )
+            start = max(0, int(base_tensor.shape[0]) - need_len)
+            val_tensor = base_tensor[start:, :, :].index_select(2, torch.tensor(idx, device=base_tensor.device))
+            val_view = _StockDataView(val_data_for_gate, val_tensor)
+
+            if POOL_TYPE == "meanstd":
+                val_gate_calc = TensorQLibStockDataCalculator(val_view, target)
+            else:
+                val_gate_calc = QLibStockDataCalculator(val_view, target)
+
+            print(
+                f"✓ ValGate 已启用：symbols={take_symbols}/{total_symbols}, periods≈{VAL_GATE_PERIODS}, "
+                f"min_abs_ic={VAL_GATE_MIN_ABS_IC}, only_when_full={VAL_GATE_ONLY_WHEN_FULL}"
+            )
+        except Exception as e:
+            print(f"⚠ ValGate 初始化失败（将禁用）：{e}")
+            val_gate_calc = None
+
     # ==================== 创建Alpha Pool ====================
     # 如果启用动态阈值，初始化用 start（避免刚开始就被“后期阈值”卡死）
     init_ic_lb = ic_lb_start if (ic_lb_start != ic_lb_end) else IC_LOWER_BOUND
@@ -1916,6 +2011,9 @@ def main():
                     "fast_gate_calls": 0,
                     "fast_gate_skips": 0,
                     "fast_gate_time_s": 0.0,
+                    "val_gate_calls": 0,
+                    "val_gate_skips": 0,
+                    "val_gate_time_s": 0.0,
                     "surrogate_calls": 0,
                     "surrogate_skips": 0,
                     "surrogate_time_s": 0.0,
@@ -1927,12 +2025,16 @@ def main():
                 self._fast_gate_only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
                 self._fast_gate_min_abs_ic = float(FAST_GATE_MIN_ABS_IC)
                 self._trial_logger = trial_logger
+                self._val_gate_calc = val_gate_calc
+                self._val_gate_only_full = bool(VAL_GATE_ONLY_WHEN_FULL)
+                self._val_gate_min_abs_ic = float(VAL_GATE_MIN_ABS_IC)
                 self._surrogate = surrogate
                 self._surrogate_thr = float(SURROGATE_SCORE_THRESHOLD)
                 self._surrogate_rand = float(SURROGATE_RANDOM_ACCEPT_PROB)
                 self._surrogate_only_full = bool(SURROGATE_ONLY_WHEN_FULL)
                 self._last_single_ic = float("nan")
                 self._last_mutual_max = float("nan")
+                self._last_val_gate_ic = float("nan")
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -2003,6 +2105,44 @@ def main():
                 return new_obj
 
             def try_new_expr(self, expr):  # type: ignore[override]
+                # Val Gate：pool 满时先在 val 子集估计 single-IC，不达标直接跳过
+                vg_calc = getattr(self, "_val_gate_calc", None)
+                if vg_calc is not None:
+                    only_full = bool(getattr(self, "_val_gate_only_full", True))
+                    if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                        import time as _time
+                        t0g = _time.perf_counter()
+                        try:
+                            ic_val_fast = float(vg_calc.calc_single_IC_ret(expr))
+                        except Exception:
+                            ic_val_fast = float("nan")
+                        dtg = _time.perf_counter() - t0g
+                        if getattr(self, "_perf_enabled", False):
+                            self._perf["val_gate_calls"] += 1
+                            self._perf["val_gate_time_s"] += float(dtg)
+                        self._last_val_gate_ic = float(ic_val_fast)
+                        thr = float(getattr(self, "_val_gate_min_abs_ic", 0.0))
+                        if not (np.isfinite(ic_val_fast) and (abs(ic_val_fast) >= thr)):
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["val_gate_skips"] += 1
+                            tl = getattr(self, "_trial_logger", None)
+                            if tl is not None:
+                                try:
+                                    step = int(getattr(self, "_current_step", 0) or 0)
+                                except Exception:
+                                    step = 0
+                                tl.log(
+                                    {
+                                        "step": step,
+                                        "expr": str(expr),
+                                        "gate": "val_gate",
+                                        "val_ic_fast": float(ic_val_fast) if np.isfinite(ic_val_fast) else None,
+                                        "val_gate_thr": float(thr),
+                                        "pool_size": int(getattr(self, "size", 0) or 0),
+                                    }
+                                )
+                            return 0.0
+
                 # Fast Gate：pool 满时先用小样本估计 single-IC，不达标直接跳过完整评估
                 fg_calc = getattr(self, "_fast_gate_calc", None)
                 if fg_calc is not None:
@@ -2022,6 +2162,25 @@ def main():
                         if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
                             if getattr(self, "_perf_enabled", False):
                                 self._perf["fast_gate_skips"] += 1
+                            tl = getattr(self, "_trial_logger", None)
+                            if tl is not None:
+                                try:
+                                    step = int(getattr(self, "_current_step", 0) or 0)
+                                except Exception:
+                                    step = 0
+                                tl.log(
+                                    {
+                                        "step": step,
+                                        "expr": str(expr),
+                                        "gate": "fast_gate",
+                                        "single_ic_fast": float(ic_fast) if np.isfinite(ic_fast) else None,
+                                        "fast_gate_thr": float(thr),
+                                        "val_ic_fast": float(getattr(self, "_last_val_gate_ic", float("nan")))
+                                        if np.isfinite(getattr(self, "_last_val_gate_ic", float("nan")))
+                                        else None,
+                                        "pool_size": int(getattr(self, "size", 0) or 0),
+                                    }
+                                )
                             return 0.0
 
                 # 默认（every_updates=1）：保持 LinearAlphaPool 原始行为（每次入池都 optimize）
