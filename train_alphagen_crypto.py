@@ -2053,7 +2053,13 @@ def main():
     # ==================== 可选：多目标 reward（方案1） ====================
     # 默认不启用：保持历史行为（reward=pool main objective）。
     reward_mode = os.environ.get("ALPHAGEN_REWARD_MODE", "legacy").strip().lower()
-    if reward_mode in {"multi", "m"}:
+    multi_reward_enabled = reward_mode in {"multi", "m"}
+    multi_reward_calc_mode = os.environ.get("ALPHAGEN_REWARD_CALC", "auto").strip().lower()
+    if multi_reward_calc_mode not in {"auto", "train", "fast", "val"}:
+        multi_reward_calc_mode = "auto"
+    # multi reward 组件默认用更小的数据集（val > fast > train）以兼顾泛化与 fps
+    multi_reward_calc = None
+    if multi_reward_enabled:
         def _get_float_env(keys, default: float) -> float:
             for key in keys:
                 raw = os.environ.get(key, "").strip()
@@ -2104,124 +2110,17 @@ def main():
                 f"w_ic={w_ic:g}, w_ic_std={w_ic_std:g}, w_turnover={w_turn:g}, w_icir={w_icir:g}, "
                 f"ic_std_window={ic_std_window}, turnover_window={turnover_window}"
             )
-
-            # 用哪个 calculator 来计算 reward 组件（越小越快；auto 推荐 val > fast > train）
-            reward_calc_mode = os.environ.get("ALPHAGEN_REWARD_CALC", "auto").strip().lower()
-            if reward_calc_mode not in {"auto", "train", "fast", "val"}:
-                reward_calc_mode = "auto"
-            reward_calc = calculator
-            if reward_calc_mode == "val":
-                reward_calc = val_gate_calc if val_gate_calc is not None else calculator
-            elif reward_calc_mode == "fast":
-                reward_calc = fast_gate_calc if fast_gate_calc is not None else calculator
-            elif reward_calc_mode == "auto":
-                if val_gate_calc is not None:
-                    reward_calc = val_gate_calc
-                elif fast_gate_calc is not None:
-                    reward_calc = fast_gate_calc
-
-            # monkey patch：只改“step reward”，不改变 pool 的入池/优化逻辑
-            import types
-            from alphagen.utils.correlation import batch_pearsonr
-
-            _orig_try_new_expr = getattr(pool, "try_new_expr", None)
-
-            def _safe_float(x, default=0.0):
-                try:
-                    v = float(x)
-                    return v if np.isfinite(v) else float(default)
-                except Exception:
-                    return float(default)
-
-            def _calc_reward_components(p) -> tuple[float, float, float, float, float]:
-                """
-                返回：ic_mean, ic_std, icir, rolling_ic_std, turnover
-                注：这里的 IC 口径来自 reward_calc（可能是 val/fast 的小样本），用于塑形训练信号以提泛化/提速。
-                """
-                try:
-                    size = int(getattr(p, "size", 0))
-                except Exception:
-                    size = 0
-                if size <= 0:
-                    return 0.0, 0.0, 0.0, 0.0, 0.0
-
-                exprs = [e for e in getattr(p, "exprs")[:size] if e is not None]
-                if not exprs:
-                    return 0.0, 0.0, 0.0, 0.0, 0.0
-                weights = [float(w) for w in list(getattr(p, "weights"))]
-
-                target = getattr(reward_calc, "target_value", None)
-                if target is None:
-                    try:
-                        target = getattr(reward_calc, "target")
-                    except Exception:
-                        target = None
-                if target is None:
-                    return 0.0, 0.0, 0.0, 0.0, 0.0
-
-                with torch.no_grad():
-                    ens = reward_calc.make_ensemble_alpha(exprs, weights)  # type: ignore[attr-defined]
-                    ics = batch_pearsonr(ens, target)
-                    ic_mean = float(ics.mean().item())
-                    ic_std = float(ics.std().item())
-                    icir = float((ic_mean / ic_std) if ic_std > 0 else 0.0)
-
-                    win = int(getattr(p, "_reward_ic_std_window", 720) or 720)
-                    win = max(2, win)
-                    tail = ics[-win:] if int(ics.numel()) > win else ics
-                    rolling_ic_std = float(tail.std().item()) if int(tail.numel()) >= 2 else 0.0
-
-                    tw = int(getattr(p, "_reward_turnover_window", 720) or 720)
-                    tw = max(1, tw)
-                    k = min(int(ens.shape[0]), int(tw) + 1)
-                    if k >= 2:
-                        wt = ens[-k:]
-                        d = (wt[1:] - wt[:-1]).abs()
-                        m = torch.isfinite(d)
-                        turnover = float(d[m].mean().item()) if bool(m.any().item()) else 0.0
-                    else:
-                        turnover = 0.0
-                return ic_mean, ic_std, icir, rolling_ic_std, turnover
-
-            def _try_new_expr_multi(self, expr):  # type: ignore[no-redef]
-                # 先按原逻辑更新 pool（入池/优化/失败缓存等），然后再用 reward_calc 做 reward 塑形
-                if callable(_orig_try_new_expr):
-                    obj = _orig_try_new_expr(expr)
-                else:
-                    obj = 0.0
-
-                w1 = _safe_float(getattr(self, "_reward_w_ic", 1.0), 1.0)
-                w2 = _safe_float(getattr(self, "_reward_w_ic_std", 0.0), 0.0)
-                w3 = _safe_float(getattr(self, "_reward_w_turnover", 0.0), 0.0)
-                w4 = _safe_float(getattr(self, "_reward_w_icir", 0.0), 0.0)
-
-                try:
-                    ic_mean, ic_std, icir, rolling_ic_std, turnover = _calc_reward_components(self)
-                except Exception:
-                    ic_mean, ic_std, icir, rolling_ic_std, turnover = 0.0, 0.0, 0.0, 0.0, 0.0
-
-                # 记录 stats（TensorBoard）
-                setattr(self, "_last_ic_mean", float(ic_mean))
-                setattr(self, "_last_ic_std", float(ic_std))
-                setattr(self, "_last_icir", float(icir))
-                setattr(self, "_last_rolling_ic_std", float(rolling_ic_std))
-                setattr(self, "_last_turnover", float(turnover))
-
-                # reward shaping（以 IC 为主）
-                reward = float(w1) * float(ic_mean) + float(w2) * (-float(rolling_ic_std)) + float(w3) * (-float(turnover)) + float(w4) * float(icir)
-                # 防御：极端情况下回退到原 objective（避免 NaN 把训练搞崩）
-                if not np.isfinite(reward):
-                    try:
-                        return float(obj)
-                    except Exception:
-                        return 0.0
-                return float(reward)
-
-            pool.try_new_expr = types.MethodType(_try_new_expr_multi, pool)  # type: ignore[assignment]
-            print(f"✓ 已注入 multi reward（calc={reward_calc_mode}, 实际={type(reward_calc).__name__}）")
         except Exception as e:
             print(f"⚠ 启用多目标 reward 失败（将回退 legacy）：{e}")
             reward_mode = "legacy"
+            multi_reward_enabled = False
+            try:
+                setattr(pool, "_reward_mode", "legacy")
+            except Exception:
+                pass
+
+    # 注意：FastGate/ValGate/TWO_STAGE 会在后续重新 monkey patch `pool.try_new_expr`，
+    # 因此 multi reward 的实际注入放在“所有 patch 完成之后”（见后文）。
 
     # 互相关计算加速：把 mutual IC 比对顺序改为“按权重绝对值从大到小”，并允许用更严格阈值早退。
     # 设计目标：
@@ -2363,6 +2262,11 @@ def main():
             pass
 
         def _try_new_expr_gates(self, expr):  # type: ignore[no-redef]
+            # multi reward wrapper 用来判断这次是否被 gate 直接跳过
+            try:
+                setattr(self, "_last_gate_skipped", 0)
+            except Exception:
+                pass
             # 1) FastGate：训练集小样本 single-IC 粗筛（主要为了省 mutual/optimize）
             if fast_gate_calc is not None:
                 only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
@@ -2390,6 +2294,10 @@ def main():
                     if not (np.isfinite(ic_fast) and (abs(ic_fast) >= thr)):
                         if isinstance(st, dict):
                             st["skips"] = int(st.get("skips", 0)) + 1
+                        try:
+                            setattr(self, "_last_gate_skipped", 1)
+                        except Exception:
+                            pass
                         return 0.0
 
             # 2) ValGate：验证集小样本 single-IC 二次筛（对齐 val_ic）
@@ -2412,6 +2320,10 @@ def main():
                     if not (np.isfinite(ic_val) and (abs(ic_val) >= thr)):
                         if isinstance(st, dict):
                             st["skips"] = int(st.get("skips", 0)) + 1
+                        try:
+                            setattr(self, "_last_gate_skipped", 1)
+                        except Exception:
+                            pass
                         return 0.0
 
             return _orig_try_new_expr(self, expr)
@@ -2655,6 +2567,142 @@ def main():
             _core_mod.AlphaEnvCore._valid_action_types = _valid_action_types_with_min_len  # type: ignore[assignment]
         except Exception as e:
             print(f"⚠ 设置 MIN_EXPR_LEN 失败（将忽略）：{e}")
+
+    # ==================== 注入 multi reward（放在所有 try_new_expr monkey patch 之后） ====================
+    # 设计：只改变“RL step reward”，不改变 pool 的入池/优化/失败缓存等逻辑。
+    # - 若 FastGate/ValGate 把该 expr 跳过（返回 0.0），则不额外计算 reward 组件；
+    # - 若启用了 TWO_STAGE，则该阶段本身用 cheap_score 作为 reward，这里默认不再二次塑形（避免重复计算）。
+    if multi_reward_enabled and (not TWO_STAGE):
+        try:
+            import types
+            from alphagen.utils.correlation import batch_pearsonr
+
+            # 选择 reward 组件计算的 calculator
+            multi_reward_calc = calculator
+            if multi_reward_calc_mode == "val":
+                multi_reward_calc = val_gate_calc if val_gate_calc is not None else calculator
+            elif multi_reward_calc_mode == "fast":
+                multi_reward_calc = fast_gate_calc if fast_gate_calc is not None else calculator
+            elif multi_reward_calc_mode == "auto":
+                if val_gate_calc is not None:
+                    multi_reward_calc = val_gate_calc
+                elif fast_gate_calc is not None:
+                    multi_reward_calc = fast_gate_calc
+
+            _orig_try_new_expr_final = pool.try_new_expr
+
+            def _safe_float(x, default=0.0):
+                try:
+                    v = float(x)
+                    return v if np.isfinite(v) else float(default)
+                except Exception:
+                    return float(default)
+
+            def _get_target(calc_obj):
+                tv = getattr(calc_obj, "target_value", None)
+                if tv is not None:
+                    return tv
+                try:
+                    return getattr(calc_obj, "target")
+                except Exception:
+                    return None
+
+            def _calc_alpha(calc_obj, expr):
+                fn = getattr(calc_obj, "evaluate_alpha", None)
+                if callable(fn):
+                    return fn(expr)
+                fn2 = getattr(calc_obj, "_calc_alpha", None)
+                if callable(fn2):
+                    return fn2(expr)
+                return None
+
+            def _multi_components(expr):
+                tgt = _get_target(multi_reward_calc)
+                if tgt is None:
+                    return 0.0, 0.0, 0.0, 0.0, 0.0
+                alpha = _calc_alpha(multi_reward_calc, expr)
+                if alpha is None:
+                    try:
+                        ic_mean = float(multi_reward_calc.calc_single_IC_ret(expr))
+                    except Exception:
+                        ic_mean = 0.0
+                    return ic_mean, 0.0, 0.0, 0.0, 0.0
+
+                with torch.no_grad():
+                    ics = batch_pearsonr(alpha, tgt)
+                    ic_mean = float(ics.mean().item())
+                    ic_std = float(ics.std().item())
+                    icir = float(ic_mean / ic_std) if ic_std > 0 else 0.0
+
+                    win = int(getattr(pool, "_reward_ic_std_window", 720) or 720)
+                    win = max(2, win)
+                    tail = ics[-win:] if int(ics.numel()) > win else ics
+                    rolling_ic_std = float(tail.std().item()) if int(tail.numel()) >= 2 else 0.0
+
+                    tw = int(getattr(pool, "_reward_turnover_window", 720) or 720)
+                    tw = max(1, tw)
+                    k = min(int(alpha.shape[0]), int(tw) + 1)
+                    if k >= 2:
+                        at = alpha[-k:]
+                        d = (at[1:] - at[:-1]).abs()
+                        m = torch.isfinite(d)
+                        turnover = float(d[m].mean().item()) if bool(m.any().item()) else 0.0
+                    else:
+                        turnover = 0.0
+
+                if not np.isfinite(ic_mean):
+                    ic_mean = 0.0
+                if not np.isfinite(ic_std):
+                    ic_std = 0.0
+                if not np.isfinite(icir):
+                    icir = 0.0
+                if not np.isfinite(rolling_ic_std):
+                    rolling_ic_std = 0.0
+                if not np.isfinite(turnover):
+                    turnover = 0.0
+                return ic_mean, ic_std, icir, rolling_ic_std, turnover
+
+            def _try_new_expr_multi_final(self, expr):  # type: ignore[no-redef]
+                base = float(_orig_try_new_expr_final(expr))
+                try:
+                    if int(getattr(self, "_last_gate_skipped", 0)) == 1:
+                        return base
+                except Exception:
+                    pass
+
+                w1 = _safe_float(getattr(self, "_reward_w_ic", 1.0), 1.0)
+                w2 = _safe_float(getattr(self, "_reward_w_ic_std", 0.0), 0.0)
+                w3 = _safe_float(getattr(self, "_reward_w_turnover", 0.0), 0.0)
+                w4 = _safe_float(getattr(self, "_reward_w_icir", 0.0), 0.0)
+
+                try:
+                    ic_mean, ic_std, icir, rolling_ic_std, turnover = _multi_components(expr)
+                except Exception:
+                    ic_mean, ic_std, icir, rolling_ic_std, turnover = 0.0, 0.0, 0.0, 0.0, 0.0
+
+                try:
+                    setattr(self, "_last_ic_mean", float(ic_mean))
+                    setattr(self, "_last_ic_std", float(ic_std))
+                    setattr(self, "_last_icir", float(icir))
+                    setattr(self, "_last_rolling_ic_std", float(rolling_ic_std))
+                    setattr(self, "_last_turnover", float(turnover))
+                except Exception:
+                    pass
+
+                reward = float(w1) * float(ic_mean) + float(w2) * (-float(rolling_ic_std)) + float(w3) * (-float(turnover)) + float(w4) * float(icir)
+                if not np.isfinite(reward):
+                    return base
+                return float(reward)
+
+            pool.try_new_expr = types.MethodType(_try_new_expr_multi_final, pool)  # type: ignore[assignment]
+            print(f"✓ multi reward 已注入（calc={multi_reward_calc_mode}, 实际={type(multi_reward_calc).__name__}）")
+        except Exception as e:
+            print(f"⚠ multi reward 注入失败（将回退 legacy）：{e}")
+            try:
+                setattr(pool, "_reward_mode", "legacy")
+            except Exception:
+                pass
+            multi_reward_enabled = False
 
     # ==================== 创建RL环境 ====================
     print("Setting up RL environment...")
