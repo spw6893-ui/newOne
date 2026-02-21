@@ -311,6 +311,10 @@ case "$PRESET" in
 
         export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
         export_default ALPHAGEN_EVAL_TEST 1
+
+        # checkpoint：每 50k step 保存一次（可外部覆盖）
+        export_default ALPHAGEN_CHECKPOINT_EVERY_STEPS 50000
+        export_default ALPHAGEN_CHECKPOINT_KEEP 5
         ;;
     *)
         echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fg）"
