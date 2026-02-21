@@ -1127,18 +1127,31 @@ def main():
             start_lb: float,
             end_lb: float,
             update_every: int,
+            schedule_steps: Optional[int] = None,
+            warmup_steps: Optional[int] = None,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
             self.pool = pool
             self.total_timesteps = max(1, int(total_timesteps))
+            if schedule_steps is None:
+                self.schedule_steps = self.total_timesteps
+            else:
+                self.schedule_steps = max(1, int(schedule_steps))
+            if warmup_steps is None:
+                self.warmup_steps = 0
+            else:
+                self.warmup_steps = max(0, int(warmup_steps))
             self.start_lb = float(start_lb)
             self.end_lb = float(end_lb)
             self.update_every = max(1, int(update_every))
             self._last_lb: Optional[float] = None
 
         def _compute_lb(self) -> float:
-            frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
+            if self.num_timesteps <= self.warmup_steps:
+                frac = 0.0
+            else:
+                frac = min(1.0, float(self.num_timesteps - self.warmup_steps) / float(self.schedule_steps))
             return self.start_lb + frac * (self.end_lb - self.start_lb)
 
         def _on_step(self) -> bool:
@@ -1169,18 +1182,31 @@ def main():
             start_beta: float,
             end_beta: float,
             update_every: int,
+            schedule_steps: Optional[int] = None,
+            warmup_steps: Optional[int] = None,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
             self.pool = pool
             self.total_timesteps = max(1, int(total_timesteps))
+            if schedule_steps is None:
+                self.schedule_steps = self.total_timesteps
+            else:
+                self.schedule_steps = max(1, int(schedule_steps))
+            if warmup_steps is None:
+                self.warmup_steps = 0
+            else:
+                self.warmup_steps = max(0, int(warmup_steps))
             self.start_beta = float(start_beta)
             self.end_beta = float(end_beta)
             self.update_every = max(1, int(update_every))
             self._last: Optional[float] = None
 
         def _compute_beta(self) -> float:
-            frac = min(1.0, float(self.num_timesteps) / float(self.total_timesteps))
+            if self.num_timesteps <= self.warmup_steps:
+                frac = 0.0
+            else:
+                frac = min(1.0, float(self.num_timesteps - self.warmup_steps) / float(self.schedule_steps))
             return self.start_beta + frac * (self.end_beta - self.start_beta)
 
         def _on_step(self) -> bool:
@@ -1462,11 +1488,25 @@ def main():
     else:
         POOL_LCB_BETA_END = float(pool_lcb_beta_end_raw)
     pool_lcb_beta_update_every = int(os.environ.get("ALPHAGEN_POOL_LCB_BETA_UPDATE_EVERY", "10000").strip() or 10000)
+    # 允许把 beta schedule 压缩到更短步数内完成（更早从 UCB 过渡到 LCB，提升 val/test 稳健性）
+    pool_lcb_beta_schedule_steps = int(
+        os.environ.get("ALPHAGEN_POOL_LCB_BETA_SCHEDULE_STEPS", str(TOTAL_TIMESTEPS)).strip() or TOTAL_TIMESTEPS
+    )
+    pool_lcb_beta_schedule_steps = max(1, int(pool_lcb_beta_schedule_steps))
+    pool_lcb_beta_warmup_steps = int(os.environ.get("ALPHAGEN_POOL_LCB_BETA_WARMUP_STEPS", "0").strip() or 0)
+    pool_lcb_beta_warmup_steps = max(0, int(pool_lcb_beta_warmup_steps))
 
     # 动态 threshold：start/end 任意一个被设置就启用（默认与 IC_LOWER_BOUND 相同 => 等价于关闭）
     ic_lb_start = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_START", str(IC_LOWER_BOUND)))
     ic_lb_end = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_END", str(IC_LOWER_BOUND)))
     ic_lb_update_every = int(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY", "2048"))
+    # 允许把 IC lower bound schedule 压缩到更短步数内完成（更早收紧质量门槛）
+    ic_lb_schedule_steps = int(
+        os.environ.get("ALPHAGEN_IC_LOWER_BOUND_SCHEDULE_STEPS", str(TOTAL_TIMESTEPS)).strip() or TOTAL_TIMESTEPS
+    )
+    ic_lb_schedule_steps = max(1, int(ic_lb_schedule_steps))
+    ic_lb_warmup_steps = int(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_WARMUP_STEPS", "0").strip() or 0)
+    ic_lb_warmup_steps = max(0, int(ic_lb_warmup_steps))
 
     # 把关键运行参数落盘，便于确认“你实际跑的是什么配置”（避免命令行覆盖失败却不自知）
     try:
@@ -1487,12 +1527,16 @@ def main():
                 "ic_lower_bound_start": ic_lb_start,
                 "ic_lower_bound_end": ic_lb_end,
                 "ic_lower_bound_update_every": ic_lb_update_every,
+                "ic_lower_bound_schedule_steps": int(ic_lb_schedule_steps),
+                "ic_lower_bound_warmup_steps": int(ic_lb_warmup_steps),
                 "ic_lower_bound_abs": bool(IC_LOWER_BOUND_ABS),
                 "mutual_ic_threshold": float(MUTUAL_IC_THRESHOLD),
                 "lcb_beta": POOL_LCB_BETA,
                 "lcb_beta_start": POOL_LCB_BETA_START,
                 "lcb_beta_end": POOL_LCB_BETA_END,
                 "lcb_beta_update_every": int(pool_lcb_beta_update_every),
+                "lcb_beta_schedule_steps": int(pool_lcb_beta_schedule_steps),
+                "lcb_beta_warmup_steps": int(pool_lcb_beta_warmup_steps),
             },
             "trial_log": {
                 "enabled": bool(TRIAL_LOG),
@@ -2612,6 +2656,8 @@ def main():
                     start_beta=float(POOL_LCB_BETA_START),
                     end_beta=float(POOL_LCB_BETA_END),
                     update_every=int(max(256, pool_lcb_beta_update_every)),
+                    schedule_steps=int(pool_lcb_beta_schedule_steps),
+                    warmup_steps=int(pool_lcb_beta_warmup_steps),
                     verbose=0,
                 )
             )
@@ -2623,6 +2669,8 @@ def main():
                 start_lb=ic_lb_start,
                 end_lb=ic_lb_end,
                 update_every=ic_lb_update_every,
+                schedule_steps=int(ic_lb_schedule_steps),
+                warmup_steps=int(ic_lb_warmup_steps),
             )
         )
     callback = CallbackList(callbacks) if len(callbacks) > 1 else callbacks[0]
