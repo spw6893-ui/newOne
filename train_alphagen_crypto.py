@@ -1240,6 +1240,8 @@ def main():
             # commit 阶段可选：用更小 optimize 预算，避免一次 commit 把 fps 拖垮
             old_ms = getattr(self._pool, "_opt_max_steps_override", 0)
             old_tol = getattr(self._pool, "_opt_tolerance_override", 0)
+            # commit_disable_lb：必须覆盖到 full_try() 调用阶段，否则 _calc_ics 会直接因为 lb 拒绝，导致“commit 了但 pool 完全不变”
+            orig_lb2 = getattr(self._pool, "_ic_lower_bound", None)
             if int(POOL_OPT_MAX_STEPS_COMMIT) > 0:
                 try:
                     setattr(self._pool, "_opt_max_steps_override", int(POOL_OPT_MAX_STEPS_COMMIT))
@@ -1251,6 +1253,11 @@ def main():
                 except Exception:
                     pass
             try:
+                if self._commit_disable_lb and (orig_lb2 is not None):
+                    try:
+                        setattr(self._pool, "_ic_lower_bound", -1.0)
+                    except Exception:
+                        pass
                 for expr in selected:
                     tried += 1
                     try:
@@ -1265,6 +1272,8 @@ def main():
                 try:
                     setattr(self._pool, "_opt_max_steps_override", old_ms)
                     setattr(self._pool, "_opt_tolerance_override", old_tol)
+                    if self._commit_disable_lb and (orig_lb2 is not None):
+                        setattr(self._pool, "_ic_lower_bound", orig_lb2)
                 except Exception:
                     pass
 
