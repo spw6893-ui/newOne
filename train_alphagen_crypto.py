@@ -936,8 +936,11 @@ def main():
             val_calc,
             every_steps: int,
             keep_top_k: int,
+            score_mode: str = "weight_val",
             min_abs_ic: float = 0.0,
             only_when_full: bool = True,
+            set_ic_lower_bound: Optional[float] = None,
+            set_mutual_threshold: Optional[float] = None,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
@@ -945,8 +948,11 @@ def main():
             self._val_calc = val_calc
             self._every = max(256, int(every_steps))
             self._keep_k = max(1, int(keep_top_k))
+            self._score_mode = str(score_mode or "weight_val").strip().lower()
             self._min_abs_ic = float(max(0.0, min_abs_ic))
             self._only_full = bool(only_when_full)
+            self._set_lb = set_ic_lower_bound
+            self._set_mutual = set_mutual_threshold
 
         @staticmethod
         def _finite_abs(v: float) -> float:
@@ -990,7 +996,30 @@ def main():
                     ic = float("nan")
                 vals.append((i, ic))
 
-            order = sorted(vals, key=lambda x: self._finite_abs(x[1]), reverse=True)
+            # 评分策略：
+            # - val：按 abs(val_single_ic) 排序
+            # - weight：按 abs(weight) 排序（无需 val_calc，最轻量）
+            # - weight_val：按 abs(weight) * abs(val_single_ic) 排序（更贴近“边际贡献 × 泛化”）
+            mode = str(getattr(self, "_score_mode", "weight_val") or "weight_val").lower()
+            if mode == "weight":
+                try:
+                    w = list(getattr(self._pool, "weights"))
+                except Exception:
+                    w = []
+                score = {i: (abs(float(w[i])) if i < len(w) and np.isfinite(w[i]) else 0.0) for i, _ in vals}
+                order = sorted(vals, key=lambda x: float(score.get(x[0], 0.0)), reverse=True)
+            elif mode == "val":
+                order = sorted(vals, key=lambda x: self._finite_abs(x[1]), reverse=True)
+            else:
+                try:
+                    w = list(getattr(self._pool, "weights"))
+                except Exception:
+                    w = []
+                def score_wv(pair):
+                    i, ic = pair
+                    wi = abs(float(w[i])) if i < len(w) and np.isfinite(w[i]) else 0.0
+                    return wi * self._finite_abs(ic)
+                order = sorted(vals, key=score_wv, reverse=True)
             keep = [i for i, _ in order[: min(self._keep_k, len(order))]]
             if self._min_abs_ic > 0:
                 extra = [i for i, ic in order if self._finite_abs(ic) >= self._min_abs_ic]
@@ -1008,12 +1037,24 @@ def main():
                     setattr(self._pool, "_lazy_updates_since_opt", 0)
                 except Exception:
                     pass
+                # prune 后抬高质量/多样性门槛，避免弱/同质因子立即回填导致再次平台
+                if self._set_lb is not None:
+                    try:
+                        setattr(self._pool, "_ic_lower_bound", float(self._set_lb))
+                    except Exception:
+                        pass
+                if self._set_mutual is not None:
+                    try:
+                        setattr(self._pool, "_mutual_ic_threshold", float(self._set_mutual))
+                    except Exception:
+                        pass
             except Exception:
                 return True
             dt = _time.perf_counter() - t0
 
             self.logger.record("pool/prune_kept", float(len(keep)))
             self.logger.record("pool/prune_removed", float(max(0, size - len(keep))))
+            self.logger.record("pool/prune_score_mode", 1.0 if mode == "weight" else (2.0 if mode == "val" else 3.0))
             self.logger.record("perf/pool_prune_time_s", float(dt))
             if self.verbose:
                 print(f"✓ pool prune by val: kept={len(keep)}/{size}, dt={dt:.3f}s")
@@ -1941,6 +1982,20 @@ def main():
     POOL_PRUNE_EVERY_STEPS = int(os.environ.get("ALPHAGEN_POOL_PRUNE_EVERY_STEPS", "50000").strip() or 50000)
     POOL_PRUNE_KEEP_TOP_K = int(os.environ.get("ALPHAGEN_POOL_PRUNE_KEEP_TOP_K", "20").strip() or 20)
     POOL_PRUNE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_POOL_PRUNE_MIN_ABS_IC", "0.0").strip() or 0.0)
+    POOL_PRUNE_SCORE = os.environ.get("ALPHAGEN_POOL_PRUNE_SCORE", "weight_val").strip().lower()
+    if POOL_PRUNE_SCORE not in {"val", "weight", "weight_val"}:
+        print(f"⚠ 未知 ALPHAGEN_POOL_PRUNE_SCORE={POOL_PRUNE_SCORE}（将回退到 weight_val）")
+        POOL_PRUNE_SCORE = "weight_val"
+    pool_prune_set_lb_raw = os.environ.get("ALPHAGEN_POOL_PRUNE_SET_IC_LOWER_BOUND", "").strip()
+    try:
+        POOL_PRUNE_SET_IC_LOWER_BOUND = float(pool_prune_set_lb_raw) if pool_prune_set_lb_raw else None
+    except Exception:
+        POOL_PRUNE_SET_IC_LOWER_BOUND = None
+    pool_prune_set_mutual_raw = os.environ.get("ALPHAGEN_POOL_PRUNE_SET_MUTUAL_THRESHOLD", "").strip()
+    try:
+        POOL_PRUNE_SET_MUTUAL_THRESHOLD = float(pool_prune_set_mutual_raw) if pool_prune_set_mutual_raw else None
+    except Exception:
+        POOL_PRUNE_SET_MUTUAL_THRESHOLD = None
     POOL_PRUNE_EVERY_STEPS = max(256, int(POOL_PRUNE_EVERY_STEPS))
     POOL_PRUNE_KEEP_TOP_K = max(1, int(POOL_PRUNE_KEEP_TOP_K))
     POOL_PRUNE_MIN_ABS_IC = max(0.0, float(POOL_PRUNE_MIN_ABS_IC))
@@ -3138,8 +3193,11 @@ def main():
                 val_calc=val_gate_calc,
                 every_steps=POOL_PRUNE_EVERY_STEPS,
                 keep_top_k=min(int(POOL_PRUNE_KEEP_TOP_K), int(getattr(pool, "capacity", POOL_PRUNE_KEEP_TOP_K) or POOL_PRUNE_KEEP_TOP_K)),
+                score_mode=str(POOL_PRUNE_SCORE),
                 min_abs_ic=float(POOL_PRUNE_MIN_ABS_IC),
                 only_when_full=bool(POOL_PRUNE_ONLY_WHEN_FULL),
+                set_ic_lower_bound=POOL_PRUNE_SET_IC_LOWER_BOUND,
+                set_mutual_threshold=POOL_PRUNE_SET_MUTUAL_THRESHOLD,
                 verbose=0,
             )
         )

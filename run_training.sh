@@ -464,6 +464,11 @@ case "$PRESET" in
         export_default ALPHAGEN_POOL_PRUNE_EVERY_STEPS 50000
         export_default ALPHAGEN_POOL_PRUNE_KEEP_TOP_K 20
         export_default ALPHAGEN_POOL_PRUNE_MIN_ABS_IC 0.0
+        # prune 评分：weight_val（默认）更贴近“边际贡献×泛化”，避免只看 val single-IC 误删组合型因子
+        export_default ALPHAGEN_POOL_PRUNE_SCORE weight_val
+        # prune 后抬高门槛，避免弱/同质因子立即回填
+        export_default ALPHAGEN_POOL_PRUNE_SET_IC_LOWER_BOUND 0.02
+        export_default ALPHAGEN_POOL_PRUNE_SET_MUTUAL_THRESHOLD 0.92
         ;;
     explore20_ucblcb_cs_val)
         # “换方法”：在 explore20_ucblcb_cs 基础上启用 ValGate（pool 满后用验证集小样本过滤），
