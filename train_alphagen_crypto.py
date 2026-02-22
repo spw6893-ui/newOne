@@ -1275,6 +1275,7 @@ def main():
             self._feature_cols = [str(x).strip() for x in (feature_cols or []) if str(x).strip()]
             self._subexpr_strs = [str(x).strip() for x in (subexpr_strs or []) if str(x).strip()]
             self._meta = dict(meta) if isinstance(meta, dict) else {}
+            self._save_failures = 0
 
         @staticmethod
         def _step_from_model_zip(p: Path) -> int:
@@ -1353,10 +1354,18 @@ def main():
                 self._cleanup()
                 self._last_saved_step = int(step)
                 self.logger.record("checkpoint/last_step", float(step))
+                self.logger.record("checkpoint/save_failed", 0.0)
+                self.logger.record("checkpoint/save_failed_count", float(self._save_failures))
             except Exception as e:
                 # checkpoint 失败不应中断训练
+                self._save_failures += 1
+                try:
+                    self.logger.record("checkpoint/save_failed", 1.0)
+                    self.logger.record("checkpoint/save_failed_count", float(self._save_failures))
+                except Exception:
+                    pass
                 if self.verbose:
-                    print(f"⚠ checkpoint 保存失败: step={step}, reason={reason}, err={e}")
+                    print(f"⚠ checkpoint 保存失败: dir={self._dir}, step={step}, reason={reason}, err={e}")
 
         def _on_step(self) -> bool:
             if (self.num_timesteps % self._every) != 0:
@@ -2310,6 +2319,10 @@ def main():
     ckpt_keep_last = int(os.environ.get("ALPHAGEN_CHECKPOINT_KEEP", "3").strip() or 3)
     ckpt_dir_raw = os.environ.get("ALPHAGEN_CHECKPOINT_DIR", str(OUTPUT_DIR / "checkpoints")).strip()
     ckpt_dir = Path(ckpt_dir_raw) if ckpt_dir_raw else (OUTPUT_DIR / "checkpoints")
+    try:
+        ckpt_verbose = int(os.environ.get("ALPHAGEN_CHECKPOINT_VERBOSE", "0").strip() or 0)
+    except Exception:
+        ckpt_verbose = 0
 
     print("=" * 60)
     print("AlphaGen Crypto Factor Mining")
@@ -4159,6 +4172,7 @@ def main():
         )
     ckpt_cb = None
     if ckpt_every_steps > 0:
+        print(f"✓ Checkpoint 已启用：every_steps={ckpt_every_steps}, keep={ckpt_keep_last}, dir={ckpt_dir}")
         ckpt_cb = PeriodicCheckpointCallback(
             pool=pool,
             ckpt_dir=ckpt_dir,
@@ -4173,7 +4187,7 @@ def main():
                 "n_subexprs": int(len(subexprs or [])),
             },
             keep_last=ckpt_keep_last,
-            verbose=0,
+            verbose=int(ckpt_verbose),
         )
         callbacks.append(ckpt_cb)
     # pool.optimize 频率控制：
