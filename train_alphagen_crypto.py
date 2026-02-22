@@ -4176,20 +4176,23 @@ def main():
             verbose=0,
         )
         callbacks.append(ckpt_cb)
-    # pool.optimize 频率 schedule（默认关闭：start=end=1 时等价于原行为）
-    if POOL_OPT_EVERY_UPDATES_START != POOL_OPT_EVERY_UPDATES_END:
-            callbacks.append(
-                PoolOptimizeEveryScheduleCallback(
-                    pool=pool,
-                    total_timesteps=TOTAL_TIMESTEPS,
-                    start_every=POOL_OPT_EVERY_UPDATES_START,
-                    end_every=POOL_OPT_EVERY_UPDATES_END,
-                    update_every=POOL_OPT_EVERY_UPDATES_UPDATE_EVERY,
-                    full_every=int(POOL_OPT_EVERY_UPDATES_FULL),
-                    only_after_full=bool(POOL_OPT_SCHEDULE_ONLY_AFTER_FULL),
-                    verbose=0,
-                )
+    # pool.optimize 频率控制：
+    # - schedule：start->end
+    # - full_every：仅满池后强制固定频率（即使 start=end 也应该生效）
+    need_opt_every_cb = (POOL_OPT_EVERY_UPDATES_START != POOL_OPT_EVERY_UPDATES_END) or (int(POOL_OPT_EVERY_UPDATES_FULL) > 0)
+    if need_opt_every_cb:
+        callbacks.append(
+            PoolOptimizeEveryScheduleCallback(
+                pool=pool,
+                total_timesteps=TOTAL_TIMESTEPS,
+                start_every=POOL_OPT_EVERY_UPDATES_START,
+                end_every=POOL_OPT_EVERY_UPDATES_END,
+                update_every=POOL_OPT_EVERY_UPDATES_UPDATE_EVERY,
+                full_every=int(POOL_OPT_EVERY_UPDATES_FULL),
+                only_after_full=bool(POOL_OPT_SCHEDULE_ONLY_AFTER_FULL),
+                verbose=0,
             )
+        )
     else:
         try:
             setattr(pool, "_optimize_every_updates", int(POOL_OPT_EVERY_UPDATES_START))
