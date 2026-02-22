@@ -363,6 +363,8 @@ case "$PRESET" in
         export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
 
         # 新增：pool optimize 触发频率 schedule（1 -> 8）
+        # 满池前固定=1，先把 val_ic 爬到 0.05+；满池后再开始提速
+        export_default ALPHAGEN_POOL_OPT_SCHEDULE_ONLY_AFTER_FULL 1
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000
@@ -411,6 +413,7 @@ case "$PRESET" in
 
         export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
         export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
+        export_default ALPHAGEN_POOL_OPT_SCHEDULE_ONLY_AFTER_FULL 1
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000

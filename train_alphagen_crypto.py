@@ -1807,6 +1807,29 @@ def main():
         POOL_OBJ_SUBSAMPLE_DAYS = 0
     POOL_OBJ_SUBSAMPLE_SYMBOLS = max(0, int(POOL_OBJ_SUBSAMPLE_SYMBOLS))
     POOL_OBJ_SUBSAMPLE_DAYS = max(0, int(POOL_OBJ_SUBSAMPLE_DAYS))
+    # 满池后可单独设置更激进的子采样（避免“满池后 fps 崩”影响跑不下去）
+    try:
+        POOL_OBJ_SUBSAMPLE_SYMBOLS_FULL = int(os.environ.get("ALPHAGEN_POOL_OBJ_SUBSAMPLE_SYMBOLS_FULL", "0").strip() or 0)
+    except Exception:
+        POOL_OBJ_SUBSAMPLE_SYMBOLS_FULL = 0
+    try:
+        POOL_OBJ_SUBSAMPLE_DAYS_FULL = int(os.environ.get("ALPHAGEN_POOL_OBJ_SUBSAMPLE_DAYS_FULL", "0").strip() or 0)
+    except Exception:
+        POOL_OBJ_SUBSAMPLE_DAYS_FULL = 0
+    POOL_OBJ_SUBSAMPLE_SYMBOLS_FULL = max(0, int(POOL_OBJ_SUBSAMPLE_SYMBOLS_FULL))
+    POOL_OBJ_SUBSAMPLE_DAYS_FULL = max(0, int(POOL_OBJ_SUBSAMPLE_DAYS_FULL))
+
+    # 满池后可单独设置更小的 optimize 预算（不影响满池前“先把 0.05 打上去”的信号密度）
+    try:
+        POOL_OPT_MAX_STEPS_FULL = int(os.environ.get("ALPHAGEN_POOL_OPT_MAX_STEPS_FULL", "0").strip() or 0)
+    except Exception:
+        POOL_OPT_MAX_STEPS_FULL = 0
+    try:
+        POOL_OPT_TOLERANCE_FULL = int(os.environ.get("ALPHAGEN_POOL_OPT_TOLERANCE_FULL", "0").strip() or 0)
+    except Exception:
+        POOL_OPT_TOLERANCE_FULL = 0
+    POOL_OPT_MAX_STEPS_FULL = max(0, int(POOL_OPT_MAX_STEPS_FULL))
+    POOL_OPT_TOLERANCE_FULL = max(0, int(POOL_OPT_TOLERANCE_FULL))
 
     # SB3 logger key 最大长度（避免截断冲突导致训练中断）
     # 说明：SB3 的 HumanOutputFormat 会把 key 截断到 max_length，截断后重名会直接 raise 中断训练；
@@ -3341,25 +3364,39 @@ def main():
                 # MeanStdAlphaPool 默认 optimize(max_steps=10000) 在 days*stocks 很大时非常慢。
                 # 这里复用 ALPHAGEN_POOL_OPT_* 作为统一的“优化预算阀门”，方便在脚本里提速/稳住。
                 # 架构级：optimize 内 objective 子采样（仅在 optimize 期间生效，避免污染外部 objective/日志）
+                try:
+                    is_full = bool(int(getattr(self, "capacity", 0) or 0) > 0 and int(getattr(self, "size", 0) or 0) >= int(getattr(self, "capacity", 0) or 0))
+                except Exception:
+                    is_full = False
+                opt_max_steps = int(POOL_OPT_MAX_STEPS)
+                opt_tol = int(POOL_OPT_TOLERANCE)
+                if is_full:
+                    if int(POOL_OPT_MAX_STEPS_FULL) > 0:
+                        opt_max_steps = int(POOL_OPT_MAX_STEPS_FULL)
+                    if int(POOL_OPT_TOLERANCE_FULL) > 0:
+                        opt_tol = int(POOL_OPT_TOLERANCE_FULL)
+
                 day_idx = None
                 stock_idx = None
                 try:
-                    if (POOL_OBJ_SUBSAMPLE_DAYS > 0) or (POOL_OBJ_SUBSAMPLE_SYMBOLS > 0):
+                    days_sub = int(POOL_OBJ_SUBSAMPLE_DAYS_FULL) if (is_full and int(POOL_OBJ_SUBSAMPLE_DAYS_FULL) > 0) else int(POOL_OBJ_SUBSAMPLE_DAYS)
+                    stocks_sub = int(POOL_OBJ_SUBSAMPLE_SYMBOLS_FULL) if (is_full and int(POOL_OBJ_SUBSAMPLE_SYMBOLS_FULL) > 0) else int(POOL_OBJ_SUBSAMPLE_SYMBOLS)
+                    if (days_sub > 0) or (stocks_sub > 0):
                         tgt = getattr(self.calculator, "target", None)
                         if tgt is not None and hasattr(tgt, "shape"):
                             # target: (days, stocks)
                             days = int(tgt.shape[0])
                             stocks = int(tgt.shape[1]) if len(tgt.shape) > 1 else 0
-                            if (POOL_OBJ_SUBSAMPLE_DAYS > 0) and (days > 0):
-                                k = min(days, int(POOL_OBJ_SUBSAMPLE_DAYS))
+                            if (days_sub > 0) and (days > 0):
+                                k = min(days, int(days_sub))
                                 g = torch.Generator(device=tgt.device)
                                 # 用 optimize_calls 做扰动，确保每次 optimize 的子样本不同但可复现
                                 seed = int(SEED + 991 * int(getattr(self, "_perf", {}).get("optimize_calls", 0)))
                                 g.manual_seed(seed)
                                 day_idx = torch.randperm(days, generator=g, device=tgt.device)[:k]
                                 setattr(self, "_obj_subsample_day_idx", day_idx)
-                            if (POOL_OBJ_SUBSAMPLE_SYMBOLS > 0) and (stocks > 0):
-                                k = min(stocks, int(POOL_OBJ_SUBSAMPLE_SYMBOLS))
+                            if (stocks_sub > 0) and (stocks > 0):
+                                k = min(stocks, int(stocks_sub))
                                 g = torch.Generator(device=tgt.device)
                                 seed = int(SEED + 997 * int(getattr(self, "_perf", {}).get("optimize_calls", 0)))
                                 g.manual_seed(seed)
@@ -3371,10 +3408,10 @@ def main():
 
                 try:
                     if not getattr(self, "_perf_enabled", False):
-                        return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                        return super().optimize(lr=POOL_OPT_LR, max_steps=opt_max_steps, tolerance=opt_tol)
                     import time as _time
                     t0 = _time.perf_counter()
-                    out = super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                    out = super().optimize(lr=POOL_OPT_LR, max_steps=opt_max_steps, tolerance=opt_tol)
                     dt = _time.perf_counter() - t0
                     self._perf["optimize_calls"] += 1
                     self._perf["optimize_time_s"] += float(dt)
