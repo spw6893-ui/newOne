@@ -18,7 +18,7 @@ echo ""
 PRESET="${ALPHAGEN_PRESET:-baseline}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "用法:"
-    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb|explore20_ucblcb|explore20_ucblcb_fast|explore20_ucblcb_cs|explore20_ucblcb_cs_val]"
+    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb|explore20_ucblcb|explore20_ucblcb_fast|explore20_ucblcb_cs|explore20_ucblcb_cs_breakplateau|explore20_ucblcb_cs_val]"
     echo ""
     echo "示例:"
     echo "  ./run_training.sh"
@@ -29,6 +29,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "  ./run_training.sh explore20_ucblcb"
     echo "  ./run_training.sh explore20_ucblcb_fast"
     echo "  ./run_training.sh explore20_ucblcb_cs"
+    echo "  ./run_training.sh explore20_ucblcb_cs_breakplateau"
     echo "  ./run_training.sh explore20_ucblcb_cs_val"
     echo ""
     echo "说明:"
@@ -375,6 +376,91 @@ case "$PRESET" in
         # 默认也评估 test（需要时可外部覆盖为 0，提升速度/降低内存压力）
         export_default ALPHAGEN_EVAL_TEST 1
         ;;
+    explore20_ucblcb_cs_breakplateau)
+        # “冲上限版”：核心目的是避免 pool 太快被弱/同质因子塞满，满池后更容易继续抬 best/val。
+        # 主要改动：
+        # - reward 用 delta_obj（更稠密的边际信号，适合长期爬升）
+        # - 更早收紧 ic_lower_bound（减慢入池速度，提高入池质量）
+        # - 后期更严格的 mutual 阈值（强制多样性，缓解 best_ic_ret 平台期）
+        # - beta 更早从 UCB 过渡到 LCB（更早偏向泛化稳健，提升 val/test）
+        export_default ALPHAGEN_PERF_LOG 1
+        export_default ALPHAGEN_ENABLE_CS_OPS 1
+
+        export_default ALPHAGEN_FEATURES_MAX 20
+        export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95
+        export_default ALPHAGEN_TOTAL_TIMESTEPS 800000
+
+        export_default ALPHAGEN_BATCH_SIZE 512
+        export_default ALPHAGEN_N_STEPS 8192
+        export_default ALPHAGEN_N_EPOCHS 10
+        export_default ALPHAGEN_LEARNING_RATE 0.0001
+        export_default ALPHAGEN_CLIP_RANGE 0.2
+        export_default ALPHAGEN_TARGET_KL none
+        export_default ALPHAGEN_ENT_COEF 0
+
+        export_default ALPHAGEN_POOL_TYPE meanstd
+        export_default ALPHAGEN_POOL_CAPACITY 30
+        export_default ALPHAGEN_POOL_L1_ALPHA 0.001
+
+        # reward shaping
+        export_default ALPHAGEN_REWARD_MODE delta_obj
+        export_default ALPHAGEN_REWARD_SCALE 1.0
+
+        # beta schedule：更早跨过 0（避免一直处于 UCB 偏探索导致 val 上不去）
+        export_default ALPHAGEN_POOL_LCB_BETA_START -0.4
+        export_default ALPHAGEN_POOL_LCB_BETA_END 0.8
+        export_default ALPHAGEN_POOL_LCB_BETA_UPDATE_EVERY 10000
+        export_default ALPHAGEN_POOL_LCB_BETA_WARMUP_STEPS 20000
+        export_default ALPHAGEN_POOL_LCB_BETA_SCHEDULE_STEPS 200000
+
+        # optimize 预算与频率（保持 fps）
+        export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
+        export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000
+
+        # 入池门槛：更早收紧（减慢 pool 填充速度）
+        export_default ALPHAGEN_IC_LOWER_BOUND_ABS 1
+        export_default ALPHAGEN_IC_LOWER_BOUND_START 0.01
+        export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
+        export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 10000
+        export_default ALPHAGEN_IC_LOWER_BOUND_WARMUP_STEPS 20000
+        export_default ALPHAGEN_IC_LOWER_BOUND_SCHEDULE_STEPS 120000
+
+        # 多样性：后期更严格 mutual 阈值课程
+        export_default ALPHAGEN_MUTUAL_IC_THRESHOLD_START 0.98
+        export_default ALPHAGEN_MUTUAL_IC_THRESHOLD_END 0.92
+        export_default ALPHAGEN_MUTUAL_IC_THRESHOLD_UPDATE_EVERY 20000
+        export_default ALPHAGEN_MUTUAL_IC_THRESHOLD_WARMUP_STEPS 60000
+        export_default ALPHAGEN_MUTUAL_IC_THRESHOLD_SCHEDULE_STEPS 200000
+
+        # 表达式长度课程（保持与 cs 一致）
+        export_default ALPHAGEN_STACK_GUARD 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_START 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_END 12
+        export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
+        export_default ALPHAGEN_MIN_EXPR_LEN_SCHEDULE_STEPS 150000
+        export_default ALPHAGEN_MIN_EXPR_LEN_WARMUP_STEPS 50000
+        export_default ALPHAGEN_REWARD_PER_STEP 0
+
+        export_default ALPHAGEN_SUBEXPRS_MAX 80
+        export_default ALPHAGEN_SUBEXPRS_RAW_MAX 10
+        export_default ALPHAGEN_SUBEXPRS_WINDOWS "5,10,20,40"
+        export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
+
+        export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
+
+        # FastGate（保持）
+        export_default ALPHAGEN_FAST_GATE 1
+        export_default ALPHAGEN_FAST_GATE_ONLY_WHEN_FULL 1
+        export_default ALPHAGEN_FAST_GATE_SYMBOLS 20
+        export_default ALPHAGEN_FAST_GATE_PERIODS 4000
+        export_default ALPHAGEN_FAST_GATE_MIN_ABS_IC 0.003
+
+        export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
+        export_default ALPHAGEN_EVAL_TEST 1
+        ;;
     explore20_ucblcb_cs_val)
         # “换方法”：在 explore20_ucblcb_cs 基础上启用 ValGate（pool 满后用验证集小样本过滤），
         # 目标是抬高 val_ic 上限，而不是只靠调 pool optimize。
@@ -447,7 +533,7 @@ case "$PRESET" in
         export_default ALPHAGEN_CHECKPOINT_KEEP 5
         ;;
     *)
-        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast / explore20_ucblcb_cs / explore20_ucblcb_cs_val）"
+        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast / explore20_ucblcb_cs / explore20_ucblcb_cs_breakplateau / explore20_ucblcb_cs_val）"
         exit 1
         ;;
 esac
