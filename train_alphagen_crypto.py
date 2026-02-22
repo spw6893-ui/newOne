@@ -896,6 +896,16 @@ def main():
             if fg_calls > 0:
                 self.logger.record("perf/fast_gate_ms_per_call", 1000.0 * fg_time / fg_calls)
 
+            # RobustGate
+            rg_calls = delta("robust_gate_calls")
+            rg_skips = delta("robust_gate_skips")
+            rg_time = delta("robust_gate_time_s")
+            self.logger.record("perf/robust_gate_calls", rg_calls)
+            self.logger.record("perf/robust_gate_skips", rg_skips)
+            self.logger.record("perf/robust_gate_time_s", rg_time)
+            if rg_calls > 0:
+                self.logger.record("perf/robust_gate_ms_per_call", 1000.0 * rg_time / rg_calls)
+
             # ValGate
             vg_calls = delta("val_gate_calls")
             vg_skips = delta("val_gate_skips")
@@ -1997,6 +2007,24 @@ def main():
     FAST_GATE_PERIODS = max(256, FAST_GATE_PERIODS)
     FAST_GATE_MIN_ABS_IC = max(0.0, FAST_GATE_MIN_ABS_IC)
 
+    # RobustGate（训练集内的“鲁棒性门禁”）：用两个不同的训练子集估计 single-IC，
+    # 只有两侧都达标（且可选同号）才继续走完整评估，目的：
+    # - 防止弱/偶然因子太快灌满 pool；
+    # - 降低单一子集过拟合导致的 val_ic 平台期；
+    # - 并且比“直接用 val 做 gate”更符合“训练不看 val”的约束。
+    robust_gate_raw = os.environ.get("ALPHAGEN_ROBUST_GATE", "0").strip().lower()
+    ROBUST_GATE = robust_gate_raw in {"1", "true", "yes", "y", "on"}
+    robust_gate_only_full_raw = os.environ.get("ALPHAGEN_ROBUST_GATE_ONLY_WHEN_FULL", "1").strip().lower()
+    ROBUST_GATE_ONLY_WHEN_FULL = robust_gate_only_full_raw in {"1", "true", "yes", "y", "on"}
+    ROBUST_GATE_SYMBOLS = int(os.environ.get("ALPHAGEN_ROBUST_GATE_SYMBOLS", "20").strip() or 20)
+    ROBUST_GATE_PERIODS = int(os.environ.get("ALPHAGEN_ROBUST_GATE_PERIODS", "4000").strip() or 4000)
+    ROBUST_GATE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_ROBUST_GATE_MIN_ABS_IC", "0.003").strip() or 0.003)
+    robust_gate_same_sign_raw = os.environ.get("ALPHAGEN_ROBUST_GATE_REQUIRE_SAME_SIGN", "1").strip().lower()
+    ROBUST_GATE_REQUIRE_SAME_SIGN = robust_gate_same_sign_raw in {"1", "true", "yes", "y", "on"}
+    ROBUST_GATE_SYMBOLS = max(4, int(ROBUST_GATE_SYMBOLS))
+    ROBUST_GATE_PERIODS = max(256, int(ROBUST_GATE_PERIODS))
+    ROBUST_GATE_MIN_ABS_IC = max(0.0, float(ROBUST_GATE_MIN_ABS_IC))
+
     # 是否允许“训练过程使用 val 做决策”（强烈建议默认禁止，避免泄漏）
     # - 允许评估：周期性 eval 仍可计算/打印 val_ic（只做监控，不反哺训练）
     # - 禁止反馈：ValGate / prune_source=val 等“用 val 决策”路径会被强制关闭
@@ -2134,6 +2162,8 @@ def main():
 
     # Fast Gate：构造一个更小的训练子集，仅用于 single-IC 粗筛（不改变最终 IC 口径）
     fast_gate_calc = None
+    robust_gate_calc_a = None
+    robust_gate_calc_b = None
     if FAST_GATE:
         try:
             class _StockDataView:
@@ -2177,6 +2207,70 @@ def main():
         except Exception as e:
             print(f"⚠ FastGate 初始化失败（将禁用）：{e}")
             fast_gate_calc = None
+
+    # RobustGate：训练集内构造两个不同子集，要求两侧 single-IC 都达标（可选同号）
+    if ROBUST_GATE:
+        try:
+            class _StockDataView2:
+                def __init__(self, base, data_tensor: torch.Tensor):
+                    self.data = data_tensor
+                    self.max_backtrack_days = int(getattr(base, "max_backtrack_days"))
+                    self.max_future_days = int(getattr(base, "max_future_days"))
+
+                @property
+                def n_features(self) -> int:
+                    return int(self.data.shape[1])
+
+                @property
+                def n_stocks(self) -> int:
+                    return int(self.data.shape[2])
+
+                @property
+                def n_days(self) -> int:
+                    return int(self.data.shape[0] - self.max_backtrack_days - self.max_future_days)
+
+            total_symbols = int(getattr(train_data, "n_stocks", 0))
+            take_symbols = min(int(ROBUST_GATE_SYMBOLS), max(1, total_symbols))
+            rng = np.random.default_rng(SEED + 7)
+
+            # 两组不同 symbol 子集
+            idx_a = np.array(sorted(rng.choice(total_symbols, size=take_symbols, replace=False).tolist()), dtype=np.int64)
+            idx_b = np.array(sorted(rng.choice(total_symbols, size=take_symbols, replace=False).tolist()), dtype=np.int64)
+
+            base_tensor = train_data.data
+            need_len = int(ROBUST_GATE_PERIODS + train_data.max_backtrack_days + train_data.max_future_days + 1)
+            total_len = int(base_tensor.shape[0])
+            if total_len < need_len + 8:
+                raise RuntimeError(f"train tensor too short: total_len={total_len}, need_len={need_len}")
+
+            # A：使用最近窗口
+            start_a = max(0, total_len - need_len)
+            t_a = base_tensor[start_a:, :, :].index_select(2, torch.tensor(idx_a, device=base_tensor.device))
+            view_a = _StockDataView2(train_data, t_a)
+
+            # B：在更早的历史里随机抽一个窗口，尽量与最近窗口错开
+            max_start = max(0, (total_len - need_len) - max(8, need_len // 2))
+            start_b = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
+            t_b = base_tensor[start_b : start_b + need_len, :, :].index_select(2, torch.tensor(idx_b, device=base_tensor.device))
+            view_b = _StockDataView2(train_data, t_b)
+
+            if POOL_TYPE == "meanstd":
+                robust_gate_calc_a = TensorQLibStockDataCalculator(view_a, target)
+                robust_gate_calc_b = TensorQLibStockDataCalculator(view_b, target)
+            else:
+                robust_gate_calc_a = QLibStockDataCalculator(view_a, target)
+                robust_gate_calc_b = QLibStockDataCalculator(view_b, target)
+
+            print(
+                "✓ RobustGate 已启用："
+                f"symbols={take_symbols}/{total_symbols}, periods≈{ROBUST_GATE_PERIODS}, "
+                f"min_abs_ic={ROBUST_GATE_MIN_ABS_IC}, only_when_full={ROBUST_GATE_ONLY_WHEN_FULL}, "
+                f"require_same_sign={ROBUST_GATE_REQUIRE_SAME_SIGN}"
+            )
+        except Exception as e:
+            print(f"⚠ RobustGate 初始化失败（将禁用）：{e}")
+            robust_gate_calc_a = None
+            robust_gate_calc_b = None
 
     # gate calculator：
     # - ValGate 用验证集子集（若启用）
@@ -2349,6 +2443,9 @@ def main():
                     "fast_gate_calls": 0,
                     "fast_gate_skips": 0,
                     "fast_gate_time_s": 0.0,
+                    "robust_gate_calls": 0,
+                    "robust_gate_skips": 0,
+                    "robust_gate_time_s": 0.0,
                     "val_gate_calls": 0,
                     "val_gate_skips": 0,
                     "val_gate_time_s": 0.0,
@@ -2362,6 +2459,11 @@ def main():
                 self._fast_gate_calc = fast_gate_calc
                 self._fast_gate_only_full = bool(FAST_GATE_ONLY_WHEN_FULL)
                 self._fast_gate_min_abs_ic = float(FAST_GATE_MIN_ABS_IC)
+                self._robust_gate_calc_a = robust_gate_calc_a
+                self._robust_gate_calc_b = robust_gate_calc_b
+                self._robust_gate_only_full = bool(ROBUST_GATE_ONLY_WHEN_FULL)
+                self._robust_gate_min_abs_ic = float(ROBUST_GATE_MIN_ABS_IC)
+                self._robust_gate_same_sign = bool(ROBUST_GATE_REQUIRE_SAME_SIGN)
                 self._trial_logger = trial_logger
                 self._val_gate_calc = val_gate_calc
                 self._val_gate_only_full = bool(VAL_GATE_ONLY_WHEN_FULL)
@@ -2584,6 +2686,54 @@ def main():
                                         "val_ic_fast": float(getattr(self, "_last_val_gate_ic", float("nan")))
                                         if np.isfinite(getattr(self, "_last_val_gate_ic", float("nan")))
                                         else None,
+                                        "pool_size": int(getattr(self, "size", 0) or 0),
+                                    }
+                                )
+                            return 0.0
+
+                # RobustGate：训练集内两个子集都达标（可选同号）才继续
+                rg_a = getattr(self, "_robust_gate_calc_a", None)
+                rg_b = getattr(self, "_robust_gate_calc_b", None)
+                if (rg_a is not None) and (rg_b is not None):
+                    only_full = bool(getattr(self, "_robust_gate_only_full", True))
+                    if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                        import time as _time
+                        t0g = _time.perf_counter()
+                        try:
+                            ic_a = float(rg_a.calc_single_IC_ret(expr))
+                        except Exception:
+                            ic_a = float("nan")
+                        try:
+                            ic_b = float(rg_b.calc_single_IC_ret(expr))
+                        except Exception:
+                            ic_b = float("nan")
+                        dtg = _time.perf_counter() - t0g
+                        if getattr(self, "_perf_enabled", False):
+                            self._perf["robust_gate_calls"] += 1
+                            self._perf["robust_gate_time_s"] += float(dtg)
+                        thr = float(getattr(self, "_robust_gate_min_abs_ic", 0.0))
+                        same_sign = bool(getattr(self, "_robust_gate_same_sign", True))
+                        ok = bool(np.isfinite(ic_a) and np.isfinite(ic_b) and (abs(ic_a) >= thr) and (abs(ic_b) >= thr))
+                        if ok and same_sign:
+                            ok = (ic_a >= 0 and ic_b >= 0) or (ic_a <= 0 and ic_b <= 0)
+                        if not ok:
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["robust_gate_skips"] += 1
+                            tl = getattr(self, "_trial_logger", None)
+                            if tl is not None:
+                                try:
+                                    step = int(getattr(self, "_current_step", 0) or 0)
+                                except Exception:
+                                    step = 0
+                                tl.log(
+                                    {
+                                        "step": step,
+                                        "expr": str(expr),
+                                        "gate": "robust_gate",
+                                        "robust_ic_a": float(ic_a) if np.isfinite(ic_a) else None,
+                                        "robust_ic_b": float(ic_b) if np.isfinite(ic_b) else None,
+                                        "robust_gate_thr": float(thr),
+                                        "require_same_sign": bool(same_sign),
                                         "pool_size": int(getattr(self, "size", 0) or 0),
                                     }
                                 )
