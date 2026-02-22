@@ -43,6 +43,9 @@ if [ -n "${1:-}" ]; then
     PRESET="$1"
 fi
 
+# 让 Python 侧也能看到本次选择的 preset（便于日志/复现实验）
+export ALPHAGEN_PRESET="$PRESET"
+
 export_default () {
     # 仅当变量未设置时写入默认值（方便用户外部覆盖）
     local name="$1"
@@ -802,6 +805,11 @@ echo "  - ALPHAGEN_EVAL_EVERY_STEPS=${ALPHAGEN_EVAL_EVERY_STEPS:-0}"
 echo "  - ALPHAGEN_EVAL_TEST=${ALPHAGEN_EVAL_TEST:-1}"
 echo "  - ALPHAGEN_POOL_L1_ALPHA=${ALPHAGEN_POOL_L1_ALPHA:-0.005}"
 echo "  - ALPHAGEN_TARGET_KL=${ALPHAGEN_TARGET_KL:-none}"
+echo "  - ALPHAGEN_FAST_GATE=${ALPHAGEN_FAST_GATE:-0}"
+echo "  - ALPHAGEN_ROBUST_GATE=${ALPHAGEN_ROBUST_GATE:-0}"
+echo "  - ALPHAGEN_RESIDUAL_GATE=${ALPHAGEN_RESIDUAL_GATE:-0}"
+echo "  - ALPHAGEN_POOL_LCB_BETA_FULL_START=${ALPHAGEN_POOL_LCB_BETA_FULL_START:-}"
+echo "  - ALPHAGEN_POOL_LCB_BETA_FULL_END=${ALPHAGEN_POOL_LCB_BETA_FULL_END:-}"
 echo ""
 echo "监控训练进度:"
 echo "  tensorboard --logdir=./alphagen_output/tensorboard"
