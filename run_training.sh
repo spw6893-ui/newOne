@@ -121,7 +121,9 @@ preset_explore20_ucblcb_cs_breakplateau () {
 
     export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
 
-    export_default ALPHAGEN_FAST_GATE 1
+    # FastGate（近似评估）默认关闭：它会改变“满池阶段”的候选筛选分布，可能影响复现历史上限。
+    # 如需开启，用 explore20_ucblcb_fg 预设或显式 export ALPHAGEN_FAST_GATE=1。
+    export_default ALPHAGEN_FAST_GATE 0
     export_default ALPHAGEN_FAST_GATE_ONLY_WHEN_FULL 1
     export_default ALPHAGEN_FAST_GATE_SYMBOLS 20
     export_default ALPHAGEN_FAST_GATE_PERIODS 4000

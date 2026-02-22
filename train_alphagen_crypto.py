@@ -1126,6 +1126,7 @@ def main():
             val_calculator_obj,
             test_calculator_obj,
             eval_every_steps: int,
+            test_every_steps: int,
             eval_test: bool,
             print_on_test_error: bool = False,
             verbose: int = 0,
@@ -1135,6 +1136,7 @@ def main():
             self._val_calc = val_calculator_obj
             self._test_calc = test_calculator_obj
             self._every = max(1, int(eval_every_steps))
+            self._test_every = max(1, int(test_every_steps))
             self._eval_test = bool(eval_test)
             self._print_on_test_error = bool(print_on_test_error)
 
@@ -1222,7 +1224,11 @@ def main():
                 if self.verbose:
                     print(f"⚠ Val 评估失败：{e}")
 
-            if self._eval_test and (self._test_calc is not None):
+            if (
+                self._eval_test
+                and (self._test_calc is not None)
+                and ((self.num_timesteps % self._test_every) == 0)
+            ):
                 try:
                     t = self._eval_pool(self._test_calc)
                     self.logger.record("eval/test_ic", float(t.get("ic", 0.0)))
@@ -1746,7 +1752,11 @@ def main():
     device_obj = torch.device(DEVICE)
 
     # 输出配置
-    OUTPUT_DIR = Path('./alphagen_output')
+    # - 默认输出到 ./alphagen_output（相对于运行时 cwd）
+    # - 如你在别的目录启动（例如 /root/test/newOne/），容易“以为没保存”，其实是输出到了那个目录下。
+    #   可用 ALPHAGEN_OUTPUT_DIR 显式指定统一输出目录，便于定位 checkpoint / tensorboard。
+    output_dir_raw = os.environ.get("ALPHAGEN_OUTPUT_DIR", "./alphagen_output").strip() or "./alphagen_output"
+    OUTPUT_DIR = Path(output_dir_raw)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ==================== Trial Log / Surrogate Gate（可选） ====================
@@ -2194,6 +2204,15 @@ def main():
     # 周期性评估（默认关闭，>0 开启）
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
     eval_test_flag = os.environ.get("ALPHAGEN_EVAL_TEST", "1").strip().lower() in {"1", "true", "yes", "y"}
+    # 单独控制 test 评估频率：默认与 val 一致；设为更大可显著提升 SB3 展示的 fps（评估时间会计入 fps）。
+    try:
+        eval_test_every_steps = int(
+            os.environ.get("ALPHAGEN_EVAL_TEST_EVERY_STEPS", str(eval_every_steps)).strip() or eval_every_steps
+        )
+    except Exception:
+        eval_test_every_steps = eval_every_steps
+    if eval_test_every_steps <= 0:
+        eval_test_every_steps = eval_every_steps
     eval_test_print_err = os.environ.get("ALPHAGEN_EVAL_TEST_PRINT_ERROR", "0").strip().lower() in {
         "1",
         "true",
@@ -4233,6 +4252,7 @@ def main():
                 val_calculator_obj=val_calculator_periodic,
                 test_calculator_obj=test_calculator_periodic,
                 eval_every_steps=eval_every_steps,
+                test_every_steps=eval_test_every_steps,
                 eval_test=eval_test_flag,
                 print_on_test_error=bool(eval_test_print_err),
                 verbose=0,
