@@ -906,6 +906,16 @@ def main():
             if rg_calls > 0:
                 self.logger.record("perf/robust_gate_ms_per_call", 1000.0 * rg_time / rg_calls)
 
+            # ResidualGate
+            resg_calls = delta("residual_gate_calls")
+            resg_skips = delta("residual_gate_skips")
+            resg_time = delta("residual_gate_time_s")
+            self.logger.record("perf/residual_gate_calls", resg_calls)
+            self.logger.record("perf/residual_gate_skips", resg_skips)
+            self.logger.record("perf/residual_gate_time_s", resg_time)
+            if resg_calls > 0:
+                self.logger.record("perf/residual_gate_ms_per_call", 1000.0 * resg_time / resg_calls)
+
             # ValGate
             vg_calls = delta("val_gate_calls")
             vg_skips = delta("val_gate_skips")
@@ -2025,6 +2035,23 @@ def main():
     ROBUST_GATE_PERIODS = max(256, int(ROBUST_GATE_PERIODS))
     ROBUST_GATE_MIN_ABS_IC = max(0.0, float(ROBUST_GATE_MIN_ABS_IC))
 
+    # ResidualGate（训练集内的“边际贡献门禁”）：
+    # - 在一个训练 proxy 子集上，用当前 pool 的组合 alpha 形成 residual = target - ensemble；
+    # - 候选表达式必须与 residual 有足够相关性（abs(corr) >= thr）才继续走完整评估/入池；
+    # 目标：减少“和现有 pool 冗余”的候选灌满 pool，缓解满池平台期，并不引入 val 泄漏。
+    residual_gate_raw = os.environ.get("ALPHAGEN_RESIDUAL_GATE", "0").strip().lower()
+    RESIDUAL_GATE = residual_gate_raw in {"1", "true", "yes", "y", "on"}
+    residual_gate_only_full_raw = os.environ.get("ALPHAGEN_RESIDUAL_GATE_ONLY_WHEN_FULL", "1").strip().lower()
+    RESIDUAL_GATE_ONLY_WHEN_FULL = residual_gate_only_full_raw in {"1", "true", "yes", "y", "on"}
+    RESIDUAL_GATE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_RESIDUAL_GATE_MIN_ABS_IC", "0.002").strip() or 0.002)
+    RESIDUAL_GATE_TOPK = int(os.environ.get("ALPHAGEN_RESIDUAL_GATE_TOPK", "12").strip() or 12)
+    RESIDUAL_GATE_UPDATE_EVERY_STEPS = int(os.environ.get("ALPHAGEN_RESIDUAL_GATE_UPDATE_EVERY_STEPS", "20000").strip() or 20000)
+    residual_gate_use_fast_raw = os.environ.get("ALPHAGEN_RESIDUAL_GATE_USE_FASTCALC", "1").strip().lower()
+    RESIDUAL_GATE_USE_FASTCALC = residual_gate_use_fast_raw in {"1", "true", "yes", "y", "on"}
+    RESIDUAL_GATE_MIN_ABS_IC = max(0.0, float(RESIDUAL_GATE_MIN_ABS_IC))
+    RESIDUAL_GATE_TOPK = max(1, int(RESIDUAL_GATE_TOPK))
+    RESIDUAL_GATE_UPDATE_EVERY_STEPS = max(256, int(RESIDUAL_GATE_UPDATE_EVERY_STEPS))
+
     # 是否允许“训练过程使用 val 做决策”（强烈建议默认禁止，避免泄漏）
     # - 允许评估：周期性 eval 仍可计算/打印 val_ic（只做监控，不反哺训练）
     # - 禁止反馈：ValGate / prune_source=val 等“用 val 决策”路径会被强制关闭
@@ -2164,6 +2191,7 @@ def main():
     fast_gate_calc = None
     robust_gate_calc_a = None
     robust_gate_calc_b = None
+    residual_gate_calc = None
     if FAST_GATE:
         try:
             class _StockDataView:
@@ -2207,6 +2235,25 @@ def main():
         except Exception as e:
             print(f"⚠ FastGate 初始化失败（将禁用）：{e}")
             fast_gate_calc = None
+
+    # ResidualGate：默认复用 FastGate 的 calc（同一个训练 proxy 子集，避免重复加载/缓存割裂）
+    if RESIDUAL_GATE:
+        try:
+            if RESIDUAL_GATE_USE_FASTCALC and (fast_gate_calc is not None):
+                residual_gate_calc = fast_gate_calc
+                print(
+                    f"✓ ResidualGate 已启用（复用 FastGate calc）：topk={RESIDUAL_GATE_TOPK}, "
+                    f"thr={RESIDUAL_GATE_MIN_ABS_IC}, update_every_steps={RESIDUAL_GATE_UPDATE_EVERY_STEPS}, "
+                    f"only_when_full={RESIDUAL_GATE_ONLY_WHEN_FULL}"
+                )
+            else:
+                # 兜底：若未启用 FastGate，则用与 FastGate 相同参数构造一份 proxy calc
+                residual_gate_calc = fast_gate_calc
+                if residual_gate_calc is None:
+                    raise RuntimeError("ResidualGate 需要 FastGate calc（建议开启 ALPHAGEN_FAST_GATE=1 或设置 ALPHAGEN_RESIDUAL_GATE_USE_FASTCALC=1）")
+        except Exception as e:
+            print(f"⚠ ResidualGate 初始化失败（将禁用）：{e}")
+            residual_gate_calc = None
 
     # RobustGate：训练集内构造两个不同子集，要求两侧 single-IC 都达标（可选同号）
     if ROBUST_GATE:
@@ -2446,6 +2493,9 @@ def main():
                     "robust_gate_calls": 0,
                     "robust_gate_skips": 0,
                     "robust_gate_time_s": 0.0,
+                    "residual_gate_calls": 0,
+                    "residual_gate_skips": 0,
+                    "residual_gate_time_s": 0.0,
                     "val_gate_calls": 0,
                     "val_gate_skips": 0,
                     "val_gate_time_s": 0.0,
@@ -2464,6 +2514,14 @@ def main():
                 self._robust_gate_only_full = bool(ROBUST_GATE_ONLY_WHEN_FULL)
                 self._robust_gate_min_abs_ic = float(ROBUST_GATE_MIN_ABS_IC)
                 self._robust_gate_same_sign = bool(ROBUST_GATE_REQUIRE_SAME_SIGN)
+                self._residual_gate_calc = residual_gate_calc
+                self._residual_gate_only_full = bool(RESIDUAL_GATE_ONLY_WHEN_FULL)
+                self._residual_gate_min_abs_ic = float(RESIDUAL_GATE_MIN_ABS_IC)
+                self._residual_gate_topk = int(RESIDUAL_GATE_TOPK)
+                self._residual_gate_update_every_steps = int(RESIDUAL_GATE_UPDATE_EVERY_STEPS)
+                self._residual_gate_last_update_step = -1
+                self._residual_gate_dirty = True
+                self._residual_gate_residual = None
                 self._trial_logger = trial_logger
                 self._val_gate_calc = val_gate_calc
                 self._val_gate_only_full = bool(VAL_GATE_ONLY_WHEN_FULL)
@@ -3143,12 +3201,150 @@ def main():
                                 )
                             return 0.0
 
+                # RobustGate：训练集内两个子集都达标（可选同号）才继续（不看 val）
+                rg_a = getattr(self, "_robust_gate_calc_a", None)
+                rg_b = getattr(self, "_robust_gate_calc_b", None)
+                if (rg_a is not None) and (rg_b is not None):
+                    only_full = bool(getattr(self, "_robust_gate_only_full", True))
+                    if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                        import time as _time
+                        t0g = _time.perf_counter()
+                        try:
+                            ic_a = float(rg_a.calc_single_IC_ret(expr))
+                        except Exception:
+                            ic_a = float("nan")
+                        try:
+                            ic_b = float(rg_b.calc_single_IC_ret(expr))
+                        except Exception:
+                            ic_b = float("nan")
+                        dtg = _time.perf_counter() - t0g
+                        if getattr(self, "_perf_enabled", False):
+                            self._perf["robust_gate_calls"] += 1
+                            self._perf["robust_gate_time_s"] += float(dtg)
+                        thr = float(getattr(self, "_robust_gate_min_abs_ic", 0.0))
+                        same_sign = bool(getattr(self, "_robust_gate_same_sign", True))
+                        ok = bool(np.isfinite(ic_a) and np.isfinite(ic_b) and (abs(ic_a) >= thr) and (abs(ic_b) >= thr))
+                        if ok and same_sign:
+                            ok = (ic_a >= 0 and ic_b >= 0) or (ic_a <= 0 and ic_b <= 0)
+                        if not ok:
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["robust_gate_skips"] += 1
+                            tl = getattr(self, "_trial_logger", None)
+                            if tl is not None:
+                                tl.log(
+                                    {
+                                        "step": step,
+                                        "expr": expr_str,
+                                        "gate": "robust_gate",
+                                        "robust_ic_a": float(ic_a) if np.isfinite(ic_a) else None,
+                                        "robust_ic_b": float(ic_b) if np.isfinite(ic_b) else None,
+                                        "robust_gate_thr": float(thr),
+                                        "require_same_sign": bool(same_sign),
+                                        "pool_size": int(getattr(self, "size", 0) or 0),
+                                    }
+                                )
+                            return 0.0
+
+                # ResidualGate：候选必须能解释当前 pool 的 residual（训练 proxy 子集，不看 val）
+                res_calc = getattr(self, "_residual_gate_calc", None)
+                if res_calc is not None:
+                    only_full = bool(getattr(self, "_residual_gate_only_full", True))
+                    if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                        import time as _time
+                        t0g = _time.perf_counter()
+                        try:
+                            from alphagen.utils.correlation import batch_pearsonr  # 延迟导入
+                        except Exception:
+                            batch_pearsonr = None
+
+                        def _get_target_tensor(calc_obj):
+                            tv = getattr(calc_obj, "target_value", None)
+                            if tv is not None:
+                                return tv
+                            try:
+                                return getattr(calc_obj, "target")
+                            except Exception:
+                                return None
+
+                        def _eval_alpha(calc_obj, e):
+                            fn = getattr(calc_obj, "evaluate_alpha", None)
+                            if fn is not None:
+                                return fn(e)
+                            fn = getattr(calc_obj, "_calc_alpha", None)
+                            if fn is not None:
+                                return fn(e)
+                            return None
+
+                        # 更新 residual（按步数节流 + pool 发生变更后置脏）
+                        try:
+                            update_every = int(getattr(self, "_residual_gate_update_every_steps", 20000) or 20000)
+                        except Exception:
+                            update_every = 20000
+                        last_u = int(getattr(self, "_residual_gate_last_update_step", -1) or -1)
+                        dirty = bool(getattr(self, "_residual_gate_dirty", True))
+                        need_update = dirty or (last_u < 0) or ((step - last_u) >= update_every)
+                        if need_update:
+                            try:
+                                size = int(getattr(self, "size", 0) or 0)
+                                if size <= 0:
+                                    raise RuntimeError("empty pool")
+                                weights = np.asarray(getattr(self, "weights"), dtype=np.float64)
+                                k = min(size, int(getattr(self, "_residual_gate_topk", 12) or 12))
+                                k = max(1, int(k))
+                                idx = np.argsort(-np.abs(weights[:size]))[:k]
+                                exprs_sel = [self.exprs[int(i)] for i in idx]  # type: ignore[index]
+                                w_sel = [float(weights[int(i)]) for i in idx]
+                                y_hat = res_calc.make_ensemble_alpha(exprs_sel, w_sel)
+                                tgt = _get_target_tensor(res_calc)
+                                if tgt is None:
+                                    raise RuntimeError("no target tensor")
+                                residual = tgt - y_hat
+                                setattr(self, "_residual_gate_residual", residual)
+                                setattr(self, "_residual_gate_last_update_step", int(step))
+                                setattr(self, "_residual_gate_dirty", False)
+                            except Exception:
+                                # 无法更新 residual，跳过门禁（不阻塞训练）
+                                setattr(self, "_residual_gate_residual", None)
+
+                        residual = getattr(self, "_residual_gate_residual", None)
+                        thr = float(getattr(self, "_residual_gate_min_abs_ic", 0.0))
+                        score = float("nan")
+                        if (batch_pearsonr is not None) and (residual is not None):
+                            try:
+                                a = _eval_alpha(res_calc, expr)
+                                if a is not None:
+                                    score = float(batch_pearsonr(a, residual).mean().item())
+                            except Exception:
+                                score = float("nan")
+                        dtg = _time.perf_counter() - t0g
+                        if getattr(self, "_perf_enabled", False):
+                            self._perf["residual_gate_calls"] += 1
+                            self._perf["residual_gate_time_s"] += float(dtg)
+                        if not (np.isfinite(score) and (abs(score) >= thr)):
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["residual_gate_skips"] += 1
+                            tl = getattr(self, "_trial_logger", None)
+                            if tl is not None:
+                                tl.log(
+                                    {
+                                        "step": step,
+                                        "expr": expr_str,
+                                        "gate": "residual_gate",
+                                        "residual_ic": float(score) if np.isfinite(score) else None,
+                                        "residual_gate_thr": float(thr),
+                                        "pool_size": int(getattr(self, "size", 0) or 0),
+                                    }
+                                )
+                            return 0.0
+
                 pre_hist = len(getattr(self, "update_history", []) or [])
                 every = int(getattr(self, "_optimize_every_updates", 1) or 1)
                 if every <= 1:
                     if not getattr(self, "_perf_enabled", False):
                         out = super().try_new_expr(expr)
                         post_hist = len(getattr(self, "update_history", []) or [])
+                        if post_hist > pre_hist:
+                            setattr(self, "_residual_gate_dirty", True)
                         tl = getattr(self, "_trial_logger", None)
                         if tl is not None:
                             tl.log(
@@ -3170,6 +3366,8 @@ def main():
                     self._perf["try_new_expr_calls"] += 1
                     self._perf["try_new_expr_time_s"] += float(dt)
                     post_hist = len(getattr(self, "update_history", []) or [])
+                    if post_hist > pre_hist:
+                        setattr(self, "_residual_gate_dirty", True)
                     tl = getattr(self, "_trial_logger", None)
                     if tl is not None:
                         tl.log(
@@ -3188,6 +3386,8 @@ def main():
                 if not getattr(self, "_perf_enabled", False):
                     out = self._try_new_expr_lazy(expr)
                     post_hist = len(getattr(self, "update_history", []) or [])
+                    if post_hist > pre_hist:
+                        setattr(self, "_residual_gate_dirty", True)
                     tl = getattr(self, "_trial_logger", None)
                     if tl is not None:
                         tl.log(
@@ -3209,6 +3409,8 @@ def main():
                 self._perf["try_new_expr_calls"] += 1
                 self._perf["try_new_expr_time_s"] += float(dt)
                 post_hist = len(getattr(self, "update_history", []) or [])
+                if post_hist > pre_hist:
+                    setattr(self, "_residual_gate_dirty", True)
                 tl = getattr(self, "_trial_logger", None)
                 if tl is not None:
                     tl.log(
