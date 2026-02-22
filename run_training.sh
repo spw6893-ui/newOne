@@ -480,6 +480,13 @@ case "$PRESET" in
         export_default ALPHAGEN_RESIDUAL_GATE_UPDATE_EVERY_STEPS 20000
         export_default ALPHAGEN_RESIDUAL_GATE_USE_FASTCALC 1
 
+        # 满池后二段 beta：避免“满池后还在 beta<0 的 UCB 阶段”导致 best 卡住
+        # - 满池后从 0.0 快速切到 0.8（偏稳健），更对齐 OOS 提升
+        export_default ALPHAGEN_POOL_LCB_BETA_FULL_START 0.0
+        export_default ALPHAGEN_POOL_LCB_BETA_FULL_END 0.8
+        export_default ALPHAGEN_POOL_LCB_BETA_FULL_SCHEDULE_STEPS 60000
+        export_default ALPHAGEN_POOL_LCB_BETA_FULL_WARMUP_STEPS 0
+
         # 其他参数与 explore20_ucblcb_cs 保持一致（便于对比）
         export_default ALPHAGEN_FEATURES_MAX 20
         export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95

@@ -1387,6 +1387,10 @@ def main():
             update_every: int,
             schedule_steps: Optional[int] = None,
             warmup_steps: Optional[int] = None,
+            full_start_beta: Optional[float] = None,
+            full_end_beta: Optional[float] = None,
+            full_schedule_steps: Optional[int] = None,
+            full_warmup_steps: Optional[int] = None,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
@@ -1404,6 +1408,11 @@ def main():
             self.end_beta = float(end_beta)
             self.update_every = max(1, int(update_every))
             self._last: Optional[float] = None
+            self._full_step: Optional[int] = None
+            self.full_start_beta = full_start_beta
+            self.full_end_beta = full_end_beta
+            self.full_schedule_steps = max(1, int(full_schedule_steps)) if full_schedule_steps is not None else None
+            self.full_warmup_steps = max(0, int(full_warmup_steps)) if full_warmup_steps is not None else None
 
         def _compute_beta(self) -> float:
             if self.num_timesteps <= self.warmup_steps:
@@ -1415,7 +1424,36 @@ def main():
         def _on_step(self) -> bool:
             if (self.num_timesteps % self.update_every) != 0:
                 return True
+            # 记录首次满池的时间点
+            if self._full_step is None:
+                try:
+                    size = int(getattr(self.pool, "size", 0) or 0)
+                    cap = int(getattr(self.pool, "capacity", 0) or 0)
+                except Exception:
+                    size, cap = 0, 0
+                if cap > 0 and size >= cap:
+                    self._full_step = int(self.num_timesteps)
+                    # 标记一下，便于在 TensorBoard 上对齐“满池拐点”
+                    try:
+                        self.logger.record("pool/full_step", float(self._full_step))
+                    except Exception:
+                        pass
+
             beta = float(self._compute_beta())
+            # 满池后二段课程：以“满池时刻”为 0 点，快速把 beta 切到稳健区（beta>0）
+            if (
+                (self._full_step is not None)
+                and (self.full_start_beta is not None)
+                and (self.full_end_beta is not None)
+                and (self.full_schedule_steps is not None)
+                and (self.full_warmup_steps is not None)
+            ):
+                since = int(self.num_timesteps) - int(self._full_step)
+                if since <= int(self.full_warmup_steps):
+                    frac = 0.0
+                else:
+                    frac = min(1.0, float(since - int(self.full_warmup_steps)) / float(self.full_schedule_steps))
+                beta = float(self.full_start_beta + frac * (float(self.full_end_beta) - float(self.full_start_beta)))
             setattr(self.pool, "_lcb_beta", beta)
             self.logger.record("pool/lcb_beta", beta)
             self._last = beta
@@ -1539,6 +1577,7 @@ def main():
             start_every: int,
             end_every: int,
             update_every: int,
+            full_every: int = 0,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
@@ -1547,6 +1586,7 @@ def main():
             self.start_every = max(1, int(start_every))
             self.end_every = max(1, int(end_every))
             self.update_every = max(1, int(update_every))
+            self.full_every = max(0, int(full_every))
             self._last: Optional[int] = None
 
         def _compute_every(self) -> int:
@@ -1558,6 +1598,15 @@ def main():
             if (self.num_timesteps % self.update_every) != 0:
                 return True
             v = int(self._compute_every())
+            # 满池后固定 optimize 频率（用于满池阶段的单独控制）
+            if self.full_every > 0:
+                try:
+                    size = int(getattr(self.pool, "size", 0) or 0)
+                    cap = int(getattr(self.pool, "capacity", 0) or 0)
+                except Exception:
+                    size, cap = 0, 0
+                if cap > 0 and size >= cap:
+                    v = int(self.full_every)
             try:
                 setattr(self.pool, "_optimize_every_updates", v)
             except Exception:
@@ -1838,6 +1887,31 @@ def main():
     pool_lcb_beta_warmup_steps = int(os.environ.get("ALPHAGEN_POOL_LCB_BETA_WARMUP_STEPS", "0").strip() or 0)
     pool_lcb_beta_warmup_steps = max(0, int(pool_lcb_beta_warmup_steps))
 
+    # 满池后 beta 二段课程（用于解决“pool 满了但仍处于 UCB(beta<0) 导致后期卡住”的问题）
+    # - 仅当 FULL_START/FULL_END 均可解析为 float 时启用；否则忽略。
+    full_beta_start_raw = os.environ.get("ALPHAGEN_POOL_LCB_BETA_FULL_START", "").strip().lower()
+    full_beta_end_raw = os.environ.get("ALPHAGEN_POOL_LCB_BETA_FULL_END", "").strip().lower()
+    POOL_LCB_BETA_FULL_START: Optional[float]
+    POOL_LCB_BETA_FULL_END: Optional[float]
+    try:
+        POOL_LCB_BETA_FULL_START = float(full_beta_start_raw) if (full_beta_start_raw not in {"", "none", "null"}) else None
+    except Exception:
+        POOL_LCB_BETA_FULL_START = None
+    try:
+        POOL_LCB_BETA_FULL_END = float(full_beta_end_raw) if (full_beta_end_raw not in {"", "none", "null"}) else None
+    except Exception:
+        POOL_LCB_BETA_FULL_END = None
+    try:
+        pool_lcb_beta_full_schedule_steps = int(os.environ.get("ALPHAGEN_POOL_LCB_BETA_FULL_SCHEDULE_STEPS", "60000").strip() or 60000)
+    except Exception:
+        pool_lcb_beta_full_schedule_steps = 60000
+    try:
+        pool_lcb_beta_full_warmup_steps = int(os.environ.get("ALPHAGEN_POOL_LCB_BETA_FULL_WARMUP_STEPS", "0").strip() or 0)
+    except Exception:
+        pool_lcb_beta_full_warmup_steps = 0
+    pool_lcb_beta_full_schedule_steps = max(1, int(pool_lcb_beta_full_schedule_steps))
+    pool_lcb_beta_full_warmup_steps = max(0, int(pool_lcb_beta_full_warmup_steps))
+
     # 动态 threshold：start/end 任意一个被设置就启用（默认与 IC_LOWER_BOUND 相同 => 等价于关闭）
     ic_lb_start = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_START", str(IC_LOWER_BOUND)))
     ic_lb_end = float(os.environ.get("ALPHAGEN_IC_LOWER_BOUND_END", str(IC_LOWER_BOUND)))
@@ -1992,6 +2066,12 @@ def main():
     POOL_OPT_EVERY_UPDATES_END = max(1, POOL_OPT_EVERY_UPDATES_END)
     POOL_OPT_EVERY_UPDATES_UPDATE_EVERY = int(os.environ.get("ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY", "20000").strip() or 20000)
     POOL_OPT_EVERY_UPDATES_UPDATE_EVERY = max(256, POOL_OPT_EVERY_UPDATES_UPDATE_EVERY)
+    # 满池后固定 optimize 频率（用于“满池阶段”的单独控制；0 表示禁用）
+    try:
+        POOL_OPT_EVERY_UPDATES_FULL = int(os.environ.get("ALPHAGEN_POOL_OPT_EVERY_UPDATES_FULL", "0").strip() or 0)
+    except Exception:
+        POOL_OPT_EVERY_UPDATES_FULL = 0
+    POOL_OPT_EVERY_UPDATES_FULL = max(0, int(POOL_OPT_EVERY_UPDATES_FULL))
 
     # 周期性评估（默认关闭，>0 开启）
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
@@ -3706,16 +3786,17 @@ def main():
         callbacks.append(ckpt_cb)
     # pool.optimize 频率 schedule（默认关闭：start=end=1 时等价于原行为）
     if POOL_OPT_EVERY_UPDATES_START != POOL_OPT_EVERY_UPDATES_END:
-        callbacks.append(
-            PoolOptimizeEveryScheduleCallback(
-                pool=pool,
-                total_timesteps=TOTAL_TIMESTEPS,
-                start_every=POOL_OPT_EVERY_UPDATES_START,
-                end_every=POOL_OPT_EVERY_UPDATES_END,
-                update_every=POOL_OPT_EVERY_UPDATES_UPDATE_EVERY,
-                verbose=0,
+            callbacks.append(
+                PoolOptimizeEveryScheduleCallback(
+                    pool=pool,
+                    total_timesteps=TOTAL_TIMESTEPS,
+                    start_every=POOL_OPT_EVERY_UPDATES_START,
+                    end_every=POOL_OPT_EVERY_UPDATES_END,
+                    update_every=POOL_OPT_EVERY_UPDATES_UPDATE_EVERY,
+                    full_every=int(POOL_OPT_EVERY_UPDATES_FULL),
+                    verbose=0,
+                )
             )
-        )
     else:
         try:
             setattr(pool, "_optimize_every_updates", int(POOL_OPT_EVERY_UPDATES_START))
@@ -3759,6 +3840,10 @@ def main():
                     update_every=int(max(256, pool_lcb_beta_update_every)),
                     schedule_steps=int(pool_lcb_beta_schedule_steps),
                     warmup_steps=int(pool_lcb_beta_warmup_steps),
+                    full_start_beta=POOL_LCB_BETA_FULL_START,
+                    full_end_beta=POOL_LCB_BETA_FULL_END,
+                    full_schedule_steps=int(pool_lcb_beta_full_schedule_steps),
+                    full_warmup_steps=int(pool_lcb_beta_full_warmup_steps),
                     verbose=0,
                 )
             )
