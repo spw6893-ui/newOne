@@ -916,6 +916,109 @@ def main():
             self._last = dict(st)
             return True
 
+    class PeriodicPoolValPruneCallback(BaseCallback):
+        """
+        架构级改动：pool 满后进入平台期时，仅靠 try_new_expr 的“局部替换”很容易卡死。
+
+        这里增加一个“周期性重筛/腾位”机制：
+        - 每隔 N steps，用小样本验证集（val_gate_calc）快速估计当前 pool 每个因子的 single-IC；
+        - 只保留 top-K（按 abs(val_ic_fast)）的因子，其余直接移除，让 pool 重新有空间容纳新因子；
+        - 目的：强制 pool 持续更新，避免弱/同质因子长期占坑导致 val_ic 上限上不去。
+
+        注意：
+        - 该操作默认只在 pool 满时触发；
+        - 评估使用小样本 val 子集，成本低，且触发频率低，对平均 fps 影响很小。
+        """
+
+        def __init__(
+            self,
+            pool,
+            val_calc,
+            every_steps: int,
+            keep_top_k: int,
+            min_abs_ic: float = 0.0,
+            only_when_full: bool = True,
+            verbose: int = 0,
+        ):
+            super().__init__(verbose=verbose)
+            self._pool = pool
+            self._val_calc = val_calc
+            self._every = max(256, int(every_steps))
+            self._keep_k = max(1, int(keep_top_k))
+            self._min_abs_ic = float(max(0.0, min_abs_ic))
+            self._only_full = bool(only_when_full)
+
+        @staticmethod
+        def _finite_abs(v: float) -> float:
+            try:
+                if not np.isfinite(v):
+                    return -1.0
+                return float(abs(v))
+            except Exception:
+                return -1.0
+
+        def _on_step(self) -> bool:
+            if (self.num_timesteps % self._every) != 0:
+                return True
+            if self._val_calc is None:
+                return True
+            try:
+                size = int(getattr(self._pool, "size", 0) or 0)
+                cap = int(getattr(self._pool, "capacity", 0) or 0)
+            except Exception:
+                return True
+            if size <= 0:
+                return True
+            if self._only_full and cap > 0 and size < cap:
+                return True
+
+            import time as _time
+            t0 = _time.perf_counter()
+
+            vals = []
+            for i in range(size):
+                try:
+                    expr = self._pool.exprs[i]  # type: ignore[index]
+                except Exception:
+                    expr = None
+                if expr is None:
+                    vals.append((i, float("nan")))
+                    continue
+                try:
+                    ic = float(self._val_calc.calc_single_IC_ret(expr))
+                except Exception:
+                    ic = float("nan")
+                vals.append((i, ic))
+
+            order = sorted(vals, key=lambda x: self._finite_abs(x[1]), reverse=True)
+            keep = [i for i, _ in order[: min(self._keep_k, len(order))]]
+            if self._min_abs_ic > 0:
+                extra = [i for i, ic in order if self._finite_abs(ic) >= self._min_abs_ic]
+                for i in extra:
+                    if i not in keep:
+                        keep.append(i)
+            keep = sorted(set(keep))
+            if len(keep) >= size:
+                return True
+
+            try:
+                self._pool.leave_only(keep)
+                try:
+                    setattr(self._pool, "_did_first_full_optimize", False)
+                    setattr(self._pool, "_lazy_updates_since_opt", 0)
+                except Exception:
+                    pass
+            except Exception:
+                return True
+            dt = _time.perf_counter() - t0
+
+            self.logger.record("pool/prune_kept", float(len(keep)))
+            self.logger.record("pool/prune_removed", float(max(0, size - len(keep))))
+            self.logger.record("perf/pool_prune_time_s", float(dt))
+            if self.verbose:
+                print(f"✓ pool prune by val: kept={len(keep)}/{size}, dt={dt:.3f}s")
+            return True
+
     class PeriodicValTestEvalCallback(BaseCallback):
         """
         周期性在验证/测试集评估当前因子池（IC/RankIC），并写入 TensorBoard 标量。
@@ -1830,6 +1933,18 @@ def main():
     VAL_GATE_PERIODS = max(256, VAL_GATE_PERIODS)
     VAL_GATE_MIN_ABS_IC = max(0.0, VAL_GATE_MIN_ABS_IC)
 
+    # Pool prune（架构增强）：周期性用 val 小样本重筛现有 pool，主动腾位避免平台期
+    pool_prune_raw = os.environ.get("ALPHAGEN_POOL_PRUNE_BY_VAL", "0").strip().lower()
+    POOL_PRUNE_BY_VAL = pool_prune_raw in {"1", "true", "yes", "y", "on"}
+    pool_prune_only_full_raw = os.environ.get("ALPHAGEN_POOL_PRUNE_ONLY_WHEN_FULL", "1").strip().lower()
+    POOL_PRUNE_ONLY_WHEN_FULL = pool_prune_only_full_raw in {"1", "true", "yes", "y", "on"}
+    POOL_PRUNE_EVERY_STEPS = int(os.environ.get("ALPHAGEN_POOL_PRUNE_EVERY_STEPS", "50000").strip() or 50000)
+    POOL_PRUNE_KEEP_TOP_K = int(os.environ.get("ALPHAGEN_POOL_PRUNE_KEEP_TOP_K", "20").strip() or 20)
+    POOL_PRUNE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_POOL_PRUNE_MIN_ABS_IC", "0.0").strip() or 0.0)
+    POOL_PRUNE_EVERY_STEPS = max(256, int(POOL_PRUNE_EVERY_STEPS))
+    POOL_PRUNE_KEEP_TOP_K = max(1, int(POOL_PRUNE_KEEP_TOP_K))
+    POOL_PRUNE_MIN_ABS_IC = max(0.0, float(POOL_PRUNE_MIN_ABS_IC))
+
     # 周期性保存 checkpoint（默认关闭，>0 开启）
     ckpt_every_steps = int(os.environ.get("ALPHAGEN_CHECKPOINT_EVERY_STEPS", "0").strip() or 0)
     ckpt_keep_last = int(os.environ.get("ALPHAGEN_CHECKPOINT_KEEP", "3").strip() or 3)
@@ -1948,8 +2063,9 @@ def main():
             fast_gate_calc = None
 
     # ValGate：优先用 val 子集估计 single-IC，避免“train 很好但 val 很差”的过拟合候选占用计算预算
+    # 同时：若启用 POOL_PRUNE_BY_VAL，也会复用同一份 val_gate_calc 作为快速重筛依据。
     val_gate_calc = None
-    if VAL_GATE:
+    if VAL_GATE or POOL_PRUNE_BY_VAL:
         try:
             # 如果用户开启了周期 eval，则 val_data_periodic 后面会创建；这里为避免双份加载，优先复用该对象。
             # 若 eval 未开启，则此处单独加载一份 val 数据（仅用于 gate）。
@@ -3015,6 +3131,18 @@ def main():
     callbacks.append(Sb3LoggerMaxLengthCallback(max_length=SB3_LOGGER_MAX_LENGTH, verbose=0))
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
     callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
+    if POOL_PRUNE_BY_VAL and (val_gate_calc is not None):
+        callbacks.append(
+            PeriodicPoolValPruneCallback(
+                pool=pool,
+                val_calc=val_gate_calc,
+                every_steps=POOL_PRUNE_EVERY_STEPS,
+                keep_top_k=min(int(POOL_PRUNE_KEEP_TOP_K), int(getattr(pool, "capacity", POOL_PRUNE_KEEP_TOP_K) or POOL_PRUNE_KEEP_TOP_K)),
+                min_abs_ic=float(POOL_PRUNE_MIN_ABS_IC),
+                only_when_full=bool(POOL_PRUNE_ONLY_WHEN_FULL),
+                verbose=0,
+            )
+        )
     ckpt_cb = None
     if ckpt_every_steps > 0:
         ckpt_cb = PeriodicCheckpointCallback(
