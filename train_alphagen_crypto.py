@@ -736,7 +736,7 @@ def main():
         截断后若发生重名，SB3 会抛 ValueError 并终止训练。
         """
 
-        def __init__(self, max_length: int = 120, verbose: int = 0):
+        def __init__(self, max_length: int = 512, verbose: int = 0):
             super().__init__(verbose=verbose)
             self._max_length = int(max(36, max_length))
 
@@ -1667,10 +1667,12 @@ def main():
     POOL_OBJ_SUBSAMPLE_DAYS = max(0, int(POOL_OBJ_SUBSAMPLE_DAYS))
 
     # SB3 logger key 最大长度（避免截断冲突导致训练中断）
+    # 说明：SB3 的 HumanOutputFormat 会把 key 截断到 max_length，截断后重名会直接 raise 中断训练；
+    # 这里把默认值抬高，尽量避免“长 key + 截断冲突”。
     try:
-        SB3_LOGGER_MAX_LENGTH = int(os.environ.get("ALPHAGEN_SB3_LOGGER_MAX_LENGTH", "120").strip() or 120)
+        SB3_LOGGER_MAX_LENGTH = int(os.environ.get("ALPHAGEN_SB3_LOGGER_MAX_LENGTH", "512").strip() or 512)
     except Exception:
-        SB3_LOGGER_MAX_LENGTH = 120
+        SB3_LOGGER_MAX_LENGTH = 512
 
     class TrialLogger:
         def __init__(self, path: str, flush_every: int = 256):
@@ -1995,7 +1997,13 @@ def main():
     FAST_GATE_PERIODS = max(256, FAST_GATE_PERIODS)
     FAST_GATE_MIN_ABS_IC = max(0.0, FAST_GATE_MIN_ABS_IC)
 
-    # ValGate（方法替换的关键）：用“小样本验证集”估计 single-IC，引导搜索朝 val 泛化方向走
+    # 是否允许“训练过程使用 val 做决策”（强烈建议默认禁止，避免泄漏）
+    # - 允许评估：周期性 eval 仍可计算/打印 val_ic（只做监控，不反哺训练）
+    # - 禁止反馈：ValGate / prune_source=val 等“用 val 决策”路径会被强制关闭
+    no_val_feedback_raw = os.environ.get("ALPHAGEN_NO_VAL_FEEDBACK", "1").strip().lower()
+    NO_VAL_FEEDBACK = no_val_feedback_raw in {"1", "true", "yes", "y", "on"}
+
+    # ValGate（有泄漏争议）：用“小样本验证集”估计 single-IC，过滤候选，间接引导搜索朝 val 泛化方向走
     val_gate_raw = os.environ.get("ALPHAGEN_VAL_GATE", "0").strip().lower()
     VAL_GATE = val_gate_raw in {"1", "true", "yes", "y", "on"}
     val_gate_only_full_raw = os.environ.get("ALPHAGEN_VAL_GATE_ONLY_WHEN_FULL", "1").strip().lower()
@@ -2010,11 +2018,29 @@ def main():
     # Pool prune（架构增强）：周期性用 val 小样本重筛现有 pool，主动腾位避免平台期
     pool_prune_raw = os.environ.get("ALPHAGEN_POOL_PRUNE_BY_VAL", "0").strip().lower()
     POOL_PRUNE_BY_VAL = pool_prune_raw in {"1", "true", "yes", "y", "on"}
+    # prune 评估数据源：
+    # - train：只用训练集内的 proxy 子集（不看 val，推荐在严禁泄漏时使用）
+    # - val：用验证集子集（效果更直接，但有“看 val”争议）
+    POOL_PRUNE_SOURCE = os.environ.get("ALPHAGEN_POOL_PRUNE_SOURCE", "train").strip().lower()
+    if POOL_PRUNE_SOURCE not in {"train", "val"}:
+        print(f"⚠ 未知 ALPHAGEN_POOL_PRUNE_SOURCE={POOL_PRUNE_SOURCE}（将回退到 train）")
+        POOL_PRUNE_SOURCE = "train"
+
+    # 严禁 val 反馈：强制关闭所有“用 val 做决策”的路径（评估仍可保留）
+    if NO_VAL_FEEDBACK:
+        if VAL_GATE:
+            print("⚠ ALPHAGEN_NO_VAL_FEEDBACK=1：将强制关闭 ValGate（避免训练过程看到/利用 val）")
+            VAL_GATE = False
+        if POOL_PRUNE_SOURCE == "val":
+            print("⚠ ALPHAGEN_NO_VAL_FEEDBACK=1：将强制把 ALPHAGEN_POOL_PRUNE_SOURCE=val 改为 train（避免训练过程看到/利用 val）")
+            POOL_PRUNE_SOURCE = "train"
     pool_prune_only_full_raw = os.environ.get("ALPHAGEN_POOL_PRUNE_ONLY_WHEN_FULL", "1").strip().lower()
     POOL_PRUNE_ONLY_WHEN_FULL = pool_prune_only_full_raw in {"1", "true", "yes", "y", "on"}
     POOL_PRUNE_EVERY_STEPS = int(os.environ.get("ALPHAGEN_POOL_PRUNE_EVERY_STEPS", "50000").strip() or 50000)
     POOL_PRUNE_KEEP_TOP_K = int(os.environ.get("ALPHAGEN_POOL_PRUNE_KEEP_TOP_K", "20").strip() or 20)
     POOL_PRUNE_MIN_ABS_IC = float(os.environ.get("ALPHAGEN_POOL_PRUNE_MIN_ABS_IC", "0.0").strip() or 0.0)
+    POOL_PRUNE_SYMBOLS = int(os.environ.get("ALPHAGEN_POOL_PRUNE_SYMBOLS", "20").strip() or 20)
+    POOL_PRUNE_PERIODS = int(os.environ.get("ALPHAGEN_POOL_PRUNE_PERIODS", "4000").strip() or 4000)
     POOL_PRUNE_SCORE = os.environ.get("ALPHAGEN_POOL_PRUNE_SCORE", "weight_val").strip().lower()
     if POOL_PRUNE_SCORE not in {"val", "weight", "weight_val"}:
         print(f"⚠ 未知 ALPHAGEN_POOL_PRUNE_SCORE={POOL_PRUNE_SCORE}（将回退到 weight_val）")
@@ -2032,6 +2058,8 @@ def main():
     POOL_PRUNE_EVERY_STEPS = max(256, int(POOL_PRUNE_EVERY_STEPS))
     POOL_PRUNE_KEEP_TOP_K = max(1, int(POOL_PRUNE_KEEP_TOP_K))
     POOL_PRUNE_MIN_ABS_IC = max(0.0, float(POOL_PRUNE_MIN_ABS_IC))
+    POOL_PRUNE_SYMBOLS = max(4, int(POOL_PRUNE_SYMBOLS))
+    POOL_PRUNE_PERIODS = max(256, int(POOL_PRUNE_PERIODS))
 
     # 周期性保存 checkpoint（默认关闭，>0 开启）
     ckpt_every_steps = int(os.environ.get("ALPHAGEN_CHECKPOINT_EVERY_STEPS", "0").strip() or 0)
@@ -2150,10 +2178,14 @@ def main():
             print(f"⚠ FastGate 初始化失败（将禁用）：{e}")
             fast_gate_calc = None
 
-    # ValGate：优先用 val 子集估计 single-IC，避免“train 很好但 val 很差”的过拟合候选占用计算预算
-    # 同时：若启用 POOL_PRUNE_BY_VAL，也会复用同一份 val_gate_calc 作为快速重筛依据。
+    # gate calculator：
+    # - ValGate 用验证集子集（若启用）
+    # - Pool prune 默认用训练集 proxy 子集（不看 val），除非 POOL_PRUNE_SOURCE=val
     val_gate_calc = None
-    if VAL_GATE or POOL_PRUNE_BY_VAL:
+    train_prune_calc = None
+
+    # ValGate：优先用 val 子集估计 single-IC，避免“train 很好但 val 很差”的过拟合候选占用计算预算
+    if VAL_GATE or (POOL_PRUNE_BY_VAL and POOL_PRUNE_SOURCE == "val"):
         try:
             # 如果用户开启了周期 eval，则 val_data_periodic 后面会创建；这里为避免双份加载，优先复用该对象。
             # 若 eval 未开启，则此处单独加载一份 val 数据（仅用于 gate）。
@@ -2261,6 +2293,36 @@ def main():
         except Exception as e:
             print(f"⚠ ValGate 初始化失败（将禁用）：{e}")
             val_gate_calc = None
+
+    # Pool prune 的 train proxy calculator（不看 val）
+    if POOL_PRUNE_BY_VAL and (POOL_PRUNE_SOURCE == "train") and (train_prune_calc is None):
+        try:
+            total_symbols = int(getattr(train_data, "n_stocks", 0))
+            take_symbols = min(int(POOL_PRUNE_SYMBOLS), max(1, total_symbols))
+            rng = np.random.default_rng(SEED + 17)
+            idx = np.array(sorted(rng.choice(total_symbols, size=take_symbols, replace=False).tolist()), dtype=np.int64)
+
+            base_tensor = train_data.data
+            need_len = int(
+                POOL_PRUNE_PERIODS
+                + train_data.max_backtrack_days
+                + train_data.max_future_days
+                + 1
+            )
+            start = max(0, int(base_tensor.shape[0]) - need_len)
+            t_tensor = base_tensor[start:, :, :].index_select(2, torch.tensor(idx, device=base_tensor.device))
+            t_view = _StockDataView(train_data, t_tensor)
+            if POOL_TYPE == "meanstd":
+                train_prune_calc = TensorQLibStockDataCalculator(t_view, target)
+            else:
+                train_prune_calc = QLibStockDataCalculator(t_view, target)
+            print(
+                f"✓ PoolPrune(train) 已启用：symbols={take_symbols}/{total_symbols}, periods≈{POOL_PRUNE_PERIODS}, "
+                f"score={POOL_PRUNE_SCORE}, keep_top_k={POOL_PRUNE_KEEP_TOP_K}"
+            )
+        except Exception as e:
+            print(f"⚠ PoolPrune(train) 初始化失败（将禁用）：{e}")
+            train_prune_calc = None
 
     # ==================== 创建Alpha Pool ====================
     # 如果启用动态阈值，初始化用 start（避免刚开始就被“后期阈值”卡死）
@@ -3257,11 +3319,17 @@ def main():
     callbacks.append(Sb3LoggerMaxLengthCallback(max_length=SB3_LOGGER_MAX_LENGTH, verbose=0))
     callbacks.append(AlphaCacheStatsCallback(calculator_obj=calculator, update_every=2048))
     callbacks.append(PoolPerfStatsCallback(pool_obj=pool, update_every=2048))
-    if POOL_PRUNE_BY_VAL and (val_gate_calc is not None):
+    prune_calc = None
+    if POOL_PRUNE_BY_VAL:
+        if POOL_PRUNE_SOURCE == "val":
+            prune_calc = val_gate_calc
+        else:
+            prune_calc = train_prune_calc
+    if POOL_PRUNE_BY_VAL and (prune_calc is not None):
         callbacks.append(
             PeriodicPoolValPruneCallback(
                 pool=pool,
-                val_calc=val_gate_calc,
+                val_calc=prune_calc,
                 every_steps=POOL_PRUNE_EVERY_STEPS,
                 keep_top_k=min(int(POOL_PRUNE_KEEP_TOP_K), int(getattr(pool, "capacity", POOL_PRUNE_KEEP_TOP_K) or POOL_PRUNE_KEEP_TOP_K)),
                 score_mode=str(POOL_PRUNE_SCORE),

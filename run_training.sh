@@ -456,8 +456,9 @@ case "$PRESET" in
         preset_explore20_ucblcb_cs_breakplateau
         ;;
     explore20_ucblcb_cs_breakplateau_prune)
-        # 在 breakplateau 基础上开启“周期性 val 重筛/腾位”，用来对抗满池后 best_ic_ret 卡死。
-        # 注意：该机制使用 val 小样本（与 ValGate 同口径）做快速 single-IC 评估，触发频率低，对平均 fps 影响很小。
+        # 在 breakplateau 基础上开启“周期性重筛/腾位”，用来对抗满池后 best_ic_ret 卡死。
+        # 默认使用训练集内 proxy 子集（不看 val），触发频率低，对平均 fps 影响很小；
+        # 如你明确接受“训练过程看 val”，可外部设置：ALPHAGEN_NO_VAL_FEEDBACK=0 + ALPHAGEN_POOL_PRUNE_SOURCE=val。
         preset_explore20_ucblcb_cs_breakplateau
         export_default ALPHAGEN_POOL_PRUNE_BY_VAL 1
         export_default ALPHAGEN_POOL_PRUNE_ONLY_WHEN_FULL 1
@@ -474,8 +475,11 @@ case "$PRESET" in
         export_default ALPHAGEN_POOL_OBJ_SUBSAMPLE_DAYS 256
         ;;
     explore20_ucblcb_cs_val)
-        # “换方法”：在 explore20_ucblcb_cs 基础上启用 ValGate（pool 满后用验证集小样本过滤），
-        # 目标是抬高 val_ic 上限，而不是只靠调 pool optimize。
+        # “看 val”的实验预设（存在泄漏争议）：
+        # - 在 explore20_ucblcb_cs 基础上启用 ValGate（pool 满后用验证集小样本过滤）；
+        # - 目标是抬高 val_ic 上限，而不是只靠调 pool optimize；
+        # - 若你要求“训练过程不能看到 val”，请不要使用该 preset。
+        export ALPHAGEN_NO_VAL_FEEDBACK=0
         export_default ALPHAGEN_PERF_LOG 1
         export_default ALPHAGEN_ENABLE_CS_OPS 1
 
