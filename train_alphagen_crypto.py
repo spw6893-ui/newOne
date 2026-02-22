@@ -1559,6 +1559,25 @@ def main():
             from alphagen.utils.correlation import batch_pearsonr  # 延迟导入避免循环
 
             target_value = self.calculator.target
+            # optimize 内子采样（仅在 TunableNaNFriendlyMeanStdAlphaPool.optimize 临时设置索引时生效）
+            try:
+                day_idx = getattr(self, "_obj_subsample_day_idx", None)
+                stock_idx = getattr(self, "_obj_subsample_stock_idx", None)
+            except Exception:
+                day_idx = None
+                stock_idx = None
+            if day_idx is not None:
+                try:
+                    alpha_values = alpha_values.index_select(1, day_idx)
+                    target_value = target_value.index_select(0, day_idx)
+                except Exception:
+                    pass
+            if stock_idx is not None:
+                try:
+                    alpha_values = alpha_values.index_select(2, stock_idx)
+                    target_value = target_value.index_select(1, stock_idx)
+                except Exception:
+                    pass
             all_nan = torch.isnan(alpha_values).all(dim=0)
             weighted = (weights[:, None, None] * torch.nan_to_num(alpha_values, nan=0.0)).sum(dim=0)
             weighted[all_nan] = torch.nan
@@ -1632,6 +1651,20 @@ def main():
     if LAZY_REMOVE_BY not in {"weight", "single_ic"}:
         print(f"⚠ 未知 ALPHAGEN_POOL_LAZY_REMOVE_BY={LAZY_REMOVE_BY}（将回退到 weight）")
         LAZY_REMOVE_BY = "weight"
+
+    # MeanStd optimize 子采样（架构级：提升泛化 + 显著提速）
+    # - 在 optimize 内部计算目标函数时，仅随机采样部分 days/stocks；
+    # - 目的：减少过拟合（等价于 bagging/regularization），并降低 optimize 每步的张量计算量。
+    try:
+        POOL_OBJ_SUBSAMPLE_SYMBOLS = int(os.environ.get("ALPHAGEN_POOL_OBJ_SUBSAMPLE_SYMBOLS", "0").strip() or 0)
+    except Exception:
+        POOL_OBJ_SUBSAMPLE_SYMBOLS = 0
+    try:
+        POOL_OBJ_SUBSAMPLE_DAYS = int(os.environ.get("ALPHAGEN_POOL_OBJ_SUBSAMPLE_DAYS", "0").strip() or 0)
+    except Exception:
+        POOL_OBJ_SUBSAMPLE_DAYS = 0
+    POOL_OBJ_SUBSAMPLE_SYMBOLS = max(0, int(POOL_OBJ_SUBSAMPLE_SYMBOLS))
+    POOL_OBJ_SUBSAMPLE_DAYS = max(0, int(POOL_OBJ_SUBSAMPLE_DAYS))
 
     # SB3 logger key 最大长度（避免截断冲突导致训练中断）
     try:
@@ -2626,15 +2659,53 @@ def main():
             def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:  # type: ignore[override]
                 # MeanStdAlphaPool 默认 optimize(max_steps=10000) 在 days*stocks 很大时非常慢。
                 # 这里复用 ALPHAGEN_POOL_OPT_* 作为统一的“优化预算阀门”，方便在脚本里提速/稳住。
-                if not getattr(self, "_perf_enabled", False):
-                    return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
-                import time as _time
-                t0 = _time.perf_counter()
-                out = super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
-                dt = _time.perf_counter() - t0
-                self._perf["optimize_calls"] += 1
-                self._perf["optimize_time_s"] += float(dt)
-                return out
+                # 架构级：optimize 内 objective 子采样（仅在 optimize 期间生效，避免污染外部 objective/日志）
+                day_idx = None
+                stock_idx = None
+                try:
+                    if (POOL_OBJ_SUBSAMPLE_DAYS > 0) or (POOL_OBJ_SUBSAMPLE_SYMBOLS > 0):
+                        tgt = getattr(self.calculator, "target", None)
+                        if tgt is not None and hasattr(tgt, "shape"):
+                            # target: (days, stocks)
+                            days = int(tgt.shape[0])
+                            stocks = int(tgt.shape[1]) if len(tgt.shape) > 1 else 0
+                            if (POOL_OBJ_SUBSAMPLE_DAYS > 0) and (days > 0):
+                                k = min(days, int(POOL_OBJ_SUBSAMPLE_DAYS))
+                                g = torch.Generator(device=tgt.device)
+                                # 用 optimize_calls 做扰动，确保每次 optimize 的子样本不同但可复现
+                                seed = int(SEED + 991 * int(getattr(self, "_perf", {}).get("optimize_calls", 0)))
+                                g.manual_seed(seed)
+                                day_idx = torch.randperm(days, generator=g, device=tgt.device)[:k]
+                                setattr(self, "_obj_subsample_day_idx", day_idx)
+                            if (POOL_OBJ_SUBSAMPLE_SYMBOLS > 0) and (stocks > 0):
+                                k = min(stocks, int(POOL_OBJ_SUBSAMPLE_SYMBOLS))
+                                g = torch.Generator(device=tgt.device)
+                                seed = int(SEED + 997 * int(getattr(self, "_perf", {}).get("optimize_calls", 0)))
+                                g.manual_seed(seed)
+                                stock_idx = torch.randperm(stocks, generator=g, device=tgt.device)[:k]
+                                setattr(self, "_obj_subsample_stock_idx", stock_idx)
+                except Exception:
+                    day_idx = None
+                    stock_idx = None
+
+                try:
+                    if not getattr(self, "_perf_enabled", False):
+                        return super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                    import time as _time
+                    t0 = _time.perf_counter()
+                    out = super().optimize(lr=POOL_OPT_LR, max_steps=POOL_OPT_MAX_STEPS, tolerance=POOL_OPT_TOLERANCE)
+                    dt = _time.perf_counter() - t0
+                    self._perf["optimize_calls"] += 1
+                    self._perf["optimize_time_s"] += float(dt)
+                    return out
+                finally:
+                    # 清理采样索引，避免影响外部 objective
+                    for k in ("_obj_subsample_day_idx", "_obj_subsample_stock_idx"):
+                        try:
+                            if hasattr(self, k):
+                                delattr(self, k)
+                        except Exception:
+                            pass
 
         pool = TunableNaNFriendlyMeanStdAlphaPool(
             capacity=POOL_CAPACITY,

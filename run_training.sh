@@ -469,6 +469,9 @@ case "$PRESET" in
         # prune 后抬高门槛，避免弱/同质因子立即回填
         export_default ALPHAGEN_POOL_PRUNE_SET_IC_LOWER_BOUND 0.02
         export_default ALPHAGEN_POOL_PRUNE_SET_MUTUAL_THRESHOLD 0.92
+        # MeanStd optimize 子采样：提升泛化 + 提速（在 optimize 内生效，不影响外部 eval）
+        export_default ALPHAGEN_POOL_OBJ_SUBSAMPLE_SYMBOLS 64
+        export_default ALPHAGEN_POOL_OBJ_SUBSAMPLE_DAYS 256
         ;;
     explore20_ucblcb_cs_val)
         # “换方法”：在 explore20_ucblcb_cs 基础上启用 ValGate（pool 满后用验证集小样本过滤），
