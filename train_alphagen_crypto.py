@@ -1630,6 +1630,7 @@ def main():
             end_every: int,
             update_every: int,
             full_every: int = 0,
+            only_after_full: bool = False,
             verbose: int = 0,
         ):
             super().__init__(verbose=verbose)
@@ -1639,6 +1640,8 @@ def main():
             self.end_every = max(1, int(end_every))
             self.update_every = max(1, int(update_every))
             self.full_every = max(0, int(full_every))
+            self.only_after_full = bool(only_after_full)
+            self._full_step: Optional[int] = None
             self._last: Optional[int] = None
 
         def _compute_every(self) -> int:
@@ -1649,7 +1652,25 @@ def main():
         def _on_step(self) -> bool:
             if (self.num_timesteps % self.update_every) != 0:
                 return True
+
+            # 记录首次满池的时间点（用于“先满池前保持密集 optimize，再提速”的策略）
+            if self._full_step is None:
+                try:
+                    size = int(getattr(self.pool, "size", 0) or 0)
+                    cap = int(getattr(self.pool, "capacity", 0) or 0)
+                except Exception:
+                    size, cap = 0, 0
+                if cap > 0 and size >= cap:
+                    self._full_step = int(self.num_timesteps)
+                    try:
+                        self.logger.record("pool/full_step", float(self._full_step))
+                    except Exception:
+                        pass
+
             v = int(self._compute_every())
+            # 关键：如果要求“仅满池后才开始 schedule”，则满池前固定为 start_every（通常=1）
+            if self.only_after_full and (self._full_step is None):
+                v = int(self.start_every)
             # 满池后固定 optimize 频率（用于满池阶段的单独控制）
             if self.full_every > 0:
                 try:
@@ -2134,6 +2155,9 @@ def main():
     except Exception:
         POOL_OPT_EVERY_UPDATES_FULL = 0
     POOL_OPT_EVERY_UPDATES_FULL = max(0, int(POOL_OPT_EVERY_UPDATES_FULL))
+    # 是否只在“满池后”才开始 optimize_every_updates 的 schedule（建议开启：先把满池前的训练信号做足）
+    pool_opt_sched_after_full_raw = os.environ.get("ALPHAGEN_POOL_OPT_SCHEDULE_ONLY_AFTER_FULL", "0").strip().lower()
+    POOL_OPT_SCHEDULE_ONLY_AFTER_FULL = pool_opt_sched_after_full_raw in {"1", "true", "yes", "y", "on"}
 
     # 周期性评估（默认关闭，>0 开启）
     eval_every_steps = int(os.environ.get("ALPHAGEN_EVAL_EVERY_STEPS", "0").strip() or 0)
@@ -4125,6 +4149,7 @@ def main():
                     end_every=POOL_OPT_EVERY_UPDATES_END,
                     update_every=POOL_OPT_EVERY_UPDATES_UPDATE_EVERY,
                     full_every=int(POOL_OPT_EVERY_UPDATES_FULL),
+                    only_after_full=bool(POOL_OPT_SCHEDULE_ONLY_AFTER_FULL),
                     verbose=0,
                 )
             )

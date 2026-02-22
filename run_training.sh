@@ -476,6 +476,9 @@ case "$PRESET" in
 
         # 关键提速：MeanStd pool 的 optimize 很重，后期会把 fps 拖到 50 左右甚至更低。
         # 这里让 optimize 从“每次入池都做”逐步变为“每 8 次入池/替换做一次”。
+        # 但满池前建议保持 every_updates=1（训练信号更强，更容易先爬到 val_ic≈0.05），
+        # 所以默认开启“仅满池后才开始 schedule”。
+        export_default ALPHAGEN_POOL_OPT_SCHEDULE_ONLY_AFTER_FULL 1
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000
@@ -571,6 +574,7 @@ case "$PRESET" in
 
         export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
         export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
+        export_default ALPHAGEN_POOL_OPT_SCHEDULE_ONLY_AFTER_FULL 1
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
         export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000
