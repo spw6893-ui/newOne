@@ -404,6 +404,23 @@ def _load_resume_subexpr_strs(output_dir: Path, ckpt_dir: Path, resume_step: Opt
     return None
 
 
+def _load_resume_meta(ckpt_dir: Path, resume_step: Optional[int]) -> Optional[dict]:
+    """
+    读取 checkpoint 的 meta 快照（用于 resume 时对齐关键“空间/算子开关”）。
+    文件名：meta_step_{step}.json
+    """
+    if resume_step is None or resume_step <= 0:
+        return None
+    fp = _pick_latest_step_snapshot_leq(ckpt_dir, "meta_step", int(resume_step))
+    if fp and fp.exists():
+        try:
+            obj = json.loads(fp.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
 def main():
     # ==================== 配置参数 ====================
 
@@ -434,6 +451,7 @@ def main():
     feature_space = _detect_feature_space(Path(DATA_DIR))
     resume_feature_cols = _load_resume_feature_cols(output_dir=output_dir, ckpt_dir=ckpt_dir_for_resume, resume_step=resume_step) if RESUME_FLAG else None
     resume_subexpr_strs = _load_resume_subexpr_strs(output_dir=output_dir, ckpt_dir=ckpt_dir_for_resume, resume_step=resume_step) if RESUME_FLAG else None
+    resume_meta = _load_resume_meta(ckpt_dir=ckpt_dir_for_resume, resume_step=resume_step) if RESUME_FLAG else None
 
     features_max = int(os.environ.get("ALPHAGEN_FEATURES_MAX", "0").strip() or 0)
     prune_corr = float(os.environ.get("ALPHAGEN_FEATURES_PRUNE_CORR", "0.95").strip() or 0.95)
@@ -501,8 +519,21 @@ def main():
     # 架构提升（可选，默认关闭）：
     # - 增加“截面算子”到 action space：CSRank / CSZScore
     # - 这会改变 action_space 大小：旧模型无法 resume（必须从头训练）
+    enable_cs_ops_env_set = "ALPHAGEN_ENABLE_CS_OPS" in os.environ
     enable_cs_ops_raw = os.environ.get("ALPHAGEN_ENABLE_CS_OPS", "0").strip().lower()
     ENABLE_CS_OPS = enable_cs_ops_raw in {"1", "true", "yes", "y", "on"}
+    # resume 时优先对齐历史开关，避免 observation/action space mismatch
+    if RESUME_FLAG and isinstance(resume_meta, dict) and ("enable_cs_ops" in resume_meta):
+        want = bool(resume_meta.get("enable_cs_ops"))
+        if enable_cs_ops_env_set and (bool(ENABLE_CS_OPS) != bool(want)):
+            raise SystemExit(
+                "❌ RESUME 空间不一致：checkpoint meta 中 enable_cs_ops="
+                f"{int(want)}，但你当前环境 ALPHAGEN_ENABLE_CS_OPS={int(ENABLE_CS_OPS)}。\n"
+                "   解决：删掉/修改 ALPHAGEN_ENABLE_CS_OPS，使其与 checkpoint 一致；或不要用该 checkpoint resume。"
+            )
+        if not enable_cs_ops_env_set:
+            ENABLE_CS_OPS = bool(want)
+            print(f"✓ RESUME: 从 meta 快照对齐 enable_cs_ops={int(ENABLE_CS_OPS)}")
 
     import alphagen.data.expression as _expr_mod
 
@@ -1230,6 +1261,7 @@ def main():
             every_steps: int,
             feature_cols: Optional[Sequence[str]] = None,
             subexpr_strs: Optional[Sequence[str]] = None,
+            meta: Optional[dict] = None,
             keep_last: int = 3,
             verbose: int = 0,
         ):
@@ -1242,6 +1274,7 @@ def main():
             self._last_saved_step = -1
             self._feature_cols = [str(x).strip() for x in (feature_cols or []) if str(x).strip()]
             self._subexpr_strs = [str(x).strip() for x in (subexpr_strs or []) if str(x).strip()]
+            self._meta = dict(meta) if isinstance(meta, dict) else {}
 
         @staticmethod
         def _step_from_model_zip(p: Path) -> int:
@@ -1268,11 +1301,19 @@ def main():
                 except Exception:
                     pass
                 try:
+                    (self._dir / f"alpha_pool_best_step_{st}.json").unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
                     (self._dir / f"features_step_{st}.json").unlink(missing_ok=True)
                 except Exception:
                     pass
                 try:
                     (self._dir / f"subexprs_step_{st}.json").unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    (self._dir / f"meta_step_{st}.json").unlink(missing_ok=True)
                 except Exception:
                     pass
 
@@ -1284,11 +1325,20 @@ def main():
                 # SB3 会写成 model_step_{step}.zip
                 self.model.save(str(model_base))  # type: ignore[attr-defined]
                 _dump_json_atomic(self._dir / f"alpha_pool_step_{step}.json", self._pool.to_json_dict())
+                # 可选：同时保存 best pool 快照（避免训练中后期 pool 退化导致“最强池子丢了”）
+                try:
+                    best_fn = getattr(self._pool, "best_to_json_dict", None)
+                    if best_fn is not None:
+                        _dump_json_atomic(self._dir / f"alpha_pool_best_step_{step}.json", best_fn())
+                except Exception:
+                    pass
                 # 关键：保存“当时的空间定义”（features/subexprs），保证后续 resume 不会因为 action/obs space 变化而失败
                 if self._feature_cols:
                     _dump_json_atomic(self._dir / f"features_step_{step}.json", {"features": list(self._feature_cols)})
                 if self._subexpr_strs:
                     _dump_json_atomic(self._dir / f"subexprs_step_{step}.json", {"subexprs": list(self._subexpr_strs)})
+                if self._meta:
+                    _dump_json_atomic(self._dir / f"meta_step_{step}.json", dict(self._meta))
                 _dump_json_atomic(
                     self._dir / "latest.json",
                     {
@@ -1296,6 +1346,8 @@ def main():
                         "reason": str(reason),
                         "model": f"model_step_{step}.zip",
                         "pool": f"alpha_pool_step_{step}.json",
+                        "pool_best": f"alpha_pool_best_step_{step}.json",
+                        "meta": f"meta_step_{step}.json",
                     },
                 )
                 self._cleanup()
@@ -1742,6 +1794,16 @@ def main():
         SB3_LOGGER_MAX_LENGTH = int(os.environ.get("ALPHAGEN_SB3_LOGGER_MAX_LENGTH", "512").strip() or 512)
     except Exception:
         SB3_LOGGER_MAX_LENGTH = 512
+
+    # 满池后“单调接受”：
+    # - 目的：避免 pool 已满时，低质量替换让 objective/val_ic 越跑越差；
+    # - 仅约束“满池阶段”的替换，不影响早期填池。
+    full_mono_raw = os.environ.get("ALPHAGEN_POOL_FULL_MONOTONE_ACCEPT", "0").strip().lower()
+    POOL_FULL_MONOTONE_ACCEPT = full_mono_raw in {"1", "true", "yes", "y", "on"}
+    try:
+        POOL_FULL_MONOTONE_EPS = float(os.environ.get("ALPHAGEN_POOL_FULL_MONOTONE_EPS", "0.0").strip() or 0.0)
+    except Exception:
+        POOL_FULL_MONOTONE_EPS = 0.0
 
     class TrialLogger:
         def __init__(self, path: str, flush_every: int = 256):
@@ -2620,6 +2682,29 @@ def main():
                 self._delta_best_warmup_steps = int(DELTA_BEST_WARMUP_STEPS)
                 self._delta_best_min_lcb_beta = DELTA_BEST_MIN_LCB_BETA
                 self._lazy_remove_by = str(LAZY_REMOVE_BY)
+                self._full_monotone_accept = bool(POOL_FULL_MONOTONE_ACCEPT)
+                self._full_monotone_eps = float(POOL_FULL_MONOTONE_EPS)
+                self._current_obj: float = float("nan")
+                self._best_state_json: Optional[dict] = None
+
+            def _maybe_update_best(self, ic: float, obj: float) -> bool:  # type: ignore[override]
+                ok = super()._maybe_update_best(ic, obj)
+                if not ok:
+                    return False
+                try:
+                    self._best_state_json = self.to_json_dict()
+                    try:
+                        self._best_state_json["best_obj"] = float(obj)
+                        self._best_state_json["best_ic_ret"] = float(ic)
+                        self._best_state_json["step"] = int(getattr(self, "_current_step", 0) or 0)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return True
+
+            def best_to_json_dict(self) -> dict:
+                return dict(self._best_state_json) if isinstance(self._best_state_json, dict) else self.to_json_dict()
 
             def perf_stats(self) -> dict:
                 return dict(self._perf) if getattr(self, "_perf_enabled", False) else {}
@@ -2695,28 +2780,38 @@ def main():
                     return self.best_obj
 
                 self.eval_cnt += 1
+                # 满池阶段可选：只接受“不会让当前 objective 下降”的替换（防止满池后越换越差）
+                was_full = bool(self.size >= self.capacity and self.capacity > 0)
+                monotone_full = bool(getattr(self, "_full_monotone_accept", False))
+                prev_obj = float("nan")
+                snapshot = None
+                prev_hist_len = len(getattr(self, "update_history", []) or [])
+                if was_full and monotone_full:
+                    try:
+                        prev_obj = float(getattr(self, "_current_obj"))
+                    except Exception:
+                        prev_obj = float("nan")
+                    if not np.isfinite(prev_obj):
+                        try:
+                            _, prev_obj = self.calculate_ic_and_objective()
+                        except Exception:
+                            prev_obj = float("nan")
+                    # 仅在需要时做快照（31x31 的矩阵拷贝成本很低，但别在非满池阶段浪费）
+                    try:
+                        snapshot = {
+                            "size": int(self.size),
+                            "exprs": list(self.exprs),
+                            "single_ics": np.asarray(self.single_ics).copy(),
+                            "_weights": np.asarray(getattr(self, "_weights")).copy(),
+                            "_mutual_ics": np.asarray(getattr(self, "_mutual_ics")).copy(),
+                            "_extra_info": list(getattr(self, "_extra_info", [])),
+                            "_failure_cache": set(getattr(self, "_failure_cache", set()) or set()),
+                        }
+                    except Exception:
+                        snapshot = None
+
                 old_pool = self.exprs[: self.size]  # type: ignore
                 self._add_factor(expr, ic_ret, ic_mut)
-
-                worst_idx = None
-                if self.size > self.capacity:
-                    remove_by = str(getattr(self, "_lazy_remove_by", "weight"))
-                    if remove_by == "single_ic":
-                        worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
-                    else:
-                        # 更接近 LinearAlphaPool：按 |weight| 最小淘汰
-                        try:
-                            w = np.asarray(self.weights, dtype=np.float64)
-                            worst_idx = self._safe_abs_min_idx(w[: self.size])
-                        except Exception:
-                            worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
-                    if worst_idx == self.capacity:
-                        self._pop(worst_idx)
-                        self._failure_cache.add(str(expr))
-                        return self.best_obj
-                    self._pop(worst_idx)
-
-                removed_idx = [worst_idx] if worst_idx is not None else []
 
                 # optimize 频率控制（优先保证：pool 第一次填满时至少 optimize 一次）
                 do_opt = False
@@ -2730,9 +2825,38 @@ def main():
                         every = max(1, every)
                         do_opt = (every == 1) or (self._lazy_updates_since_opt >= every)
 
+                worst_idx = None
+                new_weights = None
                 if do_opt:
-                    self.weights = self.optimize()
+                    new_weights = self.optimize()
                     self._lazy_updates_since_opt = 0
+                    # 与 LinearAlphaPool 行为对齐：先看优化后的最小 |weight|，再决定淘汰/是否回滚新增因子
+                    if self.size > self.capacity:
+                        worst_idx = int(np.argmin(np.abs(new_weights)))
+                        if worst_idx == self.capacity:
+                            self._pop(worst_idx)
+                            self._failure_cache.add(str(expr))
+                            return self.best_obj
+                    # 先应用 weights，再 pop（pop 内 swap 会把 weights 一起换走）
+                    self.weights = new_weights
+                else:
+                    # 不 optimize 时：用启发式快速淘汰一个（避免无脑回填导致 pool 质量劣化）
+                    if self.size > self.capacity:
+                        remove_by = str(getattr(self, "_lazy_remove_by", "weight"))
+                        if remove_by == "single_ic":
+                            worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
+                        else:
+                            try:
+                                w = np.asarray(self.weights, dtype=np.float64)
+                                worst_idx = self._safe_abs_min_idx(w[: self.size])
+                            except Exception:
+                                worst_idx = self._safe_abs_min_idx(self.single_ics[: self.size])
+                        if worst_idx == self.capacity:
+                            self._pop(worst_idx)
+                            self._failure_cache.add(str(expr))
+                            return self.best_obj
+
+                removed_idx = [worst_idx] if worst_idx is not None else []
 
                 self.update_history.append(
                     AddRemoveAlphas(
@@ -2743,10 +2867,50 @@ def main():
                         new_pool_ic=ic_ret,
                     )
                 )
+                # pool 发生变更后，残差需要重算
+                try:
+                    setattr(self, "_residual_gate_dirty", True)
+                except Exception:
+                    pass
+
+                if worst_idx is not None:
+                    self._pop(worst_idx)
 
                 self._failure_cache = set()
                 new_ic_ret, new_obj = self.calculate_ic_and_objective()
                 self._maybe_update_best(new_ic_ret, new_obj)
+                try:
+                    setattr(self, "_current_obj", float(new_obj))
+                except Exception:
+                    pass
+
+                # 满池阶段单调接受：若 objective 下降则回滚（保持 pool 稳定，不把“探索噪声”写进池子）
+                if was_full and monotone_full and np.isfinite(prev_obj) and np.isfinite(new_obj):
+                    eps = float(getattr(self, "_full_monotone_eps", 0.0) or 0.0)
+                    if float(new_obj) + eps < float(prev_obj) and snapshot is not None:
+                        try:
+                            self.size = int(snapshot["size"])
+                            self.exprs = list(snapshot["exprs"])
+                            self.single_ics[:] = snapshot["single_ics"]
+                            getattr(self, "_weights")[:] = snapshot["_weights"]
+                            getattr(self, "_mutual_ics")[:] = snapshot["_mutual_ics"]
+                            try:
+                                getattr(self, "_extra_info")[:] = snapshot["_extra_info"]
+                            except Exception:
+                                pass
+                            self._failure_cache = set(snapshot.get("_failure_cache", set()) or set())
+                            # 截断 update_history（不把回滚的替换记进去）
+                            try:
+                                uh = getattr(self, "update_history", None)
+                                if isinstance(uh, list) and len(uh) > prev_hist_len:
+                                    del uh[prev_hist_len:]
+                            except Exception:
+                                pass
+                            setattr(self, "_current_obj", float(prev_obj))
+                        except Exception:
+                            pass
+                        return float(prev_obj) if np.isfinite(prev_obj) else float(new_obj)
+
                 return new_obj
 
             def try_new_expr(self, expr):  # type: ignore[override]
@@ -2877,30 +3041,173 @@ def main():
                                 )
                             return 0.0
 
+                # ResidualGate：候选必须能解释当前 pool 的 residual（训练 proxy 子集，不看 val）
+                res_calc = getattr(self, "_residual_gate_calc", None)
+                if res_calc is not None:
+                    only_full = bool(getattr(self, "_residual_gate_only_full", True))
+                    if (not only_full) or (getattr(self, "size", 0) >= getattr(self, "capacity", 0)):
+                        import time as _time
+                        t0g = _time.perf_counter()
+                        try:
+                            from alphagen.utils.correlation import batch_pearsonr  # 延迟导入
+                        except Exception:
+                            batch_pearsonr = None
+
+                        def _get_target_tensor(calc_obj):
+                            tv = getattr(calc_obj, "target_value", None)
+                            if tv is not None:
+                                return tv
+                            try:
+                                return getattr(calc_obj, "target")
+                            except Exception:
+                                return None
+
+                        def _eval_alpha(calc_obj, e):
+                            fn = getattr(calc_obj, "evaluate_alpha", None)
+                            if fn is not None:
+                                return fn(e)
+                            fn = getattr(calc_obj, "_calc_alpha", None)
+                            if fn is not None:
+                                return fn(e)
+                            return None
+
+                        # 更新 residual（按步数节流 + pool 发生变更后置脏）
+                        try:
+                            update_every = int(getattr(self, "_residual_gate_update_every_steps", 20000) or 20000)
+                        except Exception:
+                            update_every = 20000
+                        try:
+                            step = int(getattr(self, "_current_step", 0) or 0)
+                        except Exception:
+                            step = 0
+                        last_u = int(getattr(self, "_residual_gate_last_update_step", -1) or -1)
+                        dirty = bool(getattr(self, "_residual_gate_dirty", True))
+                        if dirty or (update_every > 0 and (step - last_u) >= update_every):
+                            try:
+                                size = int(getattr(self, "size", 0) or 0)
+                                if size <= 0:
+                                    setattr(self, "_residual_gate_residual", None)
+                                else:
+                                    weights = np.asarray(self.weights, dtype=np.float64)
+                                    k = min(size, int(getattr(self, "_residual_gate_topk", 12) or 12))
+                                    if k <= 0:
+                                        setattr(self, "_residual_gate_residual", None)
+                                    else:
+                                        idx = np.argsort(np.abs(weights))[-k:]
+                                        exprs_sel = [self.exprs[int(i)] for i in idx]  # type: ignore[index]
+                                        w_sel = [float(weights[int(i)]) for i in idx]
+                                        y_hat = res_calc.make_ensemble_alpha(exprs_sel, w_sel)
+                                        tgt = _get_target_tensor(res_calc)
+                                        if tgt is None:
+                                            raise RuntimeError("no target tensor")
+                                        residual = tgt - y_hat
+                                        setattr(self, "_residual_gate_residual", residual)
+                                setattr(self, "_residual_gate_last_update_step", int(step))
+                                setattr(self, "_residual_gate_dirty", False)
+                            except Exception:
+                                # 无法更新 residual：不要阻塞训练（临时视作门禁不可用）
+                                setattr(self, "_residual_gate_residual", None)
+
+                        residual = getattr(self, "_residual_gate_residual", None)
+                        thr = float(getattr(self, "_residual_gate_min_abs_ic", 0.0))
+                        # 若 residual / 相关系数实现不可用，则不做门禁（避免把所有候选都拦死）
+                        if (batch_pearsonr is None) or (residual is None):
+                            dtg = _time.perf_counter() - t0g
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["residual_gate_calls"] += 1
+                                self._perf["residual_gate_time_s"] += float(dtg)
+                            tl = getattr(self, "_trial_logger", None)
+                            if tl is not None:
+                                tl.log(
+                                    {
+                                        "step": step,
+                                        "expr": str(expr),
+                                        "gate": "residual_gate_unavailable",
+                                        "residual_gate_thr": float(thr),
+                                        "pool_size": int(getattr(self, "size", 0) or 0),
+                                    }
+                                )
+                        else:
+                            score = float("nan")
+                            try:
+                                a = _eval_alpha(res_calc, expr)
+                                if a is not None:
+                                    score = float(batch_pearsonr(a, residual).mean().item())
+                            except Exception:
+                                score = float("nan")
+                            dtg = _time.perf_counter() - t0g
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["residual_gate_calls"] += 1
+                                self._perf["residual_gate_time_s"] += float(dtg)
+                            if not (np.isfinite(score) and (abs(score) >= thr)):
+                                if getattr(self, "_perf_enabled", False):
+                                    self._perf["residual_gate_skips"] += 1
+                                tl = getattr(self, "_trial_logger", None)
+                                if tl is not None:
+                                    tl.log(
+                                        {
+                                            "step": step,
+                                            "expr": str(expr),
+                                            "gate": "residual_gate",
+                                            "residual_ic": float(score) if np.isfinite(score) else None,
+                                            "residual_gate_thr": float(thr),
+                                            "pool_size": int(getattr(self, "size", 0) or 0),
+                                        }
+                                    )
+                                return 0.0
+
                 # 默认（every_updates=1）：保持 LinearAlphaPool 原始行为（每次入池都 optimize）
                 every = int(getattr(self, "_optimize_every_updates", 1) or 1)
                 if every <= 1:
                     if not getattr(self, "_perf_enabled", False):
+                        pre_hist = len(getattr(self, "update_history", []) or [])
                         out = super().try_new_expr(expr)
+                        post_hist = len(getattr(self, "update_history", []) or [])
+                        if post_hist > pre_hist:
+                            try:
+                                setattr(self, "_residual_gate_dirty", True)
+                            except Exception:
+                                pass
                         return self._shape_reward(old_best_obj, out)
                     import time as _time
                     t0 = _time.perf_counter()
+                    pre_hist = len(getattr(self, "update_history", []) or [])
                     out = super().try_new_expr(expr)
                     dt = _time.perf_counter() - t0
                     self._perf["try_new_expr_calls"] += 1
                     self._perf["try_new_expr_time_s"] += float(dt)
+                    post_hist = len(getattr(self, "update_history", []) or [])
+                    if post_hist > pre_hist:
+                        try:
+                            setattr(self, "_residual_gate_dirty", True)
+                        except Exception:
+                            pass
                     return self._shape_reward(old_best_obj, out)
 
                 # Lazy（every_updates>1）：减少 optimize 调用，避免后期 fps 崩
                 if not getattr(self, "_perf_enabled", False):
+                    pre_hist = len(getattr(self, "update_history", []) or [])
                     out = self._try_new_expr_lazy(expr)
+                    post_hist = len(getattr(self, "update_history", []) or [])
+                    if post_hist > pre_hist:
+                        try:
+                            setattr(self, "_residual_gate_dirty", True)
+                        except Exception:
+                            pass
                     return self._shape_reward(old_best_obj, out)
                 import time as _time
                 t0 = _time.perf_counter()
+                pre_hist = len(getattr(self, "update_history", []) or [])
                 out = self._try_new_expr_lazy(expr)
                 dt = _time.perf_counter() - t0
                 self._perf["try_new_expr_calls"] += 1
                 self._perf["try_new_expr_time_s"] += float(dt)
+                post_hist = len(getattr(self, "update_history", []) or [])
+                if post_hist > pre_hist:
+                    try:
+                        setattr(self, "_residual_gate_dirty", True)
+                    except Exception:
+                        pass
                 return self._shape_reward(old_best_obj, out)
 
             def _calc_ics(self, expr, ic_mut_threshold=None):  # type: ignore[override]
@@ -3383,39 +3690,56 @@ def main():
                                 setattr(self, "_residual_gate_last_update_step", int(step))
                                 setattr(self, "_residual_gate_dirty", False)
                             except Exception:
-                                # 无法更新 residual，跳过门禁（不阻塞训练）
+                                # 无法更新 residual：不要阻塞训练（临时视作门禁不可用）
                                 setattr(self, "_residual_gate_residual", None)
 
                         residual = getattr(self, "_residual_gate_residual", None)
                         thr = float(getattr(self, "_residual_gate_min_abs_ic", 0.0))
-                        score = float("nan")
-                        if (batch_pearsonr is not None) and (residual is not None):
-                            try:
-                                a = _eval_alpha(res_calc, expr)
-                                if a is not None:
-                                    score = float(batch_pearsonr(a, residual).mean().item())
-                            except Exception:
-                                score = float("nan")
-                        dtg = _time.perf_counter() - t0g
-                        if getattr(self, "_perf_enabled", False):
-                            self._perf["residual_gate_calls"] += 1
-                            self._perf["residual_gate_time_s"] += float(dtg)
-                        if not (np.isfinite(score) and (abs(score) >= thr)):
+                        # 若 residual / 相关系数实现不可用，则不做门禁（避免把所有候选都拦死导致“满池但没提升”）
+                        if (batch_pearsonr is None) or (residual is None):
+                            dtg = _time.perf_counter() - t0g
                             if getattr(self, "_perf_enabled", False):
-                                self._perf["residual_gate_skips"] += 1
+                                self._perf["residual_gate_calls"] += 1
+                                self._perf["residual_gate_time_s"] += float(dtg)
                             tl = getattr(self, "_trial_logger", None)
                             if tl is not None:
                                 tl.log(
                                     {
                                         "step": step,
                                         "expr": expr_str,
-                                        "gate": "residual_gate",
-                                        "residual_ic": float(score) if np.isfinite(score) else None,
+                                        "gate": "residual_gate_unavailable",
                                         "residual_gate_thr": float(thr),
                                         "pool_size": int(getattr(self, "size", 0) or 0),
                                     }
                                 )
-                            return 0.0
+                        else:
+                            score = float("nan")
+                            try:
+                                a = _eval_alpha(res_calc, expr)
+                                if a is not None:
+                                    score = float(batch_pearsonr(a, residual).mean().item())
+                            except Exception:
+                                score = float("nan")
+                            dtg = _time.perf_counter() - t0g
+                            if getattr(self, "_perf_enabled", False):
+                                self._perf["residual_gate_calls"] += 1
+                                self._perf["residual_gate_time_s"] += float(dtg)
+                            if not (np.isfinite(score) and (abs(score) >= thr)):
+                                if getattr(self, "_perf_enabled", False):
+                                    self._perf["residual_gate_skips"] += 1
+                                tl = getattr(self, "_trial_logger", None)
+                                if tl is not None:
+                                    tl.log(
+                                        {
+                                            "step": step,
+                                            "expr": expr_str,
+                                            "gate": "residual_gate",
+                                            "residual_ic": float(score) if np.isfinite(score) else None,
+                                            "residual_gate_thr": float(thr),
+                                            "pool_size": int(getattr(self, "size", 0) or 0),
+                                        }
+                                    )
+                                return 0.0
 
                 pre_hist = len(getattr(self, "update_history", []) or [])
                 every = int(getattr(self, "_optimize_every_updates", 1) or 1)
@@ -3780,6 +4104,13 @@ def main():
             every_steps=ckpt_every_steps,
             feature_cols=list(feature_space.feature_cols),
             subexpr_strs=[str(e) for e in (subexprs or [])],
+            meta={
+                "preset": str(os.environ.get("ALPHAGEN_PRESET", "")),
+                "pool_type": str(POOL_TYPE),
+                "enable_cs_ops": bool(ENABLE_CS_OPS),
+                "n_features": int(len(feature_space.feature_cols)),
+                "n_subexprs": int(len(subexprs or [])),
+            },
             keep_last=ckpt_keep_last,
             verbose=0,
         )

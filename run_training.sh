@@ -18,7 +18,7 @@ echo ""
 PRESET="${ALPHAGEN_PRESET:-baseline}"
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "用法:"
-    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb|explore20_ucblcb|explore20_ucblcb_fast|explore20_ucblcb_cs|explore20_ucblcb_cs_residual|explore20_ucblcb_cs_robust|explore20_ucblcb_cs_breakplateau|explore20_ucblcb_cs_breakplateau_prune|explore20_ucblcb_cs_val]"
+    echo "  ./run_training.sh [baseline|explore20|explore20_icir|explore20_faststable|explore20_lcb|explore20_ucblcb|explore20_ucblcb_fast|explore20_ucblcb_fg|explore20_ucblcb_cs|explore20_ucblcb_cs_residual|explore20_ucblcb_cs_robust|explore20_ucblcb_cs_breakplateau|explore20_ucblcb_cs_breakplateau_prune|explore20_ucblcb_cs_val]"
     echo ""
     echo "示例:"
     echo "  ./run_training.sh"
@@ -28,6 +28,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "  ./run_training.sh explore20_lcb"
     echo "  ./run_training.sh explore20_ucblcb"
     echo "  ./run_training.sh explore20_ucblcb_fast"
+    echo "  ./run_training.sh explore20_ucblcb_fg"
     echo "  ./run_training.sh explore20_ucblcb_cs"
     echo "  ./run_training.sh explore20_ucblcb_cs_residual"
     echo "  ./run_training.sh explore20_ucblcb_cs_robust"
@@ -385,6 +386,60 @@ case "$PRESET" in
         export_default ALPHAGEN_EVAL_EVERY_STEPS 50000
         export_default ALPHAGEN_EVAL_TEST 1
         ;;
+    explore20_ucblcb_fg)
+        # 兼容别名：fg = fast-gate（历史命名）
+        # 等价于 explore20_ucblcb_fast，并显式打开 FastGate（满池后粗筛 single-IC 提速）
+        export_default ALPHAGEN_FEATURES_MAX 20
+        export_default ALPHAGEN_FEATURES_PRUNE_CORR 0.95
+        export_default ALPHAGEN_TOTAL_TIMESTEPS 800000
+
+        export_default ALPHAGEN_BATCH_SIZE 512
+        export_default ALPHAGEN_N_STEPS 8192
+        export_default ALPHAGEN_N_EPOCHS 10
+        export_default ALPHAGEN_LEARNING_RATE 0.0001
+        export_default ALPHAGEN_CLIP_RANGE 0.2
+        export_default ALPHAGEN_TARGET_KL none
+        export_default ALPHAGEN_ENT_COEF 0
+
+        export_default ALPHAGEN_POOL_TYPE meanstd
+        export_default ALPHAGEN_POOL_CAPACITY 30
+        export_default ALPHAGEN_POOL_L1_ALPHA 0.001
+
+        export_default ALPHAGEN_POOL_LCB_BETA_START -0.5
+        export_default ALPHAGEN_POOL_LCB_BETA_END 0.5
+        export_default ALPHAGEN_POOL_LCB_BETA_UPDATE_EVERY 10000
+
+        export_default ALPHAGEN_POOL_OPT_MAX_STEPS 1000
+        export_default ALPHAGEN_POOL_OPT_TOLERANCE 100
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_START 1
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_END 8
+        export_default ALPHAGEN_POOL_OPT_EVERY_UPDATES_UPDATE_EVERY 20000
+
+        export_default ALPHAGEN_IC_LOWER_BOUND_START 0.005
+        export_default ALPHAGEN_IC_LOWER_BOUND_END 0.02
+        export_default ALPHAGEN_IC_LOWER_BOUND_UPDATE_EVERY 10000
+
+        export_default ALPHAGEN_STACK_GUARD 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_START 1
+        export_default ALPHAGEN_MIN_EXPR_LEN_END 10
+        export_default ALPHAGEN_MIN_EXPR_LEN_UPDATE_EVERY 20000
+        export_default ALPHAGEN_REWARD_PER_STEP 0
+
+        export_default ALPHAGEN_SUBEXPRS_MAX 80
+        export_default ALPHAGEN_SUBEXPRS_RAW_MAX 10
+        export_default ALPHAGEN_SUBEXPRS_WINDOWS "5,10,20,40"
+        export_default ALPHAGEN_SUBEXPRS_DTS "1,2,4,8"
+
+        export_default ALPHAGEN_ALPHA_CACHE_SIZE 256
+        export_default ALPHAGEN_FAST_GATE 1
+        export_default ALPHAGEN_FAST_GATE_ONLY_WHEN_FULL 1
+        export_default ALPHAGEN_FAST_GATE_SYMBOLS 20
+        export_default ALPHAGEN_FAST_GATE_PERIODS 4000
+        export_default ALPHAGEN_FAST_GATE_MIN_ABS_IC 0.003
+
+        export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
+        export_default ALPHAGEN_EVAL_TEST 1
+        ;;
     explore20_ucblcb_cs)
         # 开启性能打点（写入 TensorBoard：perf/*），用于定位 fps 衰减根因
         export_default ALPHAGEN_PERF_LOG 1
@@ -456,6 +511,9 @@ case "$PRESET" in
         export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
         # 默认也评估 test（需要时可外部覆盖为 0，提升速度/降低内存压力）
         export_default ALPHAGEN_EVAL_TEST 1
+        # 默认打开 checkpoint（避免跑一夜没存档）
+        export_default ALPHAGEN_CHECKPOINT_EVERY_STEPS 50000
+        export_default ALPHAGEN_CHECKPOINT_KEEP 5
         ;;
     explore20_ucblcb_cs_residual)
         # “不看 val”的架构升级：在 explore20_ucblcb_cs 基础上启用
@@ -543,6 +601,10 @@ case "$PRESET" in
 
         export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
         export_default ALPHAGEN_EVAL_TEST 1
+        export_default ALPHAGEN_CHECKPOINT_EVERY_STEPS 50000
+        export_default ALPHAGEN_CHECKPOINT_KEEP 5
+        # 满池阶段建议开启“单调接受”（防止 pool 满后被噪声替换拖垮）
+        export_default ALPHAGEN_POOL_FULL_MONOTONE_ACCEPT 1
         ;;
     explore20_ucblcb_cs_robust)
         # “不看 val”的上限尝试：在 explore20_ucblcb_cs 基础上增加 RobustGate（训练集内双子集鲁棒门禁）
@@ -617,9 +679,15 @@ case "$PRESET" in
 
         export_default ALPHAGEN_EVAL_EVERY_STEPS 20000
         export_default ALPHAGEN_EVAL_TEST 1
+        export_default ALPHAGEN_CHECKPOINT_EVERY_STEPS 50000
+        export_default ALPHAGEN_CHECKPOINT_KEEP 5
+        export_default ALPHAGEN_POOL_FULL_MONOTONE_ACCEPT 1
         ;;
     explore20_ucblcb_cs_breakplateau)
         preset_explore20_ucblcb_cs_breakplateau
+        export_default ALPHAGEN_CHECKPOINT_EVERY_STEPS 50000
+        export_default ALPHAGEN_CHECKPOINT_KEEP 5
+        export_default ALPHAGEN_POOL_FULL_MONOTONE_ACCEPT 1
         ;;
     explore20_ucblcb_cs_breakplateau_prune)
         # 在 breakplateau 基础上开启“周期性重筛/腾位”，用来对抗满池后 best_ic_ret 卡死。
@@ -715,7 +783,7 @@ case "$PRESET" in
         export_default ALPHAGEN_CHECKPOINT_KEEP 5
         ;;
     *)
-        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast / explore20_ucblcb_cs / explore20_ucblcb_cs_residual / explore20_ucblcb_cs_robust / explore20_ucblcb_cs_breakplateau / explore20_ucblcb_cs_val）"
+        echo "❌ 未知 PRESET: $PRESET（支持 baseline / explore20 / explore20_icir / explore20_faststable / explore20_lcb / explore20_ucblcb / explore20_ucblcb_fast / explore20_ucblcb_fg / explore20_ucblcb_cs / explore20_ucblcb_cs_residual / explore20_ucblcb_cs_robust / explore20_ucblcb_cs_breakplateau / explore20_ucblcb_cs_val）"
         exit 1
         ;;
 esac
@@ -814,6 +882,25 @@ echo ""
 echo "监控训练进度:"
 echo "  tensorboard --logdir=./alphagen_output/tensorboard"
 echo ""
+
+# 预设一致性检查：避免外部残留的 export 把关键 gate 关掉，导致“跑了但其实没启用”
+ALLOW_MISMATCH="${ALPHAGEN_PRESET_ALLOW_MISMATCH:-0}"
+if [ "$ALLOW_MISMATCH" != "1" ]; then
+    if [ "${ALPHAGEN_PRESET:-$PRESET}" = "explore20_ucblcb_cs_residual" ]; then
+        if [ "${ALPHAGEN_RESIDUAL_GATE:-0}" != "1" ]; then
+            echo "❌ 预设 explore20_ucblcb_cs_residual 需要 ALPHAGEN_RESIDUAL_GATE=1，但当前为 ${ALPHAGEN_RESIDUAL_GATE:-0}"
+            echo "   解决: 运行前先执行: unset ALPHAGEN_RESIDUAL_GATE  （或显式设置为 1）"
+            echo "   如确实要忽略此检查: ALPHAGEN_PRESET_ALLOW_MISMATCH=1 ./run_training.sh explore20_ucblcb_cs_residual"
+            exit 1
+        fi
+        if [ "${ALPHAGEN_ROBUST_GATE:-0}" != "1" ]; then
+            echo "❌ 预设 explore20_ucblcb_cs_residual 需要 ALPHAGEN_ROBUST_GATE=1，但当前为 ${ALPHAGEN_ROBUST_GATE:-0}"
+            echo "   解决: 运行前先执行: unset ALPHAGEN_ROBUST_GATE  （或显式设置为 1）"
+            echo "   如确实要忽略此检查: ALPHAGEN_PRESET_ALLOW_MISMATCH=1 ./run_training.sh explore20_ucblcb_cs_residual"
+            exit 1
+        fi
+    fi
+fi
 
 # libgomp 对 OMP_NUM_THREADS 要求是正整数；有些平台会注入非整数值导致告警
 if [ -n "${OMP_NUM_THREADS:-}" ] && ! [[ "${OMP_NUM_THREADS}" =~ ^[0-9]+$ ]]; then
